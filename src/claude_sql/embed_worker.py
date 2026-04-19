@@ -26,6 +26,7 @@ from typing import Any
 import boto3
 import duckdb
 import polars as pl
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from loguru import logger
 from tenacity import (
@@ -89,13 +90,18 @@ def discover_unembedded(
     list of (uuid, text) tuples
         Messages needing embedding, in DuckDB's scan order.
     """
-    if embeddings_parquet.exists():
+    # Treat zero-byte / truncated parquet files as absent so an aborted
+    # previous run doesn't lock discovery into "skip all" via a corrupt index.
+    has_parquet = embeddings_parquet.exists() and embeddings_parquet.stat().st_size > 16
+    if has_parquet:
         # CREATE VIEW doesn't accept prepared parameters in DuckDB; escape inline.
         parquet_literal = str(embeddings_parquet).replace("'", "''")
         con.execute(
-            f"CREATE OR REPLACE TEMP VIEW _embedded AS SELECT uuid FROM read_parquet('{parquet_literal}');"
+            "CREATE OR REPLACE TEMP VIEW _embedded AS "
+            f"SELECT uuid FROM read_parquet('{parquet_literal}');"
         )
-        anti = "AND mt.uuid NOT IN (SELECT uuid FROM _embedded)"
+        # mt.uuid is typed UUID; parquet uuid column is VARCHAR. Cast to match.
+        anti = "AND CAST(mt.uuid AS VARCHAR) NOT IN (SELECT uuid FROM _embedded)"
     else:
         anti = ""
 
@@ -128,12 +134,24 @@ def _build_bedrock_client(settings: Settings) -> Any:
     botocore client
         A low-level ``bedrock-runtime`` client.
     """
-    return boto3.client("bedrock-runtime", region_name=settings.region)
+    # Disable botocore's internal retry layer so tenacity sees throttling
+    # immediately — otherwise botocore silently absorbs 4 retries and our
+    # retry policy never kicks in.  Also bump read_timeout for large batches.
+    boto_cfg = BotoConfig(
+        region_name=settings.region,
+        retries={"max_attempts": 0, "mode": "standard"},
+        read_timeout=60,
+        connect_timeout=10,
+    )
+    return boto3.client("bedrock-runtime", config=boto_cfg)
 
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=1, max=30),
+    # Cohere Embed v4 on Bedrock has a strict TPM bucket that replenishes over
+    # tens of seconds; wait up to 60s between attempts and try up to 10 times
+    # before surfacing the ThrottlingException.
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception(_is_retryable),
     before_sleep=before_sleep_log(_retry_logger, logging.WARNING),
     reraise=True,
