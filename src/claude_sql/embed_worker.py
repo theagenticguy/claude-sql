@@ -27,7 +27,15 @@ import boto3
 import duckdb
 import polars as pl
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    SSLError,
+)
+from botocore.exceptions import (
+    ConnectionError as BotoConnectionError,
+)
 from loguru import logger
 from tenacity import (
     before_sleep_log,
@@ -58,7 +66,16 @@ _retry_logger = logging.getLogger("claude_sql.embed_worker")
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    """Return True if ``exc`` is a Bedrock error worth retrying."""
+    """Return True if ``exc`` is a Bedrock error worth retrying.
+
+    Two buckets:
+    * ``ClientError`` with a code in :data:`_RETRY_CODES` — service-level
+      throttling and transient model failures.
+    * Network-layer errors (SSL, connection, endpoint, read-timeout) that
+      surface when long-running batches hit flaky TCP connections.
+    """
+    if isinstance(exc, SSLError | BotoConnectionError | EndpointConnectionError | ReadTimeoutError):
+        return True
     if not isinstance(exc, ClientError):
         return False
     code = exc.response.get("Error", {}).get("Code")
@@ -381,39 +398,65 @@ async def run_backfill(
         logger.info("dry_run=True - skipping Bedrock calls")
         return 0
 
-    t0 = time.monotonic()
-    texts = [p[1] for p in pending]
-    vectors = await embed_documents_async(texts, settings=settings)
-    elapsed = time.monotonic() - t0
-    logger.info("Embedded {} vectors in {:.1f}s", len(vectors), elapsed)
-
-    now = datetime.now(UTC)
-    # Polars infers nested list[float] as Object when the batch is small or
-    # when rows are handed in as Python lists; force a fixed-size Array so
-    # write_parquet succeeds and DuckDB VSS sees FLOAT[dim] on read.
-    df = pl.DataFrame(
-        {
-            "uuid": [p[0] for p in pending],
-            "model": [settings.active_model_id] * len(pending),
-            "dim": [settings.output_dimension] * len(pending),
-            "embedding": vectors,
-            "embedded_at": [now] * len(pending),
-        },
-        schema={
-            "uuid": pl.Utf8,
-            "model": pl.Utf8,
-            "dim": pl.UInt16,
-            "embedding": pl.Array(pl.Float32, settings.output_dimension),
-            "embedded_at": pl.Datetime("us", "UTC"),
-        },
-    )
-
+    # Checkpoint every N messages so a throttling-induced timeout doesn't
+    # discard work already embedded.  chunk must be a multiple of batch_size.
+    chunk_size = max(settings.batch_size * 4, 256)
     path = settings.embeddings_parquet_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        existing = pl.read_parquet(path)
-        df = pl.concat([existing, df], how="diagonal_relaxed")
-    df.write_parquet(path)
-    logger.info("Wrote {} total embeddings to {}", len(df), path)
+    total_t0 = time.monotonic()
+    written = 0
+    for i in range(0, len(pending), chunk_size):
+        slice_ = pending[i : i + chunk_size]
+        logger.info(
+            "Chunk {}/{}: embedding {} messages",
+            i // chunk_size + 1,
+            (len(pending) + chunk_size - 1) // chunk_size,
+            len(slice_),
+        )
+        t0 = time.monotonic()
+        texts = [p[1] for p in slice_]
+        vectors = await embed_documents_async(texts, settings=settings)
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Chunk done in {:.1f}s ({:.1f} vec/s)",
+            elapsed,
+            len(vectors) / elapsed if elapsed > 0 else 0.0,
+        )
 
-    return len(pending)
+        now = datetime.now(UTC)
+        # Polars infers nested list[float] as Object when the batch is small or
+        # when rows are handed in as Python lists; force a fixed-size Array so
+        # write_parquet succeeds and DuckDB VSS sees FLOAT[dim] on read.
+        df = pl.DataFrame(
+            {
+                "uuid": [p[0] for p in slice_],
+                "model": [settings.active_model_id] * len(slice_),
+                "dim": [settings.output_dimension] * len(slice_),
+                "embedding": vectors,
+                "embedded_at": [now] * len(slice_),
+            },
+            schema={
+                "uuid": pl.Utf8,
+                "model": pl.Utf8,
+                "dim": pl.UInt16,
+                "embedding": pl.Array(pl.Float32, settings.output_dimension),
+                "embedded_at": pl.Datetime("us", "UTC"),
+            },
+        )
+        # Append by rewriting the whole file — cheap at ~35k rows × 4KB each
+        # and avoids a parquet-append dependency.
+        if path.exists() and path.stat().st_size > 16:
+            existing = pl.read_parquet(path)
+            df = pl.concat([existing, df], how="diagonal_relaxed")
+        df.write_parquet(path)
+        written += len(slice_)
+        logger.info("Checkpoint: {} rows in {}", len(df), path)
+
+    total_elapsed = time.monotonic() - total_t0
+    logger.info(
+        "Backfill complete: {} embeddings in {:.1f}s ({:.1f} vec/s overall)",
+        written,
+        total_elapsed,
+        written / total_elapsed if total_elapsed > 0 else 0.0,
+    )
+    return written

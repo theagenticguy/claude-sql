@@ -303,19 +303,26 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.info("Registered view: content_blocks")
 
+        # One row per *message*, not per text block.  Aggregating the text
+        # blocks preserves enough context for useful embeddings; the per-block
+        # fan-out made semantic search noisy (tiny fragments like
+        # "Now run the tests" dominated results).  Messages with no text blocks
+        # (tool-use-only, tool-result-only) are omitted.
         con.execute(
             """
             CREATE OR REPLACE VIEW messages_text AS
             SELECT
                 cb.message_uuid AS uuid,
-                cb.session_id,
-                cb.ts,
-                cb.role,
-                cb.text         AS text_content
+                any_value(cb.session_id) AS session_id,
+                any_value(cb.ts)         AS ts,
+                any_value(cb.role)       AS role,
+                string_agg(cb.text, '\n\n')  AS text_content
             FROM content_blocks cb
             WHERE cb.block_type = 'text'
               AND cb.text IS NOT NULL
-              AND length(cb.text) > 0;
+              AND length(cb.text) > 0
+            GROUP BY cb.message_uuid
+            HAVING length(string_agg(cb.text, '\n\n')) >= 32;
             """
         )
         logger.info("Registered view: messages_text")

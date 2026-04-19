@@ -338,18 +338,23 @@ def search(
 
         qv = embed_query(query_text, settings=settings)
         dim = int(settings.output_dimension)
+        # Rank by cosine similarity descending.  The HNSW index was built with
+        # metric='cosine', so ORDER BY array_cosine_distance (== 1 - sim) ASC
+        # is what triggers the index lookup.  Using array_distance here (L2)
+        # would silently bypass the index AND give wrong ranks because the
+        # raw int8-cast-to-float document vectors have magnitudes in the
+        # thousands while the query vector is unit-normalized.
         df = con.execute(
             f"""
             WITH qv AS (SELECT CAST(? AS FLOAT[{dim}]) AS v)
-            SELECT m.uuid,
-                   m.session_id,
-                   m.role,
+            SELECT CAST(mt.uuid AS VARCHAR)  AS uuid,
+                   CAST(mt.session_id AS VARCHAR) AS session_id,
+                   mt.role,
                    array_cosine_similarity(me.embedding, (SELECT v FROM qv)) AS sim,
                    substr(mt.text_content, 1, 200) AS snippet
             FROM message_embeddings me
-            JOIN messages m USING (uuid)
-            LEFT JOIN messages_text mt ON mt.uuid = m.uuid
-            ORDER BY array_distance(me.embedding, (SELECT v FROM qv))
+            JOIN messages_text mt ON CAST(mt.uuid AS VARCHAR) = me.uuid
+            ORDER BY array_cosine_distance(me.embedding, (SELECT v FROM qv)) ASC
             LIMIT ?
             """,
             [qv, k],

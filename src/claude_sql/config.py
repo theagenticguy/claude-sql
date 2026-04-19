@@ -74,7 +74,9 @@ class Settings(BaseSettings):
 
     output_dimension: Literal[256, 512, 1024, 1536] = 1024
     embedding_type: Literal["int8", "float", "uint8", "binary", "ubinary"] = "int8"
-    concurrency: int = 8
+    #: Parallel Bedrock calls. Tuned for global CRIS TPM ceiling with the
+    #: aggregated-text messages_text view (avg ~470 chars/msg).
+    concurrency: int = 2
     batch_size: int = 96
 
     embeddings_parquet_path: Path = Field(default_factory=_default_embeddings_parquet)
