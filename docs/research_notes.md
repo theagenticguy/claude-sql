@@ -1,12 +1,19 @@
-# claude-sql Research Notes
+# claude-sql Research Notes (wi_1aca3fd44d8d)
 
 > Zero-copy DuckDB engine over `~/.claude/projects/**/*.jsonl` transcripts,
 > with Cohere Embed v4 semantic search via DuckDB VSS.
+> HNSW wired in v1, not deferred.
 > Last verified against corpus: 2026-04-19.
 
 Corpus snapshot at capture time: 9,503 top-level sessions, 3,145 subagent
 sessions, 10,077 TodoWrite events. `mise run check` green (ruff lint + ruff
 format + `ty check src/` + pytest, 15 tests).
+
+Companion to the long-form research report at
+`../../claude-sql-zero-copy-engine-research.md` (22 sources). This file
+captures only the design decisions that survived into v1 and the tuning
+knobs worth revisiting; the original report covers alternatives,
+benchmarks, and citations in depth.
 
 ## 1. The Zero-Copy Read (DuckDB `read_json`)
 
@@ -78,7 +85,30 @@ touching ingest. For queries that hammer `block_type = 'text'`
 specifically (semantic-search embed pipeline), we materialize a thin
 `messages_text` view on top.
 
-## 3. Views + Macros
+## 3. Eleven Views + Six Macros
+
+Registration chain (`register_all` in `src/claude_sql/sql_views.py`):
+
+```
+register_all(con, settings)
+├── register_raw(con, glob=..., subagent_glob=..., subagent_meta_glob=...)
+│   ├── v_raw_events            <- read_json(projects/**/*.jsonl)
+│   ├── v_raw_subagents         <- read_json(projects/*/*/subagents/agent-*.jsonl)
+│   └── v_raw_subagent_meta     <- read_json(projects/*/*/subagents/agent-*.meta.json)
+├── register_views(con)
+│   └── 11 views (see below)
+├── register_vss(con, embeddings_parquet=..., dim=1024, metric='cosine', ...)
+│   ├── INSTALL + LOAD vss
+│   ├── CREATE OR REPLACE TABLE message_embeddings (from parquet if present)
+│   └── CREATE INDEX idx_msg_hnsw USING HNSW (embedding)
+└── register_macros(con, settings)
+    └── 6 macros: model_used, cost_estimate, tool_rank, todo_velocity,
+        subagent_fanout, semantic_search
+```
+
+Order matters: `register_vss` must run before `register_macros` because the
+`semantic_search` macro body references `message_embeddings`, and DuckDB
+resolves macro bodies at creation time.
 
 Views (11 total, all registered by `register_views` in order):
 
@@ -122,6 +152,16 @@ Model config (from `config.Settings`):
 - `embedding_type = "int8"` — requested from Cohere for compactness on
   the wire.
 
+> **Model-ID correction callout.** The default model ID is
+> `cohere.embed-v4:0` (direct on-demand, us-east-1). The
+> `us.cohere.embed-v4:0` CRIS profile is exposed as `Settings.cris_model_id`
+> and activated with `use_cris=True` when cross-region failover is needed —
+> not default because CRIS requires inference-profile ARN IAM permissions
+> (`bedrock:InvokeModel` on
+> `arn:aws:bedrock:*:*:inference-profile/us.cohere.embed-v4:0`), which not
+> all dev accounts carry. `Settings.active_model_id` returns the right one
+> based on `use_cris`, so the embed worker doesn't branch on it.
+
 Storage shape: Cohere returns int8, DuckDB VSS only supports `FLOAT`
 element type. `register_vss` converts on insert:
 
@@ -156,10 +196,14 @@ WITH (
 );
 ```
 
-`hnsw_enable_experimental_persistence` is **not** enabled. The index is
-rebuilt on every connection open — the parquet is the source of truth,
-the index is a rebuildable cache. DuckDB flags HNSW persistence as
-experimental in 2026; rebuild-on-startup is the safe default.
+**Persistence clarification.** HNSW index is **rebuilt at connection open
+from `~/.claude/embeddings.parquet`** — `hnsw_enable_experimental_persistence`
+is **NOT** used. DuckDB flags HNSW persistence as experimental in 2026
+(WAL recovery isn't fully implemented for custom indexes), so we treat the
+parquet as the source of truth and the in-memory HNSW as a rebuildable
+cache. Rebuild cost is a one-time minutes-scale build per `claude-sql`
+invocation; acceptable for an interactive CLI because `register_all` only
+runs once per command.
 
 `semantic_search` triggers the index rewrite by issuing
 `ORDER BY array_distance(embedding, query_vec) LIMIT k` — the VSS planner
@@ -179,20 +223,21 @@ embed is ~$60 one-time on-demand. Batch inference
 (`CreateModelInvocationJob`) roughly halves that; we have not yet wired a
 batch path in `embed_worker`.
 
-## 6. Open Questions
+## 6. Open Questions / Next Steps
 
-- [ ] Time HNSW build on dev hardware at the actual embedding volume once
-  `claude-sql embed` has run end-to-end.
+- [ ] Benchmark HNSW build time at 1M × 1024d on dev hardware. First
+      measurement pending.
 - [ ] 50-query manual retrieval eval on the real corpus to validate Cohere
-  v4 choice against Titan V2.
-- [ ] Re-test `hnsw_enable_experimental_persistence=true` on a throwaway
-  DB when DuckDB marks it stable; drop the rebuild-on-startup path if so.
+      v4 choice against Titan V2.
 - [ ] Decide nightly batch vs incremental-on-demand threshold for embed
-  backfill (break-even roughly >1000 new messages/day).
+      backfill (break-even roughly >1000 new messages/day).
 - [ ] Subagent transcripts contain `sessionId` too — currently we key
-  `subagent_sessions` by `parent_session_id + agent_hex` derived from the
-  filesystem path. Revisit once we see production workloads where agents
-  cross-reference each other.
+      `subagent_sessions` by `parent_session_id + agent_hex` derived from
+      the filesystem path. Revisit once we see workloads where agents
+      cross-reference each other.
+- [ ] Normalize dated model IDs (`claude-haiku-4-5-20251001`) against the
+      pricing keys in `config.DEFAULT_PRICING` so `cost_estimate` doesn't
+      silently NULL them out.
 
 ### What we verified live
 

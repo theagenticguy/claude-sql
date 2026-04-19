@@ -1,10 +1,18 @@
 # claude-sql
 
-Zero-copy SQL over `~/.claude/projects/**/*.jsonl` transcripts, with
-Cohere Embed v4 semantic search via DuckDB VSS. The corpus is queried in
-place through `read_json` — no ETL, no parquet ingest (except for
-embeddings, which are append-only). Views and macros are registered into
-a fresh in-memory DuckDB connection on every command.
+Zero-copy SQL over `~/.claude/` JSONL transcripts with Cohere Embed v4
+semantic search (via DuckDB VSS / HNSW).
+
+## What it does
+
+No ETL, no parquet materialization for the transcripts themselves. DuckDB
+reads `~/.claude/projects/**/*.jsonl` directly via `read_json(...,
+filename=true, union_by_name=true, sample_size=-1)`, and 11 business-level
+views are registered on top at connection open. Task tracking (`todo_events`,
+`todo_state_current`) and subagents (`subagent_sessions`, `subagent_messages`)
+are first-class citizens alongside `sessions` and `messages`. Semantic search
+runs on an HNSW cosine index over Cohere Embed v4 vectors stored in a single
+parquet file that gets rebuilt into memory on every `claude-sql` invocation.
 
 ## Install
 
@@ -12,69 +20,117 @@ a fresh in-memory DuckDB connection on every command.
 uv sync
 ```
 
-Requires Python 3.12+ and the `duckdb` binary on PATH if you want to use
-`claude-sql shell`. Bedrock access is needed for `claude-sql embed` /
-`claude-sql search`; everything else is local.
+Optional: `mise install` if you want the `mise run check` / `mise run test`
+tasks. The `duckdb` binary on PATH is needed for `claude-sql shell`; Bedrock
+access (AWS creds in the environment) is needed for `claude-sql embed` and
+`claude-sql search`. Everything else is purely local.
 
-## Quick start
+## Quick tour
 
 ```bash
-# List every registered view with columns, plus the macro inventory.
+# Inspect everything that's registered (11 views, 6 macros).
 uv run claude-sql schema
 
-# Run a SQL query (results print as a polars table).
-uv run claude-sql query "SELECT count(*) FROM sessions"
+# Run a query — this is the work-item acceptance prompt.
+uv run claude-sql query "
+  SELECT session_id, model_used(session_id) AS model,
+         cost_estimate(session_id) AS usd
+  FROM sessions
+  WHERE started_at >= current_timestamp - INTERVAL 30 DAY
+    AND model_used(session_id) LIKE '%opus%'
+    AND cost_estimate(session_id) > 5.0
+  ORDER BY usd DESC
+"
 
-# Show the EXPLAIN ANALYZE plan with pushdown markers highlighted.
-uv run claude-sql explain "SELECT uuid, role FROM messages WHERE session_id = '<uuid>'"
+# EXPLAIN ANALYZE plan with pushdown markers highlighted in green.
+uv run claude-sql explain "SELECT * FROM messages WHERE session_id = '11111111-...' LIMIT 1"
 
-# Backfill embeddings via Cohere Embed v4 on Bedrock.
-uv run claude-sql embed --since-days 30
-
-# Semantic search (requires embeddings).
-uv run claude-sql search "temporal determinism" --k 5
-
-# Or drop into the DuckDB REPL with everything pre-registered.
+# Drop into the DuckDB REPL with everything pre-registered.
 uv run claude-sql shell
+
+# Backfill embeddings (Cohere Embed v4 on Bedrock).
+AWS_PROFILE=lalsaado-handson uv run claude-sql embed --since-days 30
+
+# Semantic search.
+uv run claude-sql search "temporal workflow determinism" --k 10
 ```
 
-See `docs/cookbook.md` for ready-to-run recipes against the real corpus.
+See [docs/cookbook.md](docs/cookbook.md) for more recipes with real outputs
+pasted from the dev-host corpus.
+
+## Architecture
+
+Four modules under `src/claude_sql/`:
+
+- `config.py` — pydantic v2 `Settings` with env prefix `CLAUDE_SQL_`.
+- `sql_views.py` — DuckDB views + macros + VSS/HNSW setup.
+- `embed_worker.py` — async Bedrock embedding worker with tenacity retry
+  and `asyncio.gather` over a semaphore.
+- `cli.py` — cyclopts CLI.
+
+Data flow:
+
+```
+~/.claude/projects/*/*.jsonl ──┐
+                               │
+~/.claude/projects/*/*/        │  read_json(filename=true,
+  subagents/agent-*.jsonl ─────┼──> union_by_name=true,      ──> v_raw_*
+                               │  sample_size=-1)                views
+~/.claude/projects/*/*/        │
+  subagents/agent-*.meta.json ─┘
+                                     │
+                                     ▼
+                               11 business-level views
+                               (sessions, messages, content_blocks,
+                                messages_text, tool_calls, tool_results,
+                                todo_events, todo_state_current, task_spawns,
+                                subagent_sessions, subagent_messages)
+                                     │
+        ┌────────────────────────────┼──────────────────────────┐
+        │                            │                          │
+        ▼                            ▼                          ▼
+   claude-sql query /          claude-sql embed          claude-sql search
+   explain / schema            (writes parquet)           (HNSW + macro)
+                                     │                          ▲
+                                     ▼                          │
+                         ~/.claude/embeddings.parquet ──────────┘
+                         (rebuilt into message_embeddings
+                          + HNSW idx on every connection open)
+```
 
 ## Views
 
-- **sessions** — one row per top-level transcript, rolled up from raw
-  JSONL grouped by the filename-derived session id.
-- **messages** — user + assistant events with token usage and
-  `content_json` kept as JSON for lazy flattening.
-- **content_blocks** — one row per element in `message.content[]`, typed
-  by `block_type` (text, tool_use, tool_result, thinking).
-- **messages_text** — text blocks only; substrate for embeddings.
-- **tool_calls** — `content_blocks` where `block_type = 'tool_use'`.
-- **tool_results** — `content_blocks` where `block_type = 'tool_result'`.
-- **todo_events** — one row per todo per TodoWrite snapshot, ordered by
-  `snapshot_ix`.
-- **todo_state_current** — latest status per `(session_id, subject)`.
-- **task_spawns** — `tool_calls` filtered to Task / Agent / TaskCreate
-  launch sites.
-- **subagent_sessions** — rolled-up subagent runs joined with the sibling
-  `agent-*.meta.json` files for `agent_type` + `description`.
-- **subagent_messages** — user + assistant events from subagent
-  transcripts.
+| View | One-line description | Key column(s) |
+|---|---|---|
+| `sessions` | One row per top-level transcript file. | `session_id`, `started_at` |
+| `messages` | User + assistant events with usage counters. | `uuid`, `session_id`, `model` |
+| `content_blocks` | Flattened `message.content[]`. | `block_type`, `tool_name` |
+| `messages_text` | Text-only substrate for embeddings. | `uuid`, `text_content` |
+| `tool_calls` | `content_blocks` where `block_type='tool_use'`. | `tool_name`, `tool_use_id` |
+| `tool_results` | `content_blocks` where `block_type='tool_result'`. | `tool_use_id`, `content` |
+| `todo_events` | One row per todo per `TodoWrite` snapshot. | `subject`, `status`, `snapshot_ix` |
+| `todo_state_current` | Latest status per `(session, subject)`. | `status`, `written_at` |
+| `task_spawns` | `Task` / `Agent` / `TaskCreate` launch sites. | `subagent_type`, `prompt` |
+| `subagent_sessions` | One row per subagent run. | `parent_session_id`, `agent_hex`, `agent_type` |
+| `subagent_messages` | user+assistant events from subagent transcripts. | `parent_session_id`, `agent_hex` |
+
+Full column listings in [docs/jsonl_schema_v1.sql](docs/jsonl_schema_v1.sql).
 
 ## Macros
 
-- **model_used(sid)** — latest model used in a session.
-- **cost_estimate(sid)** — USD via `config.DEFAULT_PRICING`.
-- **tool_rank(last_n_days)** — table macro; tool-use leaderboard.
-- **todo_velocity(sid)** — completed / distinct todos.
-- **subagent_fanout(sid)** — count of subagent runs for a session.
-- **semantic_search(query_vec, k)** — table macro issuing HNSW-backed
-  top-k over `message_embeddings`.
+| Macro | Signature | Description |
+|---|---|---|
+| `model_used` | `(sid) -> VARCHAR` | Latest `model` observed in a session. |
+| `cost_estimate` | `(sid) -> DOUBLE` | USD via `config.DEFAULT_PRICING` (in + cache-write at in_rate, out at out_rate). |
+| `tool_rank` | `(last_n_days) -> TABLE(tool_name, n)` | Tool-use leaderboard. |
+| `todo_velocity` | `(sid) -> DOUBLE` | `completed / distinct_subjects` in `todo_state_current`. |
+| `subagent_fanout` | `(sid) -> BIGINT` | Count of `subagent_sessions` with `parent_session_id = sid`. |
+| `semantic_search` | `(query_vec, k) -> TABLE(uuid, sim, distance)` | HNSW cosine top-k over `message_embeddings`. |
 
-## Config
+## Env vars
 
-All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via
-`.env` in the working directory). Fields live on
+All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via a
+`.env` file in the working directory). Fields live on
 `claude_sql.config.Settings`.
 
 | Env var | Default | Purpose |
@@ -87,7 +143,7 @@ All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via
 | `CLAUDE_SQL_CRIS_MODEL_ID` | `us.cohere.embed-v4:0` | CRIS failover profile. |
 | `CLAUDE_SQL_USE_CRIS` | `false` | Send requests to the CRIS profile instead. |
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Embedding dim (256 / 512 / 1024 / 1536). |
-| `CLAUDE_SQL_EMBEDDING_TYPE` | `int8` | Type Cohere returns (stored as `FLOAT[]` in DuckDB). |
+| `CLAUDE_SQL_EMBEDDING_TYPE` | `int8` | Type Cohere returns (cast to `FLOAT[]` at load). |
 | `CLAUDE_SQL_CONCURRENCY` | `8` | Embed-worker concurrency. |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Max texts per Cohere request. |
 | `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings.parquet` | Where the embed worker writes. |
@@ -100,14 +156,27 @@ All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via
 `model_id` vs `cris_model_id`: `model_id` is the direct on-demand profile
 (fastest path in-region). `cris_model_id` is the cross-region inference
 profile — flip `CLAUDE_SQL_USE_CRIS=true` when the direct profile throttles
-or when running outside us-east-1.
+or when running outside us-east-1. See
+[docs/research_notes.md](docs/research_notes.md) for why CRIS isn't the
+default (IAM permissions on inference-profile ARNs).
 
-## Related docs
+## Development
 
-- [docs/cookbook.md](docs/cookbook.md) — recipes with real-corpus output.
-- [docs/research_notes.md](docs/research_notes.md) — design rationale and
-  what we verified live.
+```bash
+mise run check   # ruff lint + ruff format --check + ty check src/ + pytest (15 tests)
+mise run test
+mise run lint
+mise run typecheck
+```
+
+## Links
+
+- [Research report](../claude-sql-zero-copy-engine-research.md) — 22 sources,
+  design rationale, pricing comparisons.
+- [docs/cookbook.md](docs/cookbook.md) — runnable recipes with real outputs.
+- [docs/research_notes.md](docs/research_notes.md) — schema stability + HNSW
+  + embedding design notes.
 - [docs/jsonl_schema_v1.sql](docs/jsonl_schema_v1.sql) — captured DESCRIBE
-  for every registered view.
+  for every registered view and the three raw read_json sources.
 - [docs/queries/thread_walk.sql](docs/queries/thread_walk.sql) — recursive
   CTE that walks `parent_uuid -> uuid` to reconstruct conversation trees.

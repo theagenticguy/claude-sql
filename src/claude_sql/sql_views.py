@@ -524,6 +524,9 @@ def register_macros(
         """
     )
 
+    # Pricing join uses a prefix match so dated model IDs like
+    # ``claude-haiku-4-5-20251001`` still resolve to the base entry
+    # ``claude-haiku-4-5`` in ``DEFAULT_PRICING``.
     con.execute(
         f"""
         CREATE OR REPLACE MACRO cost_estimate(sid) AS (
@@ -533,7 +536,7 @@ def register_macros(
             ) / 1e6
             FROM messages m
             JOIN (VALUES {pricing_rows}) p(model, in_rate, out_rate)
-              USING (model)
+              ON regexp_replace(m.model, '-\\d{{8}}$', '') = p.model
             WHERE m.session_id = sid
         );
         """
