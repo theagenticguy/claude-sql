@@ -1,8 +1,9 @@
 [project]
 name = "claude-sql"
 version = "0.1.0"
-description = "Zero-copy SQL engine over ~/.claude/ JSONL transcripts with Cohere Embed v4 semantic search."
+description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
 readme = "README.md"
+license = { text = "Apache-2.0" }
 authors = [
     { name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }
 ]
