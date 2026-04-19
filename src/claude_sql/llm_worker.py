@@ -333,6 +333,48 @@ async def _classify_sessions_async(
     return written
 
 
+def _count_pending_sessions(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    already: set[str],
+    since_days: int | None,
+    limit: int | None,
+) -> int:
+    """Return the count of sessions that have text messages but no classification yet.
+
+    Pure SQL — does NOT materialize any session text.  This is the fast path for
+    ``--dry-run`` cost estimation against the full corpus (the previous path
+    iterated :func:`iter_session_texts`, which took ~15 min on 6K+ sessions).
+    """
+    where = ["mt.text_content IS NOT NULL", "length(mt.text_content) >= 1"]
+    if since_days is not None:
+        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
+    sql = f"""
+        SELECT count(DISTINCT CAST(mt.session_id AS VARCHAR))
+          FROM messages_text mt
+         WHERE {" AND ".join(where)}
+    """
+    row = con.execute(sql).fetchone()
+    total = int(row[0]) if row is not None else 0
+    if already:
+        # Subtract sessions that already have a classification.  We pull only
+        # the overlap via a parameterized IN so we don't double-count sessions
+        # in ``already`` that aren't actually in the corpus anymore.
+        placeholders = ",".join("?" for _ in already)
+        overlap_sql = f"""
+            SELECT count(DISTINCT CAST(mt.session_id AS VARCHAR))
+              FROM messages_text mt
+             WHERE {" AND ".join(where)}
+               AND CAST(mt.session_id AS VARCHAR) IN ({placeholders})
+        """
+        overlap_row = con.execute(overlap_sql, list(already)).fetchone()
+        overlap = int(overlap_row[0]) if overlap_row is not None else 0
+        total = max(0, total - overlap)
+    if limit is not None:
+        total = min(total, int(limit))
+    return total
+
+
 def classify_sessions(
     con: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -346,15 +388,23 @@ def classify_sessions(
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
 
     if dry_run:
-        pending = list(
-            iter_session_texts(con, settings=settings, since_days=since_days, limit=limit)
+        already: set[str] = set()
+        if (
+            settings.classifications_parquet_path.exists()
+            and settings.classifications_parquet_path.stat().st_size > 16
+        ):
+            already = set(
+                pl.read_parquet(settings.classifications_parquet_path)["session_id"].to_list()
+            )
+        pending_count = _count_pending_sessions(
+            con, already=already, since_days=since_days, limit=limit
         )
         # Back-of-envelope: avg 8K input tokens, 300 output per session.
-        cost = _estimate_cost(len(pending), 8000, 300, settings.sonnet_pricing)
+        cost = _estimate_cost(pending_count, 8000, 300, settings.sonnet_pricing)
         logger.info(
             "classify --dry-run: {} sessions pending.  Estimated cost ~${:.2f} "
             "(thinking={}, model={})",
-            len(pending),
+            pending_count,
             cost,
             thinking_mode,
             settings.sonnet_model_id,
@@ -699,13 +749,19 @@ def detect_conflicts(
     """Detect stance conflicts per session and return count processed."""
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
     if dry_run:
-        pending = list(
-            iter_session_texts(con, settings=settings, since_days=since_days, limit=limit)
+        already: set[str] = set()
+        if (
+            settings.conflicts_parquet_path.exists()
+            and settings.conflicts_parquet_path.stat().st_size > 16
+        ):
+            already = set(pl.read_parquet(settings.conflicts_parquet_path)["session_id"].to_list())
+        pending_count = _count_pending_sessions(
+            con, already=already, since_days=since_days, limit=limit
         )
-        cost = _estimate_cost(len(pending), 6000, 400, settings.sonnet_pricing)
+        cost = _estimate_cost(pending_count, 6000, 400, settings.sonnet_pricing)
         logger.info(
             "conflicts --dry-run: {} sessions, estimated cost ~${:.2f}",
-            len(pending),
+            pending_count,
             cost,
         )
         return 0
