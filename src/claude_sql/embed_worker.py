@@ -90,19 +90,19 @@ def discover_unembedded(
         Messages needing embedding, in DuckDB's scan order.
     """
     if embeddings_parquet.exists():
+        # CREATE VIEW doesn't accept prepared parameters in DuckDB; escape inline.
+        parquet_literal = str(embeddings_parquet).replace("'", "''")
         con.execute(
-            "CREATE OR REPLACE TEMP VIEW _embedded AS SELECT uuid FROM read_parquet(?);",
-            [str(embeddings_parquet)],
+            f"CREATE OR REPLACE TEMP VIEW _embedded AS SELECT uuid FROM read_parquet('{parquet_literal}');"
         )
         anti = "AND mt.uuid NOT IN (SELECT uuid FROM _embedded)"
     else:
         anti = ""
 
     where = ["mt.text_content IS NOT NULL", "length(mt.text_content) > 0"]
-    params: list[Any] = []
     if since_days is not None:
-        where.append("mt.ts >= current_timestamp - INTERVAL (?) DAY")
-        params.append(since_days)
+        # DuckDB refuses to prepare an INTERVAL parameter; inline the coerced int.
+        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
 
     sql = (
         f"SELECT mt.uuid, mt.text_content FROM messages_text mt WHERE {' AND '.join(where)} {anti}"
@@ -110,8 +110,9 @@ def discover_unembedded(
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
 
-    rows = con.execute(sql, params).fetchall()
-    return [(r[0], r[1]) for r in rows]
+    rows = con.execute(sql).fetchall()
+    # DuckDB returns UUIDs as uuid.UUID objects; polars wants str for pl.Utf8.
+    return [(str(r[0]), r[1]) for r in rows]
 
 
 def _build_bedrock_client(settings: Settings) -> Any:
@@ -369,6 +370,9 @@ async def run_backfill(
     logger.info("Embedded {} vectors in {:.1f}s", len(vectors), elapsed)
 
     now = datetime.now(UTC)
+    # Polars infers nested list[float] as Object when the batch is small or
+    # when rows are handed in as Python lists; force a fixed-size Array so
+    # write_parquet succeeds and DuckDB VSS sees FLOAT[dim] on read.
     df = pl.DataFrame(
         {
             "uuid": [p[0] for p in pending],
@@ -376,7 +380,14 @@ async def run_backfill(
             "dim": [settings.output_dimension] * len(pending),
             "embedding": vectors,
             "embedded_at": [now] * len(pending),
-        }
+        },
+        schema={
+            "uuid": pl.Utf8,
+            "model": pl.Utf8,
+            "dim": pl.UInt16,
+            "embedding": pl.Array(pl.Float32, settings.output_dimension),
+            "embedded_at": pl.Datetime("us", "UTC"),
+        },
     )
 
     path = settings.embeddings_parquet_path
