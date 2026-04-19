@@ -1,14 +1,36 @@
+# mise-en-place configuration for claude-sql.
+#
+# Best-practice mise + uv combo:
+#   * ``mise`` pins tool versions (Python, uv) so contributors get identical
+#     interpreters without touching system Python.
+#   * ``_.python.venv`` auto-creates ``.venv`` on ``cd`` and activates it.
+#   * ``uv`` manages packages + lockfile (``uv.lock``); never hand-edit deps
+#     in ``pyproject.toml`` — use ``uv add``/``uv remove``.
+#   * Every project command is a mise task so the ``claude-sql`` developer
+#     only needs ``mise run <task>`` (no memorizing raw ``uv``/``ruff`` invocations).
+
 [tools]
 python = "3.12"
+uv = "latest"
 
 [env]
 _.python.venv = { path = ".venv", create = true }
 
-[tasks.test]
-description = "Run tests"
-run = "uv run pytest tests/ --no-header -q"
-# Allow pytest exit code 5 (no tests collected) during early scaffolding.
-# Once tests exist this is effectively a strict `pytest` run.
+# ---------------------------------------------------------------------------
+# Install / sync
+# ---------------------------------------------------------------------------
+
+[tasks.install]
+description = "Install all deps from uv.lock into .venv"
+run = "uv sync --all-extras"
+
+[tasks.upgrade]
+description = "Upgrade every dependency to the latest compatible version"
+run = "uv lock --upgrade && uv sync"
+
+# ---------------------------------------------------------------------------
+# Quality gates (run in parallel inside `mise run check`)
+# ---------------------------------------------------------------------------
 
 [tasks.lint]
 description = "Lint with ruff"
@@ -18,10 +40,42 @@ run = "uv run ruff check ."
 description = "Check formatting"
 run = "uv run ruff format --check ."
 
+[tasks."fmt:write"]
+description = "Apply formatting"
+run = "uv run ruff format ."
+
 [tasks.typecheck]
-description = "Type check with ty"
+description = "Type-check with ty"
 run = "uv run ty check src/"
 
+[tasks.test]
+description = "Run the full pytest suite"
+run = "uv run pytest tests/ --no-header -q"
+
 [tasks.check]
-description = "All quality gates: lint + format + typecheck + test"
+description = "All quality gates: lint + fmt + typecheck + test"
 depends = ["lint", "fmt", "typecheck", "test"]
+
+# ---------------------------------------------------------------------------
+# Build / release
+# ---------------------------------------------------------------------------
+
+[tasks.build]
+description = "Build wheel + sdist into dist/"
+run = "uv build"
+
+[tasks."tool:install"]
+description = "Install claude-sql as a uv tool (global, isolated venv)"
+run = "uv tool install --from . claude-sql --force"
+
+[tasks."tool:uninstall"]
+description = "Uninstall the claude-sql uv tool"
+run = "uv tool uninstall claude-sql"
+
+# ---------------------------------------------------------------------------
+# CLI passthrough (so ``mise run cli -- schema`` works as shorthand)
+# ---------------------------------------------------------------------------
+
+[tasks.cli]
+description = "Run the claude-sql CLI in this venv"
+run = "uv run claude-sql"
