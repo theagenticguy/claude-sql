@@ -67,18 +67,10 @@ class Settings(BaseSettings):
     # Bedrock / embedding
     # ------------------------------------------------------------------
     region: str = "us-east-1"
-    #: Direct on-demand model ID (default for single-region in-region use).
-    model_id: str = "cohere.embed-v4:0"
-    #: US CRIS inference profile (cross-region in us-east-1/2, us-west-1/2).
-    cris_model_id: str = "us.cohere.embed-v4:0"
-    #: Global CRIS inference profile — widest throughput ceiling.
-    global_model_id: str = "global.cohere.embed-v4:0"
-    #: Routing mode. ``"direct"`` uses ``model_id``, ``"us"`` uses the US CRIS
-    #: profile (4-region pool), ``"global"`` uses the global CRIS profile
-    #: (worldwide pool with the highest effective TPM ceiling).
-    routing: Literal["direct", "us", "global"] = "direct"
-    #: Legacy switch retained for compatibility; equivalent to ``routing="us"``.
-    use_cris: bool = False
+    #: Cohere Embed v4 global CRIS profile. Sustained 223 vec/s with zero
+    #: throttling at concurrency=8 in testing; US-only and direct on-demand
+    #: both throttle hard at low TPM. No reason to expose the knob.
+    model_id: str = "global.cohere.embed-v4:0"
 
     output_dimension: Literal[256, 512, 1024, 1536] = 1024
     embedding_type: Literal["int8", "float", "uint8", "binary", "ubinary"] = "int8"
@@ -103,15 +95,5 @@ class Settings(BaseSettings):
 
     @property
     def active_model_id(self) -> str:
-        """Return the model ID that should actually be sent to Bedrock.
-
-        Priority order:
-        1. ``routing="global"`` → ``global_model_id`` (widest TPM ceiling).
-        2. ``routing="us"`` → ``cris_model_id`` (4-region US pool).
-        3. ``routing="direct"`` (default) or ``use_cris=True`` legacy flag.
-        """
-        if self.routing == "global":
-            return self.global_model_id
-        if self.routing == "us" or self.use_cris:
-            return self.cris_model_id
+        """Return the Bedrock model ID (kept as a property for call-site stability)."""
         return self.model_id

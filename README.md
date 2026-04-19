@@ -139,9 +139,7 @@ All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via a
 | `CLAUDE_SQL_SUBAGENT_GLOB` | `~/.claude/projects/*/*/subagents/agent-*.jsonl` | Subagent transcripts. |
 | `CLAUDE_SQL_SUBAGENT_META_GLOB` | `~/.claude/projects/*/*/subagents/agent-*.meta.json` | Sibling meta for subagents. |
 | `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region. |
-| `CLAUDE_SQL_MODEL_ID` | `cohere.embed-v4:0` | Direct on-demand model id. |
-| `CLAUDE_SQL_CRIS_MODEL_ID` | `us.cohere.embed-v4:0` | CRIS failover profile. |
-| `CLAUDE_SQL_USE_CRIS` | `false` | Send requests to the CRIS profile instead. |
+| `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Cohere Embed v4 global CRIS profile (sustained ~220 vec/s with zero throttling). |
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Embedding dim (256 / 512 / 1024 / 1536). |
 | `CLAUDE_SQL_EMBEDDING_TYPE` | `int8` | Type Cohere returns (cast to `FLOAT[]` at load). |
 | `CLAUDE_SQL_CONCURRENCY` | `8` | Embed-worker concurrency. |
@@ -153,12 +151,12 @@ All settings are overridable via env vars prefixed `CLAUDE_SQL_` (or via a
 | `CLAUDE_SQL_HNSW_M` | `16` | HNSW `M`. |
 | `CLAUDE_SQL_HNSW_M0` | `32` | HNSW `M0`. |
 
-`model_id` vs `cris_model_id`: `model_id` is the direct on-demand profile
-(fastest path in-region). `cris_model_id` is the cross-region inference
-profile — flip `CLAUDE_SQL_USE_CRIS=true` when the direct profile throttles
-or when running outside us-east-1. See
-[docs/research_notes.md](docs/research_notes.md) for why CRIS isn't the
-default (IAM permissions on inference-profile ARNs).
+Why `global.cohere.embed-v4:0`: the direct `cohere.embed-v4:0` profile and
+the US CRIS pool both throttle aggressively on modest token rates (8 × 96
+batches blew through the TPM bucket in seconds in real-corpus testing).
+The `global.*` CRIS profile routes to the worldwide Bedrock capacity pool
+and sustained 223 vec/s at concurrency=8 with zero `ThrottlingException`s.
+Kept as a single default; no routing knob.
 
 ## Development
 

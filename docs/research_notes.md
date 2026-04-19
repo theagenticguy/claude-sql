@@ -141,26 +141,23 @@ Macros (six, all registered by `register_macros`):
 
 Model config (from `config.Settings`):
 
-- `model_id = "cohere.embed-v4:0"` — direct on-demand in us-east-1. This
-  is the default.
-- `cris_model_id = "us.cohere.embed-v4:0"` — the cross-region inference
-  (CRIS) failover profile. Gated behind `use_cris = False`; flip it on
-  in env (`CLAUDE_SQL_USE_CRIS=true`) when running outside us-east-1 or
-  when throttling warrants regional fan-out.
+- `model_id = "global.cohere.embed-v4:0"` — Cohere Embed v4 global CRIS
+  inference profile. Hardcoded as the single default; see the routing
+  callout below.
 - `output_dimension = 1024` — Matryoshka-truncatable later without
   re-embedding; 256 is the smallest supported by Embed v4.
 - `embedding_type = "int8"` — requested from Cohere for compactness on
   the wire.
 
-> **Model-ID correction callout.** The default model ID is
-> `cohere.embed-v4:0` (direct on-demand, us-east-1). The
-> `us.cohere.embed-v4:0` CRIS profile is exposed as `Settings.cris_model_id`
-> and activated with `use_cris=True` when cross-region failover is needed —
-> not default because CRIS requires inference-profile ARN IAM permissions
-> (`bedrock:InvokeModel` on
-> `arn:aws:bedrock:*:*:inference-profile/us.cohere.embed-v4:0`), which not
-> all dev accounts carry. `Settings.active_model_id` returns the right one
-> based on `use_cris`, so the embed worker doesn't branch on it.
+> **Routing decision.** The direct `cohere.embed-v4:0` and the US CRIS
+> `us.cohere.embed-v4:0` both throttled aggressively on the real corpus
+> (8×96 batch fan-out saturated the TPM bucket in seconds). The global
+> CRIS profile `global.cohere.embed-v4:0` sustained 223 vec/s at
+> concurrency=8 with zero `ThrottlingException`s. Since the global pool
+> always ≥ the direct/us pools, we hardcode it. No `use_cris`/`routing`
+> knobs. IAM requirement: `bedrock:InvokeModel` on
+> `arn:aws:bedrock:*:*:inference-profile/global.cohere.embed-v4:0` —
+> already present on `lalsaado-handson`.
 
 Storage shape: Cohere returns int8, DuckDB VSS only supports `FLOAT`
 element type. `register_vss` converts on insert:
