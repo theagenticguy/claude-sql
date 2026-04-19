@@ -58,6 +58,68 @@ uv run claude-sql search "temporal workflow determinism" --k 10
 See [docs/cookbook.md](docs/cookbook.md) for more recipes with real outputs
 pasted from the dev-host corpus.
 
+## v2 analytics
+
+Three new capabilities sit on top of the v1 substrate:
+
+1. **Session classification** — Sonnet 4.6 with Bedrock structured output
+   tags every session with `autonomy_tier`, `work_category`, `success`,
+   `goal`, and `confidence`.
+2. **Message clustering** — UMAP 50d -> UMAP 2d -> HDBSCAN over the Cohere
+   Embed v4 vectors; in-house c-TF-IDF labels each cluster with its top 10
+   1-2gram terms.
+3. **Session community detection** — Louvain (`networkx` >= 3.4) over a
+   cosine-similarity graph of session centroids, yielding coarse topic
+   neighborhoods per session.
+
+End-to-end dry-run:
+
+```bash
+uv run claude-sql analyze --dry-run --since-days 30
+```
+
+Prints pending counts and cost estimates for every LLM stage; pass
+`--no-dry-run` to spend real money. `--skip-<stage>` drops an individual
+stage; `--force-cluster` / `--force-community` rebuild those (non-LLM)
+parquets.
+
+**Six new subcommands.** All LLM-touching commands default to `--dry-run`.
+
+| Subcommand | One-line |
+|---|---|
+| `classify` | Sonnet 4.6 session-level autonomy + work + success + goal |
+| `trajectory` | Per-message sentiment delta + is_transition (regex prefilter -> Sonnet) |
+| `conflicts` | Per-session stance-conflict detection via Sonnet |
+| `cluster` | UMAP + HDBSCAN over `message_embeddings`; writes `clusters.parquet` |
+| `community` | Louvain community detection over session centroids |
+| `analyze` | Orchestrator: embed -> cluster + community -> classify -> trajectory -> conflicts |
+
+(`terms` also exists as a standalone step; `analyze` runs it automatically
+after `cluster`.)
+
+**Six new analytics macros.**
+
+| Macro | Signature |
+|---|---|
+| `autonomy_trend` | `(window_days) -> TABLE(week, autonomy_tier, n)` |
+| `work_mix` | `(since_days) -> TABLE(work_category, n)` |
+| `success_rate_by_work` | `(since_days) -> TABLE(work_category, sessions, success_rate, failure_rate, partial_rate)` |
+| `cluster_top_terms` | `(cluster_id, n) -> TABLE(term, weight, rank)` |
+| `community_top_topics` | `(community_id, n) -> TABLE(cluster_id, n_msgs, top_terms)` |
+| `sentiment_arc` | `(session_id) -> TABLE(ts, role, sentiment_delta, is_transition, text)` |
+
+**Seven new parquet-backed views** register at connection open if their
+parquet exists (missing ones warn and no-op): `session_classifications`,
+`session_goals`, `message_trajectory`, `session_conflicts`,
+`message_clusters`, `cluster_terms`, `session_communities`.
+
+`claude-sql classify --dry-run` is the recommended pre-flight — it prints
+a cost estimate ($/MTok * pending-session count) before you commit to the
+real Bedrock call.
+
+See [docs/analytics_cookbook.md](docs/analytics_cookbook.md) for runnable
+recipes per capability.
+
 ## Architecture
 
 Four modules under `src/claude_sql/`:

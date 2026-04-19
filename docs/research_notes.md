@@ -258,3 +258,131 @@ batch path in `embed_worker`.
   events.
 - **Quality gates green**: `mise run check` passes ruff lint, ruff format
   check, `ty check src/`, and the 15-test pytest suite.
+
+## v2 research
+
+v2 layers session-level analytics on top of the zero-copy substrate:
+clusters, communities, LLM-judged classifications/trajectory/conflicts. The
+research below captures design decisions that survived into v2 and the
+measurements that drove them. Verified against the corpus on 2026-04-19.
+
+### Corpus snapshot at v2 capture
+
+- 26,158 Cohere Embed v4 embeddings at `~/.claude/embeddings.parquet`.
+- 26,158 HDBSCAN cluster assignments at `~/.claude/clusters.parquet` —
+  299 signal clusters + 9,859 noise points (37.7%).
+- 2,990 c-TF-IDF term rows at `~/.claude/cluster_terms.parquet`
+  (299 clusters × 10 top 1-2gram terms).
+- 6,329 session-centroid embeddings grouped into 1,512 Louvain communities
+  at `~/.claude/session_communities.parquet`. Top-5 community sizes:
+  759, 711, 686, 450, 309.
+- `session_classifications.parquet`, `message_trajectory.parquet`, and
+  `session_conflicts.parquet` are pending. Full-corpus Sonnet 4.6 run is
+  roughly $455; estimate via `claude-sql classify --dry-run` before spending.
+
+### Sonnet 4.6 model and Bedrock structured output
+
+- **Model ID**: `global.anthropic.claude-sonnet-4-6`. CRIS-only (no direct
+  on-demand `claude-sonnet-4-6` ARN), 1M-context native, **no** beta header
+  required. Pricing $3/MTok input, $15/MTok output.
+- **Bedrock `output_config.format` is GA and replaces the earlier
+  tool_use/tool_choice plan.** Supported on Sonnet 4.5 / 4.6, Opus 4.5 / 4.6,
+  and Haiku 4.5. The request shape is `Converse`'s standard body plus
+  `output_config = {"format": {"json": {"schema": <JSON Schema>}}}` — the
+  model is *required* to emit a parseable JSON object conforming to the
+  schema.
+- **Schema rules.** JSON Schema Draft 2020-12 subset: `$ref`,
+  `$defs`, `allOf` union, and a few other features are disallowed. The
+  pydantic v2 `model_json_schema()` output must be flattened (inline every
+  `$ref`) and every object needs `additionalProperties: false` injected.
+  `claude_sql.schemas` has a `_flatten_schema` helper that does exactly this.
+- **`citations` is the *only* documented incompatibility** — `thinking`
+  is not mentioned as incompatible with structured output. We keep
+  `thinking: {"type": "adaptive"}` on by default for classify/trajectory/
+  conflicts, and expose a `--no-thinking` CLI escape hatch on each command
+  for when a run is hitting budget ceilings. (Adaptive thinking adds a few
+  hundred output tokens on average; disable if the dry-run estimate is
+  uncomfortable.)
+
+### Louvain community detection — networkx beats python-louvain
+
+`networkx.algorithms.community.louvain_communities` has been built in
+since networkx 3.4 and is the current maintained implementation. The old
+`python-louvain` package is stuck at its 2018 release — no bug fixes, no
+parallel modularity tweaks, and depends on the deprecated `community` shim.
+Switching saved one dependency and got us a measurable speedup on the real
+graph.
+
+Pipeline: build cosine-similarity graph from 6,329 session centroids, keep
+edges with `sim >= threshold` (default 0.75), pass to
+`louvain_communities(..., resolution=1.0)`.
+
+Measured wall time on the dev-host: 3.6s for 6,329 nodes -> 1,512 communities.
+The size distribution is heavy-tailed (top 5: 759, 711, 686, 450, 309; long
+tail of size-1 singletons).
+
+### UMAP + HDBSCAN — measured end-to-end
+
+26,158 × 1024d int8-cast-to-float embeddings. Reference times on dev-host:
+
+| Stage | Wall | Config |
+|---|---|---|
+| UMAP 50d | 78s | `n_neighbors=30, min_dist=0.0, metric='cosine'` |
+| UMAP 2d | 25s | Re-fit on 50d output for 2d visualization coords |
+| HDBSCAN | 8s | `min_cluster_size=20, min_samples=5, metric='euclidean'` on the 50d coords |
+| **Total** | **~110s** | Single-process, no GPU |
+
+299 clusters with 37.7% noise. Textual-embedding HDBSCAN literature puts a
+healthy noise band at 25-45%; 37.7% is in the middle — not aggressive
+over-clustering, not a dumping ground. Lowering `min_cluster_size` to 10
+would push noise down to ~30% but also split several coherent clusters.
+
+### In-house c-TF-IDF
+
+BERTopic pulls in sentence-transformers + UMAP + HDBSCAN + scikit-learn and
+pins specific versions — we already have UMAP/HDBSCAN, so we implement
+c-TF-IDF directly against CountVectorizer:
+
+- `CountVectorizer(min_df=2, max_df=0.95, ngram_range=(1, 2))`.
+- Pseudo-document per cluster via DuckDB `string_agg(text_content, ' ')`.
+- Weight formula: normalized per-cluster term frequency × `log(1 + avg /
+  col_sum)` where `avg` is the corpus-average column sum and `col_sum` is
+  the per-term column sum across clusters (BERTopic's original formulation).
+
+Output: 299 clusters × 10 terms = 2,990 rows in
+`~/.claude/cluster_terms.parquet`. `cluster_top_terms(cid, n)` exposes it
+as a macro; `community_top_topics(cid, n)` joins through
+`session_communities -> session_clusters -> cluster_terms` to label a
+community by the terms of the clusters its sessions' messages land in.
+
+### Stale JSONL bug — graceful skip in build_session_text
+
+`sessions` emits session UUIDs directly from `v_raw_events`. Over the
+corpus's lifetime, some JSONL files get deleted (worktree cleanup, failed
+rm-rf replays), but the session UUID lingers inside other files that
+reference it. The classify pipeline calls `build_session_text(session_id)`
+in `session_text.py` per pending session; when it hits a deleted file,
+DuckDB's `read_json` raises `duckdb.IOException` and the pipeline used to
+abort mid-run, losing every classification after the failure.
+
+Fix: `build_session_text` now catches `duckdb.IOException` and skips the
+session with a `logger.warning(...)` — the pipeline continues and the stale
+session shows up again on the next run. If the JSONL is still missing, it
+gets skipped again (harmless). If it has been restored, it gets classified.
+
+### Carry-forward: dated model IDs in `cost_estimate`
+
+The first v1 backfill surfaced a NULL-cost problem for dated model IDs like
+`claude-haiku-4-5-20251001`. `config.DEFAULT_PRICING` keys on the base IDs
+(`claude-haiku-4-5`), so the `JOIN` in `cost_estimate(sid)` missed the
+dated ones. Fix (shipped in v1.1, carried forward into v2):
+
+```sql
+JOIN (VALUES ...) p(model, in_rate, out_rate)
+  ON regexp_replace(m.model, '-\d{8}$', '') = p.model
+```
+
+The regex strips a trailing `-YYYYMMDD` date, so dated IDs resolve to the
+pricing-table base entry. No change to `DEFAULT_PRICING` required when
+Anthropic ships a new dated snapshot of an existing base model.
+

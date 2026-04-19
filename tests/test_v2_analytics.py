@@ -9,15 +9,26 @@ that the Bedrock ``output_config.format`` contract is honored (no
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import duckdb
 import polars as pl
+import pytest
 
+from claude_sql.config import Settings
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
+)
+from claude_sql.sql_views import (
+    register_analytics,
+    register_macros,
+    register_raw,
+    register_views,
+    register_vss,
 )
 
 # ---------------------------------------------------------------------------
@@ -185,3 +196,185 @@ def test_register_analytics_with_fixture_parquet(tmp_path: Any) -> None:
     # resolve and return both rows (both have goal set).
     (goals_n,) = con.execute("SELECT count(*) FROM session_goals").fetchone()
     assert goals_n == 2
+
+
+# ---------------------------------------------------------------------------
+# register_analytics via Settings + macros
+# ---------------------------------------------------------------------------
+
+
+def _make_classifications_parquet(path: Path, n: int = 10) -> None:
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "session_id": f"sess-{i:04d}",
+            "autonomy_tier": ["manual", "assisted", "autonomous"][i % 3],
+            "work_category": ["sde", "admin", "strategy_business"][i % 3],
+            "success": ["success", "partial", "failure"][i % 3],
+            "goal": f"goal {i}",
+            "confidence": 0.7 + 0.02 * i,
+            "classified_at": now,
+        }
+        for i in range(n)
+    ]
+    pl.DataFrame(
+        rows,
+        schema={
+            "session_id": pl.Utf8,
+            "autonomy_tier": pl.Utf8,
+            "work_category": pl.Utf8,
+            "success": pl.Utf8,
+            "goal": pl.Utf8,
+            "confidence": pl.Float32,
+            "classified_at": pl.Datetime("us", "UTC"),
+        },
+    ).write_parquet(path)
+
+
+def _make_clusters_parquet(path: Path, n: int = 20) -> None:
+    rows = [
+        {
+            "uuid": f"msg-{i:04d}",
+            "cluster_id": i % 4,
+            "x": float(i),
+            "y": float(i * 0.5),
+            "is_noise": False,
+        }
+        for i in range(n)
+    ]
+    pl.DataFrame(
+        rows,
+        schema={
+            "uuid": pl.Utf8,
+            "cluster_id": pl.Int32,
+            "x": pl.Float32,
+            "y": pl.Float32,
+            "is_noise": pl.Boolean,
+        },
+    ).write_parquet(path)
+
+
+def _make_cluster_terms_parquet(path: Path) -> None:
+    rows = []
+    for cid in range(4):
+        for rank, term in enumerate(["alpha", "beta", "gamma"], start=1):
+            rows.append({"cluster_id": cid, "term": term, "weight": 1.0 / rank, "rank": rank})
+    pl.DataFrame(
+        rows,
+        schema={
+            "cluster_id": pl.Int32,
+            "term": pl.Utf8,
+            "weight": pl.Float32,
+            "rank": pl.Int32,
+        },
+    ).write_parquet(path)
+
+
+@pytest.fixture
+def analytics_settings(tmp_path: Path) -> Settings:
+    _make_classifications_parquet(tmp_path / "cls.parquet")
+    _make_clusters_parquet(tmp_path / "clu.parquet")
+    _make_cluster_terms_parquet(tmp_path / "ter.parquet")
+    return Settings(
+        classifications_parquet_path=tmp_path / "cls.parquet",
+        clusters_parquet_path=tmp_path / "clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "ter.parquet",
+        # Leave trajectory/conflicts/communities pointing at nonexistent paths
+        trajectory_parquet_path=tmp_path / "nope_traj.parquet",
+        conflicts_parquet_path=tmp_path / "nope_conf.parquet",
+        communities_parquet_path=tmp_path / "nope_comm.parquet",
+    )
+
+
+def test_register_analytics_creates_available_views(analytics_settings: Settings) -> None:
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=analytics_settings)
+    rows = con.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+    ).fetchall()
+    names = {r[0] for r in rows}
+    assert "session_classifications" in names
+    assert "session_goals" in names
+    assert "message_clusters" in names
+    assert "cluster_terms" in names
+    # Missing parquets -> views not created
+    assert "message_trajectory" not in names
+    assert "session_conflicts" not in names
+    assert "session_communities" not in names
+
+
+def test_register_analytics_count_classifications(analytics_settings: Settings) -> None:
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=analytics_settings)
+    count = con.execute("SELECT count(*) FROM session_classifications").fetchone()[0]
+    assert count == 10
+
+
+def test_analytics_macros_register_safely(analytics_settings: Settings, tmp_path: Path) -> None:
+    """register_macros should succeed even when trajectory/conflicts/communities
+    parquets are missing (those macros are wrapped in _safe_macro).  v1 macros
+    still require the transcript-derived views + message_embeddings table."""
+    con = duckdb.connect(":memory:")
+    # v1 macros reference messages, tool_calls, todo_state_current,
+    # subagent_sessions, message_embeddings -- stand up an empty transcript
+    # dir so register_raw / register_views / register_vss succeed.
+    # register_raw + register_views need non-empty globs with enough shape
+    # for DuckDB to infer every column the DDL references.
+    proj = tmp_path / "projects" / "-x"
+    proj.mkdir(parents=True)
+    parent_uuid = "99999999-9999-9999-9999-999999999999"
+    sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    session_record = {
+        "parentUuid": None,
+        "isSidechain": False,
+        "type": "user",
+        "uuid": "u-m1",
+        "timestamp": "2026-04-01T10:00:00.000Z",
+        "sessionId": sid,
+        "version": "2.0.0",
+        "gitBranch": "main",
+        "cwd": "/x",
+        "userType": "external",
+        "entrypoint": "cli",
+        "permissionMode": "acceptEdits",
+        "promptId": "p-u-m1",
+        "message": {
+            "id": "m-u-m1",
+            "type": "message",
+            "role": "user",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "content": [{"type": "text", "text": "seed text for macros"}],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+    }
+    (proj / f"{sid}.jsonl").write_text(json.dumps(session_record) + "\n")
+    sub_dir = proj / parent_uuid / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-deadbeef.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "description": "placeholder"})
+    )
+    sub_record = dict(session_record, sessionId=f"sub-{parent_uuid}", uuid="sub-u-1")
+    (sub_dir / "agent-deadbeef.jsonl").write_text(json.dumps(sub_record) + "\n")
+    register_raw(
+        con,
+        glob=str(proj / "*.jsonl"),
+        subagent_glob=str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.jsonl"),
+        subagent_meta_glob=str(
+            tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.meta.json"
+        ),
+    )
+    register_views(con)
+    register_vss(con, embeddings_parquet=tmp_path / "__no_embeddings__.parquet")
+    register_analytics(con, settings=analytics_settings)
+    register_macros(con, settings=analytics_settings)
+    # Verify that cluster_top_terms is callable (its backing view exists)
+    rows = con.execute("SELECT term FROM cluster_top_terms(0, 5) ORDER BY rank").fetchall()
+    assert len(rows) == 3  # our fixture has 3 terms per cluster
+    assert [r[0] for r in rows] == ["alpha", "beta", "gamma"]
