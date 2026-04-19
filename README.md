@@ -1,38 +1,48 @@
 # claude-sql
 
-> Every Claude Code session you've ever run, queryable in SQL — without an
-> ETL step.
+> **Ask your Claude Code transcripts anything.**
+> Your sessions are already on disk. This turns them into a searchable,
+> explorable, self-improving record of your work.
 
-`claude-sql` points DuckDB at `~/.claude/projects/**/*.jsonl` and gives you
-a first-class analytics surface over your own transcripts: sessions,
-messages, tool calls, todos, subagents, semantic search via Cohere Embed
-v4, HDBSCAN message clusters, Louvain session communities, and
-Sonnet-4.6-driven session/message classifications. All joinable in a
-single SQL query. Zero copy, zero ingestion.
+## What you get out of it
 
-## Why you'd use this
+**Remember what you worked on.**
 
-You've had hundreds of conversations with Claude. The transcripts are
-already on disk. You can't answer any of these today:
+- "What was that thing I did last Tuesday with DuckDB and HNSW?"
+- "Show me every conversation I've had about temporal workflows,
+  ranked by relevance."
+- "Which week did I finally figure out the memory RCA?"
 
-- Which sessions used Opus and cost me more than $5 in the last 30 days?
-- What topics have I been working on this month? Which clusters grew or
-  shrank week-over-week?
-- Where did I spend the most time in tool calls vs. prose? Which tools
-  succeeded, which ones errored out?
-- What's my *autonomy tier* distribution — when do I hand-hold the agent
-  vs. when does it run autonomously? Has it shifted over time?
-- Which sessions ended in success vs. unresolved vs. abandoned?
-- Show me every session I've had about `DuckDB HNSW` semantically
-  (not just keyword-matched).
-- Which todo subjects did I create but never mark complete?
-- Which of my sessions spawn the most subagents? Which subagent types?
-- Is the work mix trending toward SDE, strategy, or admin?
-- Find every time a message contradicts a previous stance in the same
-  session — and how those conflicts resolved.
+**See where your time and money actually go.**
 
-`claude-sql` turns every one of those into a SQL query that runs in under
-a second on the live JSONL corpus (no export, no pipeline).
+- "Which sessions cost me more than $5 on Opus this month — and what
+  was I trying to do?"
+- "Which tools am I leaning on most? Which ones fail the most?"
+- "Where am I spending hours on prose vs. on tool calls?"
+
+**Notice patterns in how you work.**
+
+- "When do I hand-hold the agent step-by-step vs. let it run on its own?
+  Has that shifted?"
+- "What kinds of work am I doing most — coding, strategy, admin, writing?"
+- "Which session types actually finish successfully vs. trail off?"
+- "Which todos do I create and never close out?"
+
+**Surface themes across hundreds of conversations.**
+
+- "Group my sessions by what they're *about* and tell me what moved
+  this month."
+- "Show me the 10 biggest themes in my work and what's trending."
+- "When I've wrestled with the same problem across multiple sessions,
+  group them together so I can see the arc."
+
+**Catch yourself disagreeing with yourself.**
+
+- "Find sessions where I took two opposing positions on the same
+  decision — and flag which ones got resolved vs. abandoned."
+
+`claude-sql` turns every one of those into a SQL query that runs in
+under a second on the live JSONL corpus — no export, no pipeline.
 
 ## How it works
 
