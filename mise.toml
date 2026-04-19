@@ -1,0 +1,27 @@
+[tools]
+python = "3.12"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.test]
+description = "Run tests"
+run = "uv run pytest tests/ --no-header -q"
+# Allow pytest exit code 5 (no tests collected) during early scaffolding.
+# Once tests exist this is effectively a strict `pytest` run.
+
+[tasks.lint]
+description = "Lint with ruff"
+run = "uv run ruff check ."
+
+[tasks.fmt]
+description = "Check formatting"
+run = "uv run ruff format --check ."
+
+[tasks.typecheck]
+description = "Type check with ty"
+run = "uv run ty check src/"
+
+[tasks.check]
+description = "All quality gates: lint + format + typecheck + test"
+depends = ["lint", "fmt", "typecheck", "test"]
