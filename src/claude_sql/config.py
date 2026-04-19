@@ -33,6 +33,30 @@ def _default_embeddings_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/embeddings.parquet"))
 
 
+def _default_classifications_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/session_classifications.parquet"))
+
+
+def _default_trajectory_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/message_trajectory.parquet"))
+
+
+def _default_conflicts_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/session_conflicts.parquet"))
+
+
+def _default_clusters_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/clusters.parquet"))
+
+
+def _default_cluster_terms_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/cluster_terms.parquet"))
+
+
+def _default_communities_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
+
+
 # Model pricing per 1M tokens (in_rate, out_rate).  Mirrors claude-mine/transform.py.
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-7": (15.0, 75.0),
@@ -95,7 +119,60 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     pricing: dict[str, tuple[float, float]] = Field(default_factory=lambda: dict(DEFAULT_PRICING))
 
+    # ------------------------------------------------------------------
+    # v2: LLM classification (Bedrock Sonnet 4.6 + output_config.format)
+    # ------------------------------------------------------------------
+    #: Sonnet 4.6 global CRIS inference profile — CRIS-only, 1M context native,
+    #: no beta header. Supports `output_config.format` GA structured output.
+    sonnet_model_id: str = "global.anthropic.claude-sonnet-4-6"
+    #: (input, output) $/MTok for Sonnet 4.6 on Bedrock us-east-1.
+    sonnet_pricing: tuple[float, float] = (3.0, 15.0)
+    #: Thinking mode for classification.  ``"adaptive"`` keeps reasoning on;
+    #: ``"disabled"`` is the escape hatch if Bedrock 400s on thinking +
+    #: output_config (undocumented incompatibility).
+    classify_thinking: Literal["adaptive", "disabled"] = "adaptive"
+    #: Max output tokens for a single classification call.
+    classify_max_tokens: int = 2048
+    #: Per-text clip used when assembling session_text — tool_results can be
+    #: arbitrarily large (Bash output, file reads).
+    session_text_tool_result_max_chars: int = 50_000
+    #: Total session_text cap (conservative 800K chars ≈ 200K tokens, leaves
+    #: room for the response under the 1M window).
+    session_text_total_max_chars: int = 800_000
+
+    # v2 parquet outputs
+    classifications_parquet_path: Path = Field(default_factory=_default_classifications_parquet)
+    trajectory_parquet_path: Path = Field(default_factory=_default_trajectory_parquet)
+    conflicts_parquet_path: Path = Field(default_factory=_default_conflicts_parquet)
+    clusters_parquet_path: Path = Field(default_factory=_default_clusters_parquet)
+    cluster_terms_parquet_path: Path = Field(default_factory=_default_cluster_terms_parquet)
+    communities_parquet_path: Path = Field(default_factory=_default_communities_parquet)
+
+    # ------------------------------------------------------------------
+    # v2: UMAP + HDBSCAN + Louvain hyperparameters
+    # ------------------------------------------------------------------
+    umap_n_components_50: int = 50
+    umap_n_components_2: int = 2
+    umap_n_neighbors: int = 30
+    umap_min_dist_cluster: float = 0.0
+    umap_min_dist_viz: float = 0.1
+    umap_metric: str = "cosine"
+    hdbscan_min_cluster_size: int = 20
+    hdbscan_min_samples: int = 5
+    louvain_edge_threshold: float = 0.75
+    louvain_resolution: float = 1.0
+    seed: int = 42
+
+    # ------------------------------------------------------------------
+    # v2: TF-IDF
+    # ------------------------------------------------------------------
+    tfidf_min_df: int = 2
+    tfidf_max_df: float = 0.95
+    tfidf_ngram_min: int = 1
+    tfidf_ngram_max: int = 2
+    tfidf_top_n_terms: int = 10
+
     @property
     def active_model_id(self) -> str:
-        """Return the Bedrock model ID (kept as a property for call-site stability)."""
+        """Return the Bedrock embedding model ID (kept as a property for call-site stability)."""
         return self.model_id

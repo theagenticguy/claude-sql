@@ -428,7 +428,8 @@ def test_explain_has_pushdown_markers(fixtures_dir: Path) -> None:
 def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
     con = _connect(fixtures_dir)
     views = describe_all(con)
-    expected = {
+    # v1 business views must always be present with at least one column.
+    v1_views = {
         "sessions",
         "messages",
         "content_blocks",
@@ -441,10 +442,12 @@ def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
         "subagent_sessions",
         "subagent_messages",
     }
-    assert expected <= set(views.keys())
-    # Every view should have at least one column.
-    for name, cols in views.items():
-        assert cols, f"view {name} reported empty columns"
+    assert v1_views <= set(views.keys())
+    for name in v1_views:
+        assert views[name], f"v1 view {name} reported empty columns"
+    # v2 analytics views appear in VIEW_NAMES but only materialize when their
+    # parquets exist; this fixture uses a bare connection so describe_all
+    # returns [] for them, which is expected.
 
 
 def test_list_macros_includes_all(fixtures_dir: Path) -> None:

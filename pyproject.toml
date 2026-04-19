@@ -8,15 +8,21 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.40",
     "boto3>=1.42.91",
     "cyclopts>=4.10.2",
     "duckdb>=1.5.2",
+    "hdbscan>=0.8.40",
     "loguru>=0.7.3",
+    "networkx>=3.4",
     "polars>=1.40.0",
     "pyarrow>=23.0.1",
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
+    "scikit-learn>=1.5",
+    "scipy>=1.13",
     "tenacity>=9.1.4",
+    "umap-learn>=0.5.12",
 ]
 
 [project.scripts]

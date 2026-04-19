@@ -2,7 +2,9 @@
 
 Wires a DuckDB connection to the on-disk ``~/.claude/`` JSONL transcript corpus
 and exposes it as a stable set of zero-copy SQL views, analytical macros, and
-an HNSW-indexed embeddings table.
+an HNSW-indexed embeddings table.  v2 analytics outputs (classifications,
+trajectory, conflicts, clusters, communities) are surfaced as parquet-backed
+views alongside the transcript-derived views.
 
 Design notes
 ------------
@@ -16,6 +18,12 @@ Design notes
 * Subagent transcripts live in sibling ``agent-<hex>.jsonl`` files under
   ``subagents/`` with ``*.meta.json`` partners; they surface via dedicated
   views so primary-session views stay pure.
+* v2 analytics views (``session_classifications``, ``message_trajectory``,
+  ``session_conflicts``, ``message_clusters``, ``cluster_terms``,
+  ``session_communities``, and the derived ``session_goals``) are created by
+  :func:`register_analytics` from the corresponding parquet files.  Each is
+  skipped with a warning when its parquet is missing, so the function is
+  idempotent on partially-populated systems.
 * All views use ``CREATE OR REPLACE`` so callers may safely re-register.
 * Globs are inlined into DDL (DuckDB rejects prepared parameters as
   table-function arguments); ``sample_size`` and ``maximum_object_size`` are
@@ -41,7 +49,9 @@ SUBAGENT_GLOB: str = os.path.expanduser("~/.claude/projects/*/*/subagents/agent-
 SUBAGENT_META_GLOB: str = os.path.expanduser("~/.claude/projects/*/*/subagents/agent-*.meta.json")
 
 # Business-level views emitted by ``register_views``. Used by the
-# ``claude-sql schema`` subcommand for schema dumps.
+# ``claude-sql schema`` subcommand for schema dumps.  Includes the v2
+# analytics view names at the tail so ``describe_all`` can enumerate them
+# once :func:`register_analytics` has populated the corresponding parquets.
 VIEW_NAMES: tuple[str, ...] = (
     "sessions",
     "messages",
@@ -54,6 +64,48 @@ VIEW_NAMES: tuple[str, ...] = (
     "task_spawns",
     "subagent_sessions",
     "subagent_messages",
+    # v2 analytics views (materialize when the matching parquet exists).
+    "session_classifications",
+    "session_goals",
+    "message_trajectory",
+    "session_conflicts",
+    "message_clusters",
+    "cluster_terms",
+    "session_communities",
+)
+
+# Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
+# parquet outputs.  Exported so callers (``claude-sql`` subcommands, smoke
+# tests) can enumerate analytics views without needing to filter out the
+# transcript-derived views.
+ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
+    "session_classifications",
+    "session_goals",
+    "message_trajectory",
+    "session_conflicts",
+    "message_clusters",
+    "cluster_terms",
+    "session_communities",
+)
+
+# Macro names registered by :func:`register_macros`.  The first six are the
+# v1 macros that ship unconditionally; the remaining six are the v2 analytics
+# macros, each registered via :func:`_safe_macro` so a missing backing view
+# downgrades to a warning instead of an exception.
+MACRO_NAMES: tuple[str, ...] = (
+    "model_used",
+    "cost_estimate",
+    "tool_rank",
+    "todo_velocity",
+    "subagent_fanout",
+    "semantic_search",
+    # v2 analytics macros
+    "autonomy_trend",
+    "work_mix",
+    "success_rate_by_work",
+    "cluster_top_terms",
+    "community_top_topics",
+    "sentiment_arc",
 )
 
 
@@ -495,14 +547,46 @@ def _pricing_values_clause(pricing: dict[str, tuple[float, float]]) -> str:
     return ", ".join(rows)
 
 
+def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
+    """Execute a ``CREATE OR REPLACE MACRO`` DDL, downgrading failures to warnings.
+
+    Analytics macros reference views (``session_classifications``,
+    ``cluster_terms``, etc.) that only materialize once the corresponding
+    parquet has been produced.  Wrapping creation in ``try/except
+    duckdb.Error`` means a fresh install (pre-``claude-sql classify``) can
+    still call :func:`register_macros` without blowing up: the macro simply
+    doesn't get created and the caller gets a ``logger.warning`` pointing at
+    the missing backing view.
+
+    Parameters
+    ----------
+    con
+        Open DuckDB connection.
+    name
+        Macro name, used only for log messages.
+    ddl
+        Complete ``CREATE OR REPLACE MACRO`` statement.
+    """
+    try:
+        con.execute(ddl)
+        logger.info("Registered analytics macro: {}", name)
+    except duckdb.Error as exc:
+        logger.warning("Skipped macro {} (backing view missing): {}", name, exc)
+
+
 def register_macros(
     con: duckdb.DuckDBPyConnection,
     settings: Settings | None = None,
 ) -> None:
     """Create SQL macros used by the CLI and analysts.
 
-    Macros created: ``model_used``, ``cost_estimate``, ``tool_rank``,
-    ``todo_velocity``, ``subagent_fanout``, ``semantic_search``.
+    v1 macros (always created): ``model_used``, ``cost_estimate``,
+    ``tool_rank``, ``todo_velocity``, ``subagent_fanout``, ``semantic_search``.
+
+    v2 analytics macros (created via :func:`_safe_macro`, skipped when their
+    backing analytics view is missing): ``autonomy_trend``, ``work_mix``,
+    ``success_rate_by_work``, ``cluster_top_terms``, ``community_top_topics``,
+    ``sentiment_arc``.
 
     ``semantic_search(query_vec, k)`` is a table macro that returns the top-k
     uuids by cosine distance to ``query_vec`` using the HNSW index.
@@ -513,7 +597,10 @@ def register_macros(
     ----------
     con
         Open DuckDB connection with views (and the ``message_embeddings``
-        table from :func:`register_vss`) already registered.
+        table from :func:`register_vss`) already registered.  Analytics views
+        should be registered first (via :func:`register_analytics`) so the
+        analytics macros bind successfully; if they're not, those macros are
+        skipped with a warning.
     settings
         Optional :class:`Settings` for pricing overrides; falls back to
         :data:`claude_sql.config.DEFAULT_PRICING`.
@@ -601,6 +688,134 @@ def register_macros(
     logger.info(
         "Registered macros: model_used, cost_estimate, tool_rank, "
         "todo_velocity, subagent_fanout, semantic_search"
+    )
+
+    # ------------------------------------------------------------------
+    # v2 analytics macros -- each wrapped in _safe_macro so a missing
+    # backing view (pre-``claude-sql classify`` run) is a warning, not an
+    # exception.
+    # ------------------------------------------------------------------
+
+    # Time series: autonomy tier mix over rolling windows.
+    _safe_macro(
+        con,
+        "autonomy_trend",
+        """
+        CREATE OR REPLACE MACRO autonomy_trend(window_days) AS TABLE (
+            SELECT
+                date_trunc('week', classified_at) AS week,
+                autonomy_tier,
+                count(*) AS n
+            FROM session_classifications
+            WHERE classified_at >= current_timestamp - (window_days * INTERVAL 1 DAY)
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+        );
+        """,
+    )
+
+    # Work-category mix in the last N days.
+    _safe_macro(
+        con,
+        "work_mix",
+        """
+        CREATE OR REPLACE MACRO work_mix(since_days) AS TABLE (
+            SELECT work_category, count(*) AS n
+            FROM session_classifications
+            WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
+            GROUP BY 1
+            ORDER BY n DESC
+        );
+        """,
+    )
+
+    # Success / failure / partial rate broken down by work category.
+    _safe_macro(
+        con,
+        "success_rate_by_work",
+        """
+        CREATE OR REPLACE MACRO success_rate_by_work(since_days) AS TABLE (
+            SELECT
+                work_category,
+                count(*) AS sessions,
+                count(*) FILTER (WHERE success = 'success')::DOUBLE
+                    / NULLIF(count(*), 0) AS success_rate,
+                count(*) FILTER (WHERE success = 'failure')::DOUBLE
+                    / NULLIF(count(*), 0) AS failure_rate,
+                count(*) FILTER (WHERE success = 'partial')::DOUBLE
+                    / NULLIF(count(*), 0) AS partial_rate
+            FROM session_classifications
+            WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
+            GROUP BY 1
+            ORDER BY sessions DESC
+        );
+        """,
+    )
+
+    # Top-N TF-IDF terms for a single cluster.
+    _safe_macro(
+        con,
+        "cluster_top_terms",
+        """
+        CREATE OR REPLACE MACRO cluster_top_terms(cid, n) AS TABLE (
+            SELECT term, weight, rank
+            FROM cluster_terms
+            WHERE cluster_id = cid
+            ORDER BY rank
+            LIMIT n
+        );
+        """,
+    )
+
+    # Top cluster_ids within a given community, ranked by the number of
+    # messages each cluster contributes to the community.  Each row carries
+    # its top 5 TF-IDF terms for human-readable context.
+    _safe_macro(
+        con,
+        "community_top_topics",
+        """
+        CREATE OR REPLACE MACRO community_top_topics(cid, n) AS TABLE (
+            WITH community_msgs AS (
+                SELECT CAST(m.uuid AS VARCHAR) AS uuid
+                  FROM messages m
+                  JOIN session_communities sc
+                    ON CAST(m.session_id AS VARCHAR) = sc.session_id
+                 WHERE sc.community_id = cid
+            ),
+            cluster_counts AS (
+                SELECT mc.cluster_id, count(*) AS n_msgs
+                  FROM message_clusters mc
+                  JOIN community_msgs cm USING (uuid)
+                 WHERE mc.cluster_id >= 0
+                 GROUP BY mc.cluster_id
+            )
+            SELECT cc.cluster_id, cc.n_msgs,
+                   (SELECT string_agg(term, ', ' ORDER BY rank)
+                      FROM cluster_terms ct
+                     WHERE ct.cluster_id = cc.cluster_id
+                       AND ct.rank <= 5) AS top_terms
+              FROM cluster_counts cc
+              ORDER BY n_msgs DESC
+              LIMIT n
+        );
+        """,
+    )
+
+    # Sentiment arc for a single session: per-message (ts, role, delta,
+    # transition flag, confidence) in chronological order.
+    _safe_macro(
+        con,
+        "sentiment_arc",
+        """
+        CREATE OR REPLACE MACRO sentiment_arc(sid) AS TABLE (
+            SELECT m.ts, m.role, mt.sentiment_delta, mt.is_transition, mt.confidence
+              FROM messages m
+              JOIN message_trajectory mt
+                ON CAST(m.uuid AS VARCHAR) = mt.uuid
+             WHERE CAST(m.session_id AS VARCHAR) = sid
+             ORDER BY m.ts
+        );
+        """,
     )
 
 
@@ -722,16 +937,124 @@ def register_vss(
 
 
 # ---------------------------------------------------------------------------
-# Convenience
+# v2 analytics views
 # ---------------------------------------------------------------------------
+
+
+def _parquet_is_populated(path: Path | None) -> bool:
+    """Return True when ``path`` exists on disk with more than header-only bytes."""
+    if path is None:
+        return False
+    return path.exists() and path.stat().st_size > 16
+
+
+def register_analytics(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    settings: Settings | None = None,
+    classifications_parquet: Path | None = None,
+    trajectory_parquet: Path | None = None,
+    conflicts_parquet: Path | None = None,
+    clusters_parquet: Path | None = None,
+    cluster_terms_parquet: Path | None = None,
+    communities_parquet: Path | None = None,
+) -> None:
+    """Register v2 analytics parquets as DuckDB views.
+
+    Creates one ``CREATE OR REPLACE VIEW`` per parquet that exists on disk:
+    ``session_classifications``, ``message_trajectory``, ``session_conflicts``,
+    ``message_clusters``, ``cluster_terms``, ``session_communities``, plus the
+    derived ``session_goals`` projection over ``session_classifications``.
+
+    Each view is created only when its source parquet exists and is larger
+    than an empty-file sentinel (>16 bytes).  Missing parquets are skipped
+    with a ``logger.warning`` so the function is idempotent against a
+    partially-populated system -- you can call it before, during, or after an
+    analytics pipeline run and it will pick up whatever is on disk.
+
+    Analytics macros (``autonomy_trend`` et al.) are **not** registered here
+    -- they belong to :func:`register_macros`, which must be called
+    afterwards so macro bodies bind against the just-created views.
+
+    Parameters
+    ----------
+    con
+        Open DuckDB connection.
+    settings
+        Optional :class:`Settings` whose ``*_parquet_path`` fields drive the
+        per-view parquet locations.  If ``None``, explicit per-parquet
+        keyword arguments take over (see below); if both are supplied, the
+        explicit path wins.
+    classifications_parquet, trajectory_parquet, conflicts_parquet,
+    clusters_parquet, cluster_terms_parquet, communities_parquet
+        Optional explicit paths, useful for tests and ad-hoc wiring.  Each
+        defaults to the matching ``settings.*_parquet_path`` (or the
+        :class:`Settings` defaults) when not provided.
+    """
+    resolved = settings if settings is not None else Settings()
+    view_to_path: dict[str, Path] = {
+        "session_classifications": classifications_parquet
+        if classifications_parquet is not None
+        else resolved.classifications_parquet_path,
+        "message_trajectory": trajectory_parquet
+        if trajectory_parquet is not None
+        else resolved.trajectory_parquet_path,
+        "session_conflicts": conflicts_parquet
+        if conflicts_parquet is not None
+        else resolved.conflicts_parquet_path,
+        "message_clusters": clusters_parquet
+        if clusters_parquet is not None
+        else resolved.clusters_parquet_path,
+        "cluster_terms": cluster_terms_parquet
+        if cluster_terms_parquet is not None
+        else resolved.cluster_terms_parquet_path,
+        "session_communities": communities_parquet
+        if communities_parquet is not None
+        else resolved.communities_parquet_path,
+    }
+
+    registered: set[str] = set()
+    for view_name, path in view_to_path.items():
+        if not _parquet_is_populated(path):
+            logger.warning(
+                "register_analytics: skipping {} (parquet missing at {})",
+                view_name,
+                path,
+            )
+            continue
+        try:
+            con.execute(
+                f"CREATE OR REPLACE VIEW {view_name} AS "
+                f"SELECT * FROM read_parquet({_sql_str(str(path))});"
+            )
+            logger.info("Registered analytics view: {} (source={})", view_name, path)
+            registered.add(view_name)
+        except duckdb.Error:
+            logger.exception("Failed to register analytics view {} from {}", view_name, path)
+
+    # ``session_goals`` is a thin projection of ``session_classifications``;
+    # only materialize it when the upstream view exists.
+    if "session_classifications" in registered:
+        try:
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW session_goals AS
+                SELECT session_id, goal, confidence, classified_at
+                FROM session_classifications;
+                """
+            )
+            logger.info("Registered analytics view: session_goals")
+        except duckdb.Error:
+            logger.exception("Failed to register session_goals view")
 
 
 def register_all(
     con: duckdb.DuckDBPyConnection,
     *,
     settings: Settings | None = None,
+    include_analytics: bool = True,
 ) -> None:
-    """Register raw views, derived views, VSS, and macros in order.
+    """Register raw views, derived views, VSS, analytics, and macros in order.
 
     Parameters
     ----------
@@ -739,12 +1062,26 @@ def register_all(
         Open DuckDB connection.
     settings
         Optional :class:`Settings`; a default instance is created when absent.
+    include_analytics
+        When ``True`` (default), call :func:`register_analytics` before
+        :func:`register_macros` so the v2 analytics macros can bind against
+        the freshly-registered analytics views.  Set to ``False`` to skip
+        analytics view registration entirely (useful in tests that only
+        exercise v1 macros or when the caller will register analytics views
+        out-of-band).
 
     Notes
     -----
-    Order matters: ``register_vss`` must run before ``register_macros`` because
-    the ``semantic_search`` macro body references the ``message_embeddings``
-    table and DuckDB resolves macro bodies at creation time.
+    Order matters on two axes:
+
+    1. ``register_vss`` must run before ``register_macros`` because the
+       ``semantic_search`` macro body references the ``message_embeddings``
+       table and DuckDB resolves macro bodies at creation time.
+    2. ``register_analytics`` must also run before ``register_macros`` so
+       the analytics macros (``autonomy_trend``, ``cluster_top_terms``, ...)
+       bind against the analytics views at macro-creation time.  When a
+       parquet is missing the macro is skipped with a warning rather than
+       raising.
     """
     settings = settings or Settings()
     register_raw(
@@ -764,6 +1101,8 @@ def register_all(
         m=settings.hnsw_m,
         m0=settings.hnsw_m0,
     )
+    if include_analytics:
+        register_analytics(con, settings=settings)
     register_macros(con, settings=settings)
 
 

@@ -24,8 +24,11 @@ import polars as pl
 from cyclopts import App, Parameter
 from loguru import logger
 
+from claude_sql.cluster_worker import run_clustering
+from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
+from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
 from claude_sql.sql_views import (
     describe_all,
@@ -34,6 +37,7 @@ from claude_sql.sql_views import (
     register_raw,
     register_views,
 )
+from claude_sql.terms_worker import run_terms
 
 app = App(
     name="claude-sql",
@@ -365,6 +369,281 @@ def search(
         con.close()
 
 
+@app.command
+def classify(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Classify sessions via Sonnet 4.6 (autonomy, work category, success, goal).
+
+    Default is ``--dry-run`` -- real Bedrock spend requires explicit
+    ``--no-dry-run``.
+    """
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        n = classify_sessions(
+            con,
+            settings,
+            since_days=since_days,
+            limit=limit,
+            dry_run=dry_run,
+            no_thinking=no_thinking,
+        )
+        logger.info("classify: {} sessions processed (dry_run={})", n, dry_run)
+    finally:
+        con.close()
+
+
+@app.command
+def trajectory(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Per-message sentiment + is_transition (regex prefilter -> Sonnet 4.6).
+
+    Default is ``--dry-run`` -- real Bedrock spend requires explicit
+    ``--no-dry-run``.
+    """
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        n = trajectory_messages(
+            con,
+            settings,
+            since_days=since_days,
+            limit=limit,
+            dry_run=dry_run,
+            no_thinking=no_thinking,
+        )
+        logger.info("trajectory: {} messages processed (dry_run={})", n, dry_run)
+    finally:
+        con.close()
+
+
+@app.command
+def conflicts(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Per-session stance-conflict detection via Sonnet 4.6.
+
+    Default is ``--dry-run`` -- real Bedrock spend requires explicit
+    ``--no-dry-run``.
+    """
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        n = detect_conflicts(
+            con,
+            settings,
+            since_days=since_days,
+            limit=limit,
+            dry_run=dry_run,
+            no_thinking=no_thinking,
+        )
+        logger.info("conflicts: {} sessions processed (dry_run={})", n, dry_run)
+    finally:
+        con.close()
+
+
+@app.command
+def cluster(*, force: bool = False, common: Common | None = None) -> None:
+    """UMAP + HDBSCAN over message_embeddings; writes clusters.parquet."""
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    stats = run_clustering(settings, force=force)
+    logger.info(
+        "cluster: {} messages, {} clusters, {} noise ({:.1%})",
+        stats["total"],
+        stats["clusters"],
+        stats["noise"],
+        stats["noise"] / stats["total"] if stats["total"] else 0,
+    )
+
+
+@app.command
+def terms(*, force: bool = False, common: Common | None = None) -> None:
+    """Compute c-TF-IDF term labels per cluster; writes cluster_terms.parquet."""
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        tstats = run_terms(con, settings, force=force)
+        logger.info(
+            "terms: {} clusters, {} term-rows",
+            tstats["clusters"],
+            tstats["terms"],
+        )
+    finally:
+        con.close()
+
+
+@app.command
+def community(*, force: bool = False, common: Common | None = None) -> None:
+    """Session-level Louvain community detection from cosine-similarity graph."""
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        stats = run_communities(con, settings, force=force)
+        logger.info(
+            "community: {} sessions grouped into {} communities",
+            stats["sessions"],
+            stats["communities"],
+        )
+    finally:
+        con.close()
+
+
+@app.command
+def analyze(
+    *,
+    since_days: int | None = 30,
+    limit: int | None = None,
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    skip_embed: bool = False,
+    skip_classify: bool = False,
+    skip_trajectory: bool = False,
+    skip_conflicts: bool = False,
+    skip_cluster: bool = False,
+    skip_community: bool = False,
+    force_cluster: bool = False,
+    force_community: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Run the full v2 analytics pipeline.
+
+    Stages: embed -> classify + cluster + community -> trajectory -> conflicts.
+
+    Default is ``--dry-run`` -- every LLM-touching stage just prints pending
+    counts and cost estimates.  Pass ``--no-dry-run`` to execute for real.
+    Use ``--skip-<stage>`` to drop a stage entirely.  ``--force-cluster`` /
+    ``--force-community`` rebuild those parquet outputs even if they already
+    exist.
+    """
+    import asyncio
+
+    configure_logging(common.verbose if common else False)
+    settings = _resolve_settings(common)
+
+    # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
+    if not skip_embed:
+        con = _open_connection(settings)
+        try:
+            n = asyncio.run(
+                run_backfill(
+                    con=con,
+                    settings=settings,
+                    since_days=since_days,
+                    limit=limit,
+                    dry_run=dry_run,
+                )
+            )
+            logger.info("analyze/embed: {} new embeddings (dry_run={})", n, dry_run)
+        finally:
+            con.close()
+
+    # 2. Cluster (reads embeddings parquet, writes clusters.parquet).  Non-LLM.
+    if not skip_cluster:
+        stats = run_clustering(settings, force=force_cluster)
+        logger.info(
+            "analyze/cluster: {} messages, {} clusters, {} noise",
+            stats["total"],
+            stats["clusters"],
+            stats["noise"],
+        )
+        con = _open_connection(settings)
+        try:
+            tstats = run_terms(con, settings, force=force_cluster)
+            logger.info(
+                "analyze/terms: {} clusters, {} term-rows",
+                tstats["clusters"],
+                tstats["terms"],
+            )
+        finally:
+            con.close()
+
+    # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
+    if not skip_community:
+        con = _open_connection(settings)
+        try:
+            cstats = run_communities(con, settings, force=force_community)
+            logger.info(
+                "analyze/community: {} sessions, {} communities",
+                cstats["sessions"],
+                cstats["communities"],
+            )
+        finally:
+            con.close()
+
+    # 4. Session classification (LLM).
+    if not skip_classify:
+        con = _open_connection(settings)
+        try:
+            n = classify_sessions(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                dry_run=dry_run,
+                no_thinking=no_thinking,
+            )
+            logger.info("analyze/classify: {} sessions (dry_run={})", n, dry_run)
+        finally:
+            con.close()
+
+    # 5. Trajectory (LLM).
+    if not skip_trajectory:
+        con = _open_connection(settings)
+        try:
+            n = trajectory_messages(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                dry_run=dry_run,
+                no_thinking=no_thinking,
+            )
+            logger.info("analyze/trajectory: {} messages (dry_run={})", n, dry_run)
+        finally:
+            con.close()
+
+    # 6. Conflicts (LLM, requires full session context).
+    if not skip_conflicts:
+        con = _open_connection(settings)
+        try:
+            n = detect_conflicts(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                dry_run=dry_run,
+                no_thinking=no_thinking,
+            )
+            logger.info("analyze/conflicts: {} sessions (dry_run={})", n, dry_run)
+        finally:
+            con.close()
+
+    logger.info("analyze: done")
+
+
 @app.default
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand.
@@ -377,6 +656,7 @@ def _default(*, common: Common | None = None) -> None:
     del common
     print("claude-sql - pass a subcommand or --help")
     print("  schema | query | explain | shell | embed | search")
+    print("  classify | trajectory | conflicts | cluster | terms | community | analyze")
 
 
 # ---------------------------------------------------------------------------
