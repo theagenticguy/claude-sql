@@ -224,11 +224,11 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `todo_events` | one row per todo per TodoWrite snapshot | `subject`, `status`, `snapshot_ix` |
 | `todo_state_current` | latest status per `(session, subject)` | `status`, `written_at` |
 | `task_spawns` | `Task`/`Agent`/`TaskCreate` launch sites | `subagent_type`, `prompt` |
-| `subagent_sessions` | rolled-up subagent runs | `parent_session_id`, `agent_type` |
+| `subagent_sessions` | rolled-up subagent runs | `parent_session_id`, `agent_hex`, `agent_type`, `description`, `started_at`, `ended_at`, `message_count`, `transcript_path` |
 | `subagent_messages` | user+assistant events from subagent transcripts | `uuid`, `parent_session_id` |
 | `session_classifications` | one row per classified session | `autonomy_tier`, `work_category`, `success`, `goal` |
 | `session_goals` | projection over classifications | `session_id`, `goal` |
-| `message_trajectory` | per-message sentiment + is_transition | `sentiment_delta`, `is_transition` |
+| `message_trajectory` | per-message sentiment + is_transition | `sentiment_delta` (`positive`/`neutral`/`negative`), `is_transition` |
 | `session_conflicts` | per-session stance conflicts | `stance_a`, `stance_b`, `resolution` |
 | `message_clusters` | cluster id + 2d viz coords | `cluster_id`, `x`, `y`, `is_noise` |
 | `cluster_terms` | c-TF-IDF top terms per cluster | `cluster_id`, `term`, `weight`, `rank` |

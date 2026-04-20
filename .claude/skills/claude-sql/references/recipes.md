@@ -112,35 +112,58 @@ ORDER BY written_at;
 
 ## Themes: "group my sessions by topic"
 
-### 11. Top themes in the last month (requires `cluster`)
+### 11. Top themes in the last month (requires `cluster` + `terms`)
 
 ```sql
-SELECT c.cluster_id,
-       count(DISTINCT mc.session_id) AS sessions,
-       string_agg(DISTINCT ct.term, ', ' ORDER BY ct.rank)
-         FILTER (WHERE ct.rank <= 5) AS top_terms
+SELECT mc.cluster_id,
+       count(DISTINCT m.session_id) AS sessions,
+       (SELECT string_agg(term, ', ' ORDER BY rank)
+          FROM cluster_top_terms(mc.cluster_id, 5)) AS top_terms
 FROM message_clusters mc
-JOIN cluster_terms ct USING (cluster_id)
-JOIN messages m ON m.uuid = mc.message_uuid
-JOIN sessions s ON s.session_id = m.session_id
+JOIN messages m ON CAST(m.uuid AS VARCHAR) = mc.uuid
+JOIN sessions s USING (session_id)
 WHERE s.started_at >= current_timestamp - INTERVAL 30 DAY
   AND NOT mc.is_noise
-GROUP BY c.cluster_id
+GROUP BY mc.cluster_id
 ORDER BY sessions DESC
 LIMIT 10;
 ```
 
+`message_clusters.uuid` is VARCHAR and `messages.uuid` is UUID — the explicit
+`CAST` keeps the join index-friendly. Use the `cluster_top_terms` macro
+rather than joining `cluster_terms` directly; the macro already orders by
+rank and caps the term count.
+
 ### 12. Session communities with their dominant clusters
 (requires `cluster` + `community`)
 
+`community_top_topics(cid, n)` returns one row per dominant cluster within
+the community, with its `top_terms` already pre-joined. It's a **table**
+macro, so the per-community call has to be a `LATERAL` join rather than a
+correlated scalar subquery (DuckDB doesn't thread correlated columns into
+table-macro parameters):
+
 ```sql
-SELECT community_id,
-       count(DISTINCT session_id) AS size,
-       (SELECT string_agg(term, ', ') FROM community_top_topics(community_id, 5)) AS topics
-FROM session_communities
-GROUP BY community_id
-ORDER BY size DESC;
+WITH sized AS (
+    SELECT community_id, count(DISTINCT session_id) AS size
+      FROM session_communities
+     WHERE community_id >= 0
+     GROUP BY 1
+     HAVING count(*) >= 5
+     ORDER BY size DESC
+     LIMIT 20
+)
+SELECT s.community_id, s.size,
+       string_agg(t.top_terms, ' | ' ORDER BY t.n_msgs DESC) AS topics
+  FROM sized s,
+       community_top_topics(s.community_id, 3) AS t
+ GROUP BY s.community_id, s.size
+ ORDER BY s.size DESC;
 ```
+
+Noise / singleton sessions live in `community_id = -1` (the
+`NOISE_COMMUNITY_ID` bucket).  The `WHERE community_id >= 0` filter drops
+them; query for `= -1` if you want to inspect them.
 
 ## Contradictions: "where did I disagree with myself"
 
