@@ -197,7 +197,7 @@ def register_raw(
             );
             """
         )
-        logger.info(
+        logger.debug(
             "Registered v_raw_events from glob {} with sample_size={}",
             glob,
             sample_size_i,
@@ -229,7 +229,7 @@ def register_raw(
             );
             """
         )
-        logger.info("Registered v_raw_subagents from glob {}", subagent_glob)
+        logger.debug("Registered v_raw_subagents from glob {}", subagent_glob)
 
         # meta.json files are one object per file (not NDJSON) -> format='auto'.
         con.execute(
@@ -256,7 +256,7 @@ def register_raw(
             );
             """
         )
-        logger.info("Registered v_raw_subagent_meta from glob {}", subagent_meta_glob)
+        logger.debug("Registered v_raw_subagent_meta from glob {}", subagent_meta_glob)
     except Exception:
         logger.exception("Failed to register raw views")
         raise
@@ -303,7 +303,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             GROUP BY session_id_file;
             """
         )
-        logger.info("Registered view: sessions")
+        logger.debug("Registered view: sessions")
 
         # ``message.content`` is inferred by ``read_json`` as JSON. ``to_json``
         # is defensive: if a future schema infers LIST, ``to_json`` normalizes
@@ -331,7 +331,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE type IN ('user', 'assistant');
             """
         )
-        logger.info("Registered view: messages")
+        logger.debug("Registered view: messages")
 
         con.execute(
             """
@@ -353,7 +353,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                  UNNEST(json_extract(m.content_json, '$[*]')) AS t(block);
             """
         )
-        logger.info("Registered view: content_blocks")
+        logger.debug("Registered view: content_blocks")
 
         # One row per *message*, not per text block.  Aggregating the text
         # blocks preserves enough context for useful embeddings; the per-block
@@ -377,7 +377,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             HAVING length(string_agg(cb.text, '\n\n')) >= 32;
             """
         )
-        logger.info("Registered view: messages_text")
+        logger.debug("Registered view: messages_text")
 
         con.execute(
             """
@@ -393,7 +393,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE cb.block_type = 'tool_use';
             """
         )
-        logger.info("Registered view: tool_calls")
+        logger.debug("Registered view: tool_calls")
 
         con.execute(
             """
@@ -408,7 +408,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE cb.block_type = 'tool_result';
             """
         )
-        logger.info("Registered view: tool_results")
+        logger.debug("Registered view: tool_results")
 
         # DuckDB's ``UNNEST`` requires a LIST. ``json_extract(x, '$.todos')``
         # returns a JSON scalar (potentially an array) that UNNEST rejects.
@@ -433,7 +433,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE tc.tool_name = 'TodoWrite';
             """
         )
-        logger.info("Registered view: todo_events")
+        logger.debug("Registered view: todo_events")
 
         con.execute(
             """
@@ -450,7 +450,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE rn = 1;
             """
         )
-        logger.info("Registered view: todo_state_current")
+        logger.debug("Registered view: todo_state_current")
 
         con.execute(
             """
@@ -468,7 +468,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE tool_name IN ('Task', 'Agent', 'TaskCreate', 'mcp__tasks__task_create');
             """
         )
-        logger.info("Registered view: task_spawns")
+        logger.debug("Registered view: task_spawns")
 
         con.execute(
             """
@@ -489,7 +489,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             GROUP BY r.parent_session_id, r.agent_hex;
             """
         )
-        logger.info("Registered view: subagent_sessions")
+        logger.debug("Registered view: subagent_sessions")
 
         con.execute(
             """
@@ -512,7 +512,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             WHERE type IN ('user', 'assistant');
             """
         )
-        logger.info("Registered view: subagent_messages")
+        logger.debug("Registered view: subagent_messages")
     except Exception:
         logger.exception("Failed to register derived views")
         raise
@@ -569,7 +569,7 @@ def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
     """
     try:
         con.execute(ddl)
-        logger.info("Registered analytics macro: {}", name)
+        logger.debug("Registered analytics macro: {}", name)
     except duckdb.Error as exc:
         logger.warning("Skipped macro {} (backing view missing): {}", name, exc)
 
@@ -685,7 +685,7 @@ def register_macros(
         """
     )
 
-    logger.info(
+    logger.debug(
         "Registered macros: model_used, cost_estimate, tool_rank, "
         "todo_velocity, subagent_fanout, semantic_search"
     )
@@ -926,7 +926,7 @@ def register_vss(
     )
     row = con.execute("SELECT count(*) FROM message_embeddings;").fetchone()
     count = int(row[0]) if row else 0
-    logger.info(
+    logger.debug(
         "Loaded {} embeddings and built HNSW index (metric={}, M={}, ef_search={})",
         count,
         metric,
@@ -1016,7 +1016,11 @@ def register_analytics(
     registered: set[str] = set()
     for view_name, path in view_to_path.items():
         if not _parquet_is_populated(path):
-            logger.warning(
+            # Missing analytics parquets are the default state until the user
+            # runs the corresponding generator (classify / cluster / ...), so
+            # they belong at DEBUG -- otherwise every query command floods the
+            # terminal with warnings about work the user hasn't yet asked for.
+            logger.debug(
                 "register_analytics: skipping {} (parquet missing at {})",
                 view_name,
                 path,
@@ -1027,7 +1031,7 @@ def register_analytics(
                 f"CREATE OR REPLACE VIEW {view_name} AS "
                 f"SELECT * FROM read_parquet({_sql_str(str(path))});"
             )
-            logger.info("Registered analytics view: {} (source={})", view_name, path)
+            logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)
         except duckdb.Error:
             logger.exception("Failed to register analytics view {} from {}", view_name, path)
@@ -1043,7 +1047,7 @@ def register_analytics(
                 FROM session_classifications;
                 """
             )
-            logger.info("Registered analytics view: session_goals")
+            logger.debug("Registered analytics view: session_goals")
         except duckdb.Error:
             logger.exception("Failed to register session_goals view")
 

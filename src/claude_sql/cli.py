@@ -1,10 +1,18 @@
 """Cyclopts CLI entry point for ``claude-sql``.
 
-Wires the ``claude-sql`` console script to six subcommands: ``shell``,
-``query``, ``explain``, ``schema``, ``embed``, and ``search``. Shared flags
-(``--verbose`` / ``--quiet``, ``--glob``, ``--subagent-glob``) live on a
-flattened :class:`Common` dataclass so callers write ``claude-sql query ...
---verbose`` instead of ``--common.verbose``.
+Wires the ``claude-sql`` console script to its thirteen subcommands.  Shared
+flags -- ``--verbose`` / ``--quiet``, ``--glob``, ``--subagent-glob``,
+``--format`` -- live on a flattened :class:`Common` dataclass so callers write
+``claude-sql query ... --format json`` instead of ``--common.format json``.
+
+Agent-friendly defaults
+-----------------------
+* ``--format auto`` emits a human table on a TTY and machine-readable JSON
+  when stdout is a pipe, so agents do not have to set a flag.
+* DuckDB errors are classified into parse / catalog / runtime and mapped to
+  stable exit codes (64 / 65 / 70) with a JSON error payload on non-TTY.
+* ``--quiet`` is honored by every subcommand; view registration goes to DEBUG
+  so the default stderr stays quiet for routine reads.
 
 ``asyncio`` and subprocess imports are performed lazily inside the relevant
 commands so that the fast path (``schema``, ``query``, ``explain``) does not
@@ -13,10 +21,13 @@ drag extra modules into startup.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 import duckdb
@@ -30,6 +41,14 @@ from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
+from claude_sql.output import (
+    EXIT_CODES,
+    OutputFormat,
+    emit_dataframe,
+    emit_json,
+    resolve_format,
+    run_or_die,
+)
 from claude_sql.sql_views import (
     describe_all,
     list_macros,
@@ -48,11 +67,34 @@ app = App(
 @Parameter(name="*")
 @dataclass
 class Common:
-    """Shared CLI flags flattened onto every subcommand."""
+    """Shared CLI flags flattened onto every subcommand.
 
-    verbose: Annotated[bool, Parameter(negative="--quiet")] = False
+    ``verbose`` and its paired ``--quiet`` negation both map to this single
+    bool (cyclopts uses the ``negative=`` argument to wire the "opposite"
+    flag onto the same field).  ``quiet`` is the one extra concept the
+    dataclass needs to carry: it cannot piggyback on ``verbose`` because
+    the two states are not symmetric (verbose forces DEBUG, quiet forces
+    ERROR, and the default is INFO).
+    """
+
+    verbose: bool = False
+    quiet: bool = False
     glob: str | None = None
     subagent_glob: str | None = None
+    format: Annotated[OutputFormat, Parameter(name="--format")] = OutputFormat.AUTO
+
+
+def _configure(common: Common | None) -> None:
+    """Install logging based on the shared flags."""
+    configure_logging(
+        verbose=common.verbose if common else False,
+        quiet=common.quiet if common else False,
+    )
+
+
+def _fmt(common: Common | None) -> OutputFormat:
+    """Resolve the effective output format for a subcommand."""
+    return common.format if common else OutputFormat.AUTO
 
 
 # ---------------------------------------------------------------------------
@@ -61,20 +103,7 @@ class Common:
 
 
 def _resolve_settings(common: Common | None) -> Settings:
-    """Build :class:`Settings` from env then apply CLI overrides.
-
-    Parameters
-    ----------
-    common
-        Parsed shared flags, or ``None`` if the subcommand was invoked without
-        any common options.
-
-    Returns
-    -------
-    Settings
-        A fresh settings instance with any CLI overrides applied via
-        :meth:`pydantic.BaseModel.model_copy`.
-    """
+    """Build :class:`Settings` from env then apply CLI overrides."""
     settings = Settings()
     if common is None:
         return settings
@@ -89,19 +118,7 @@ def _resolve_settings(common: Common | None) -> Settings:
 
 
 def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
-    """Open an in-memory DuckDB connection with every claude-sql object wired.
-
-    Parameters
-    ----------
-    settings
-        Fully resolved settings controlling globs, embedding dim, HNSW knobs.
-
-    Returns
-    -------
-    duckdb.DuckDBPyConnection
-        Connection with raw views, derived views, the VSS extension, the
-        ``message_embeddings`` table, and all macros registered.
-    """
+    """Open an in-memory DuckDB connection with every claude-sql object wired."""
     con = duckdb.connect(":memory:")
     register_all(con, settings=settings)
     return con
@@ -119,6 +136,38 @@ _EXPLAIN_MARKERS: tuple[str, ...] = (
 )
 
 
+def _describe_cache_entry(name: str, path: Path) -> dict[str, object]:
+    """Collect filesystem metadata about one parquet cache entry.
+
+    The row count is only read when the parquet looks healthy (>16 bytes --
+    same sentinel used by :func:`register_analytics`).  Reading row counts is
+    cheap (``read_parquet`` reads the footer only), but we still gate it
+    because a zero-byte file is a sign of an aborted run we should not touch.
+    """
+    exists = path.exists() and path.is_file()
+    entry: dict[str, object] = {"name": name, "path": str(path), "exists": exists}
+    if not exists:
+        return entry
+    stat = path.stat()
+    entry["bytes"] = stat.st_size
+    entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
+    if stat.st_size > 16:
+        con = duckdb.connect(":memory:")
+        try:
+            row = con.execute(
+                "SELECT count(*) FROM read_parquet(?)",
+                [str(path)],
+            ).fetchone()
+            entry["rows"] = int(row[0]) if row else 0
+        except duckdb.Error:
+            # Do not let a corrupt parquet abort the whole list -- surface it
+            # with rows=None so the caller still sees the metadata.
+            entry["rows"] = None
+        finally:
+            con.close()
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -130,16 +179,10 @@ def shell(*, common: Common | None = None) -> None:
 
     Writes a temporary on-disk DuckDB database, calls :func:`register_all` to
     materialize every view / macro / HNSW index into it, closes the Python
-    connection, then execs the ``duckdb`` binary against that DB file. The CLI
-    is strictly a launcher; the real REPL is DuckDB's own.
-
-    Parameters
-    ----------
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
+    connection, then execs the ``duckdb`` binary against that DB file.  The
+    DB path is printed so the user can reopen it later or clean it up.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
 
     with tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False) as tf:
@@ -161,28 +204,24 @@ def shell(*, common: Common | None = None) -> None:
             "`claude-sql query '<sql>'`. DB persists at {}",
             db_path,
         )
-        sys.exit(127)
+        sys.exit(EXIT_CODES["duckdb_missing"])
 
 
 @app.command
 def query(sql: str, /, *, common: Common | None = None) -> None:
-    """Run a SQL query and print the result as a polars table.
+    """Run a SQL query and emit the result in the requested format.
 
-    Parameters
-    ----------
-    sql
-        A single DuckDB SQL statement.
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
+    Default format is ``auto`` (table on TTY, JSON otherwise).  DuckDB errors
+    are classified into parse / catalog / runtime and exit with codes 64 / 65
+    / 70 respectively.
     """
-    configure_logging(common.verbose if common else False, False)
+    _configure(common)
     settings = _resolve_settings(common)
+    fmt = _fmt(common)
     con = _open_connection(settings)
     try:
-        df = con.execute(sql).pl()
-        with pl.Config(tbl_rows=100, tbl_cols=20, fmt_str_lengths=120):
-            print(df)
+        df = run_or_die(lambda: con.execute(sql).pl(), fmt=fmt)
+        emit_dataframe(df, fmt)
     finally:
         con.close()
 
@@ -192,36 +231,36 @@ def explain(
     sql: str,
     /,
     *,
-    analyze: bool = True,
+    analyze: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Show the EXPLAIN plan for ``sql`` and highlight pushdown markers in green.
+    """Show the EXPLAIN plan for ``sql`` and highlight pushdown markers.
 
-    Parameters
-    ----------
-    sql
-        The SQL statement to analyze.
-    analyze
-        When true (default), run ``EXPLAIN ANALYZE`` so the plan includes
-        timing. Pass ``--no-analyze`` for a static plan.
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
+    Defaults to a static plan (``EXPLAIN``) so probing slow or expensive
+    queries doesn't execute them.  Pass ``--analyze`` to run ``EXPLAIN
+    ANALYZE`` when you actually want timings.
+
+    When ``--format=json``, emits ``{"plan": "<text>"}`` without the ANSI
+    highlights so agents can consume the plan cleanly.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
     con = _open_connection(settings)
     try:
         prefix = "EXPLAIN ANALYZE " if analyze else "EXPLAIN "
-        rows = con.execute(prefix + sql).fetchall()
+        rows = run_or_die(lambda: con.execute(prefix + sql).fetchall(), fmt=fmt)
         # EXPLAIN rows are (type, plan_text) tuples; the plan sits in the last
         # column regardless of row shape.
         text = "\n".join(str(r[-1]) for r in rows)
-        for line in text.splitlines():
-            if any(m in line for m in _EXPLAIN_MARKERS):
-                print(f"\033[92m{line}\033[0m")
-            else:
-                print(line)
+        if fmt is OutputFormat.TABLE:
+            for line in text.splitlines():
+                if any(m in line for m in _EXPLAIN_MARKERS):
+                    print(f"\033[92m{line}\033[0m")
+                else:
+                    print(line)
+        else:
+            emit_json({"plan": text}, fmt)
     finally:
         con.close()
 
@@ -230,27 +269,76 @@ def explain(
 def schema(*, common: Common | None = None) -> None:
     """List every registered view with its columns, plus the macro inventory.
 
-    Parameters
-    ----------
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
+    ``--format table`` (default on TTY) prints a compact human layout; every
+    other format emits ``{"views": {...}, "macros": [...]}`` so agents can
+    parse the catalog without scraping.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
     con = _open_connection(settings)
     try:
         views = describe_all(con)
         macros = list_macros(con)
-        for name, cols in views.items():
-            print(f"\n\033[1m{name}\033[0m ({len(cols)} cols)")
-            for col, col_type in cols:
-                print(f"  {col:<28} {col_type}")
-        print(f"\n\033[1mMacros\033[0m ({len(macros)})")
-        for macro in macros:
-            print(f"  {macro}")
+        if fmt is OutputFormat.TABLE:
+            for name, cols in views.items():
+                print(f"\n\033[1m{name}\033[0m ({len(cols)} cols)")
+                for col, col_type in cols:
+                    print(f"  {col:<28} {col_type}")
+            print(f"\n\033[1mMacros\033[0m ({len(macros)})")
+            for macro in macros:
+                print(f"  {macro}")
+        else:
+            payload = {
+                "views": {
+                    name: [{"column": c, "type": t} for c, t in cols]
+                    for name, cols in views.items()
+                },
+                "macros": list(macros),
+            }
+            emit_json(payload, fmt)
     finally:
         con.close()
+
+
+@app.command(name="list-cache")
+def list_cache(*, common: Common | None = None) -> None:
+    """Introspect parquet cache state -- which outputs exist, how fresh, how many rows.
+
+    Exists so agents can decide, before issuing ``search`` or ``query``,
+    whether the prerequisite pipeline stage (``embed`` / ``classify`` /
+    ``cluster`` / ``community``) needs to be run.  Each entry reports
+    ``{name, path, exists, bytes, mtime, rows}`` where the last three are
+    omitted when the parquet is absent.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
+    entries = [
+        _describe_cache_entry("embeddings", settings.embeddings_parquet_path),
+        _describe_cache_entry("session_classifications", settings.classifications_parquet_path),
+        _describe_cache_entry("message_trajectory", settings.trajectory_parquet_path),
+        _describe_cache_entry("session_conflicts", settings.conflicts_parquet_path),
+        _describe_cache_entry("message_clusters", settings.clusters_parquet_path),
+        _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
+        _describe_cache_entry("session_communities", settings.communities_parquet_path),
+    ]
+
+    if fmt is OutputFormat.TABLE:
+        df = pl.DataFrame(entries)
+        emit_dataframe(df, OutputFormat.TABLE)
+        return
+    # JSON / NDJSON / CSV -- emit the list directly so downstream tooling
+    # doesn't have to unwrap a wrapper object.
+    if fmt is OutputFormat.NDJSON:
+        for entry in entries:
+            sys.stdout.write(json.dumps(entry, default=str))
+            sys.stdout.write("\n")
+        return
+    if fmt is OutputFormat.CSV:
+        emit_dataframe(pl.DataFrame(entries), OutputFormat.CSV)
+        return
+    emit_json(entries, fmt)
 
 
 @app.command
@@ -266,22 +354,10 @@ def embed(
     Only registers raw + derived views (not VSS) because the backfill reads
     ``messages_text`` for discovery and the existing parquet for the anti-join;
     it does not need the HNSW index.
-
-    Parameters
-    ----------
-    since_days
-        Only embed messages newer than ``N`` days.
-    limit
-        Cap on total messages to embed this run.
-    dry_run
-        Print the batch plan without calling Bedrock.
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
     """
     import asyncio
 
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = duckdb.connect(":memory:")
     try:
@@ -318,27 +394,18 @@ def search(
 
     Embeds ``query_text`` with Cohere Embed v4 ``search_query`` mode, then
     returns the top-``k`` nearest messages along with a snippet of their text.
-    Exits 2 (with a clear hint) when the embeddings parquet is empty.
-
-    Parameters
-    ----------
-    query_text
-        Natural-language search query.
-    k
-        Number of nearest neighbors to return.
-    common
-        Shared flags (``--verbose`` / ``--quiet``, ``--glob``,
-        ``--subagent-glob``).
+    Exits with code 2 (with a clear hint) when the embeddings parquet is empty.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
+    fmt = _fmt(common)
     con = _open_connection(settings)
     try:
         row = con.execute("SELECT count(*) FROM message_embeddings").fetchone()
         count = int(row[0]) if row else 0
         if count == 0:
             logger.error("No embeddings yet. Run: claude-sql embed --since-days 7")
-            sys.exit(2)
+            sys.exit(EXIT_CODES["no_embeddings"])
 
         qv = embed_query(query_text, settings=settings)
         dim = int(settings.output_dimension)
@@ -348,23 +415,25 @@ def search(
         # would silently bypass the index AND give wrong ranks because the
         # raw int8-cast-to-float document vectors have magnitudes in the
         # thousands while the query vector is unit-normalized.
-        df = con.execute(
-            f"""
-            WITH qv AS (SELECT CAST(? AS FLOAT[{dim}]) AS v)
-            SELECT CAST(mt.uuid AS VARCHAR)  AS uuid,
-                   CAST(mt.session_id AS VARCHAR) AS session_id,
-                   mt.role,
-                   array_cosine_similarity(me.embedding, (SELECT v FROM qv)) AS sim,
-                   substr(mt.text_content, 1, 200) AS snippet
-            FROM message_embeddings me
-            JOIN messages_text mt ON CAST(mt.uuid AS VARCHAR) = me.uuid
-            ORDER BY array_cosine_distance(me.embedding, (SELECT v FROM qv)) ASC
-            LIMIT ?
-            """,
-            [qv, k],
-        ).pl()
-        with pl.Config(tbl_rows=k, tbl_cols=20, fmt_str_lengths=200):
-            print(df)
+        df = run_or_die(
+            lambda: con.execute(
+                f"""
+                WITH qv AS (SELECT CAST(? AS FLOAT[{dim}]) AS v)
+                SELECT CAST(mt.uuid AS VARCHAR)  AS uuid,
+                       CAST(mt.session_id AS VARCHAR) AS session_id,
+                       mt.role,
+                       array_cosine_similarity(me.embedding, (SELECT v FROM qv)) AS sim,
+                       substr(mt.text_content, 1, 200) AS snippet
+                FROM message_embeddings me
+                JOIN messages_text mt ON CAST(mt.uuid AS VARCHAR) = me.uuid
+                ORDER BY array_cosine_distance(me.embedding, (SELECT v FROM qv)) ASC
+                LIMIT ?
+                """,
+                [qv, k],
+            ).pl(),
+            fmt=fmt,
+        )
+        emit_dataframe(df, fmt, table_rows=k, table_str_len=200)
     finally:
         con.close()
 
@@ -383,7 +452,7 @@ def classify(
     Default is ``--dry-run`` -- real Bedrock spend requires explicit
     ``--no-dry-run``.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
@@ -414,7 +483,7 @@ def trajectory(
     Default is ``--dry-run`` -- real Bedrock spend requires explicit
     ``--no-dry-run``.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
@@ -445,7 +514,7 @@ def conflicts(
     Default is ``--dry-run`` -- real Bedrock spend requires explicit
     ``--no-dry-run``.
     """
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
@@ -465,7 +534,7 @@ def conflicts(
 @app.command
 def cluster(*, force: bool = False, common: Common | None = None) -> None:
     """UMAP + HDBSCAN over message_embeddings; writes clusters.parquet."""
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     stats = run_clustering(settings, force=force)
     logger.info(
@@ -480,7 +549,7 @@ def cluster(*, force: bool = False, common: Common | None = None) -> None:
 @app.command
 def terms(*, force: bool = False, common: Common | None = None) -> None:
     """Compute c-TF-IDF term labels per cluster; writes cluster_terms.parquet."""
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
@@ -497,7 +566,7 @@ def terms(*, force: bool = False, common: Common | None = None) -> None:
 @app.command
 def community(*, force: bool = False, common: Common | None = None) -> None:
     """Session-level Louvain community detection from cosine-similarity graph."""
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
@@ -540,7 +609,7 @@ def analyze(
     """
     import asyncio
 
-    configure_logging(common.verbose if common else False)
+    _configure(common)
     settings = _resolve_settings(common)
 
     # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
@@ -646,16 +715,11 @@ def analyze(
 
 @app.default
 def _default(*, common: Common | None = None) -> None:
-    """Print a hint when ``claude-sql`` is invoked without a subcommand.
-
-    Parameters
-    ----------
-    common
-        Shared flags (unused here; kept for signature uniformity).
-    """
+    """Print a hint when ``claude-sql`` is invoked without a subcommand."""
     del common
     print("claude-sql - pass a subcommand or --help")
-    print("  schema | query | explain | shell | embed | search")
+    print("  schema | query | explain | shell | list-cache")
+    print("  embed | search")
     print("  classify | trajectory | conflicts | cluster | terms | community | analyze")
 
 
