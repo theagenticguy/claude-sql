@@ -76,28 +76,29 @@ no-op).
 
 ### As a uv tool (recommended)
 
-This installs `claude-sql` into an isolated venv and puts it on your PATH
-globally.
+`claude-sql` is **not published to PyPI**. You install it from a local
+checkout of this repo. `mise run tool:install` wraps `uv tool install
+--from . claude-sql --force --reinstall` so the binary on your `PATH`
+lands in an isolated uv-managed venv.
 
 ```bash
-# From the git repo
 git clone https://github.com/theagenticguy/claude-sql.git
 cd claude-sql
-mise run tool:install     # → uv tool install --from . claude-sql --force
-claude-sql --version
+mise run tool:install     # → uv tool install --from . claude-sql --force --reinstall
+claude-sql --version      # prints version + "installed from directory: /path/to/checkout"
 ```
 
-Or one-shot from the source tree:
+To upgrade after pulling new commits, re-run the same task (or the
+alias `tool:upgrade` — identical command, nicer grep):
 
 ```bash
-uv tool install --from . claude-sql
+git pull
+mise run tool:upgrade     # same as tool:install, just clearer intent
 ```
 
-Update in place later:
-
-```bash
-uv tool upgrade claude-sql
-```
+> :warning: `uv tool upgrade claude-sql` does **not** work — it resolves
+> against the PyPI registry, which has no `claude-sql` package. Always
+> reinstall from your checkout.
 
 Remove:
 

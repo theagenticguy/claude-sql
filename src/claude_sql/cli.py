@@ -39,6 +39,7 @@ from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
+from claude_sql.install_source import format_version
 from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
 from claude_sql.output import (
@@ -60,6 +61,7 @@ from claude_sql.terms_worker import run_terms
 
 app = App(
     name="claude-sql",
+    version=format_version,
     help=("Zero-copy SQL over ~/.claude/ JSONL transcripts with Cohere Embed v4 semantic search."),
 )
 

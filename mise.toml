@@ -66,7 +66,11 @@ run = "uv build"
 
 [tasks."tool:install"]
 description = "Install claude-sql as a uv tool (global, isolated venv)"
-run = "uv tool install --from . claude-sql --force"
+run = "uv tool install --from . claude-sql --force --reinstall"
+
+[tasks."tool:upgrade"]
+description = "Re-install claude-sql from the current working tree (use after pulling)"
+run = "uv tool install --from . claude-sql --force --reinstall"
 
 [tasks."tool:uninstall"]
 description = "Uninstall the claude-sql uv tool"
