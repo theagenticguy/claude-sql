@@ -57,6 +57,10 @@ def _default_communities_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
 
 
+def _default_checkpoint_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/session_checkpoint.parquet"))
+
+
 # Model pricing per 1M tokens (in_rate, out_rate).  Mirrors claude-mine/transform.py.
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-7": (15.0, 75.0),
@@ -147,6 +151,8 @@ class Settings(BaseSettings):
     clusters_parquet_path: Path = Field(default_factory=_default_clusters_parquet)
     cluster_terms_parquet_path: Path = Field(default_factory=_default_cluster_terms_parquet)
     communities_parquet_path: Path = Field(default_factory=_default_communities_parquet)
+    #: Per-(session_id, pipeline) checkpoint parquet. See ``checkpointer.py``.
+    checkpoint_parquet_path: Path = Field(default_factory=_default_checkpoint_parquet)
 
     # ------------------------------------------------------------------
     # v2: UMAP + HDBSCAN + Louvain hyperparameters

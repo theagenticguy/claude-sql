@@ -324,6 +324,7 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("message_clusters", settings.clusters_parquet_path),
         _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
         _describe_cache_entry("session_communities", settings.communities_parquet_path),
+        _describe_cache_entry("session_checkpoint", settings.checkpoint_parquet_path),
     ]
 
     if fmt is OutputFormat.TABLE:

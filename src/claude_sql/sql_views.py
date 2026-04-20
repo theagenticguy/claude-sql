@@ -72,6 +72,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "session_checkpoint",
 )
 
 # Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
@@ -86,6 +87,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "session_checkpoint",
 )
 
 # Macro names registered by :func:`register_macros`.  The first six are the
@@ -958,6 +960,7 @@ def register_analytics(
     clusters_parquet: Path | None = None,
     cluster_terms_parquet: Path | None = None,
     communities_parquet: Path | None = None,
+    checkpoint_parquet: Path | None = None,
 ) -> None:
     """Register v2 analytics parquets as DuckDB views.
 
@@ -1011,6 +1014,9 @@ def register_analytics(
         "session_communities": communities_parquet
         if communities_parquet is not None
         else resolved.communities_parquet_path,
+        "session_checkpoint": checkpoint_parquet
+        if checkpoint_parquet is not None
+        else resolved.checkpoint_parquet_path,
     }
 
     registered: set[str] = set()
