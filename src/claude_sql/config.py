@@ -159,7 +159,21 @@ class Settings(BaseSettings):
     umap_metric: str = "cosine"
     hdbscan_min_cluster_size: int = 20
     hdbscan_min_samples: int = 5
-    louvain_edge_threshold: float = 0.75
+    #: Absolute cosine floor below which a pair is never considered related,
+    #: regardless of the adaptive search.  Kept conservative so the graph
+    #: doesn't collapse into a single giant component on very similar
+    #: corpora.
+    louvain_edge_threshold: float = 0.55
+    #: Target band for the average graph degree.  ``_pick_adaptive_threshold``
+    #: picks the cosine cut that puts average degree in ``[low, high]``.
+    #: 8-15 is the empirically-tested sweet spot for Louvain on session-
+    #: centroid graphs (1K-20K nodes): enough to let community structure
+    #: emerge, not enough to produce a hairball.
+    louvain_target_avg_degree_low: float = 8.0
+    louvain_target_avg_degree_high: float = 15.0
+    #: Louvain communities smaller than this get collapsed into the
+    #: NOISE_COMMUNITY_ID bucket (-1) so reports stay legible.
+    louvain_min_community_size: int = 3
     louvain_resolution: float = 1.0
     seed: int = 42
 
