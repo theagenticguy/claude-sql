@@ -49,12 +49,13 @@ from tenacity import (
     wait_exponential,
 )
 
+from claude_sql import checkpointer
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
 )
-from claude_sql.session_text import iter_session_texts
+from claude_sql.session_text import iter_session_texts, session_bounds
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -241,15 +242,28 @@ async def _classify_sessions_async(
         done_df = pl.read_parquet(settings.classifications_parquet_path)
         already = set(done_df["session_id"].to_list())
 
+    # Checkpoint skip: compare current (last_ts, mtime) against the last run.
+    bounds = session_bounds(con, since_days=since_days, limit=limit)
+    unchanged_pending, skipped = checkpointer.filter_unchanged(
+        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
+        pipeline="classify",
+        checkpoint_path=settings.checkpoint_parquet_path,
+    )
+    keep = set(unchanged_pending)
+
     pending: list[tuple[str, str]] = []
     for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
         if sid in already:
             continue
+        if sid not in keep:
+            continue
         pending.append((sid, text))
 
     if not pending:
-        logger.info("classify: no pending sessions")
+        logger.info("classify: no pending sessions (skipped={} via checkpoint)", skipped)
         return 0
+    if skipped:
+        logger.info("classify: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
     sem = asyncio.Semaphore(settings.concurrency)
@@ -317,6 +331,18 @@ async def _classify_sessions_async(
                 },
             )
             _append_parquet(settings.classifications_parquet_path, df)
+
+        # Checkpoint the sessions we just classified — at their CURRENT bounds,
+        # so a later re-run with no new messages is a no-op.
+        if ok_rows:
+            checkpointer.mark_completed(
+                settings.checkpoint_parquet_path,
+                pipeline="classify",
+                rows=[
+                    (row["session_id"], *bounds.get(row["session_id"], (None, None)))
+                    for row in ok_rows
+                ],
+            )
 
         written += len(ok_rows)
         logger.info(
@@ -458,21 +484,47 @@ async def _trajectory_async(
     ):
         already = set(pl.read_parquet(settings.trajectory_parquet_path)["uuid"].to_list())
 
+    # Session-level checkpoint: drop messages whose host session has not advanced
+    # since the last trajectory run. This cuts the per-message SQL down before
+    # the anti-join on uuid.
+    bounds = session_bounds(con, since_days=since_days, limit=limit)
+    unchanged_pending, skipped_sessions = checkpointer.filter_unchanged(
+        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
+        pipeline="trajectory",
+        checkpoint_path=settings.checkpoint_parquet_path,
+    )
+    active_sessions: set[str] = set(unchanged_pending)
+
     where = ["mt.text_content IS NOT NULL", "length(mt.text_content) >= 1"]
     if since_days is not None:
         where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
+    if active_sessions:
+        where.append(
+            "CAST(mt.session_id AS VARCHAR) IN (SELECT unnest(?))",
+        )
     sql = f"""
-        SELECT CAST(mt.uuid AS VARCHAR) AS uuid, mt.text_content
+        SELECT CAST(mt.uuid AS VARCHAR) AS uuid,
+               CAST(mt.session_id AS VARCHAR) AS sid,
+               mt.text_content
           FROM messages_text mt
          WHERE {" AND ".join(where)}
          ORDER BY mt.ts
     """
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
-    rows = [(r[0], r[1]) for r in con.execute(sql).fetchall() if r[0] not in already]
+    params = [list(active_sessions)] if active_sessions else []
+    rows_raw = con.execute(sql, params).fetchall() if active_sessions or not bounds else []
+    rows = [(r[0], r[2]) for r in rows_raw if r[0] not in already]
+    session_for_uuid = {r[0]: r[1] for r in rows_raw if r[0] not in already}
+    if skipped_sessions:
+        logger.info(
+            "trajectory: skipped {} sessions via checkpoint",
+            skipped_sessions,
+        )
     logger.info("trajectory: {} pending messages", len(rows))
 
     if not rows:
+        logger.info("trajectory: wrote 0 total rows (nothing pending)")
         return 0
 
     heuristic_rows: list[dict[str, Any]] = []
@@ -504,7 +556,20 @@ async def _trajectory_async(
         )
         _append_parquet(settings.trajectory_parquet_path, df)
 
+    processed_sessions: set[str] = set()
+    for row in heuristic_rows:
+        sid = session_for_uuid.get(row["uuid"])
+        if sid is not None:
+            processed_sessions.add(sid)
+
     if not llm_pending:
+        if processed_sessions:
+            checkpointer.mark_completed(
+                settings.checkpoint_parquet_path,
+                pipeline="trajectory",
+                rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
+            )
+        logger.info("trajectory: wrote {} total rows", len(heuristic_rows))
         return len(heuristic_rows)
 
     client = _build_bedrock_client(settings)
@@ -547,6 +612,9 @@ async def _trajectory_async(
                     "classified_at": now,
                 }
             )
+            sid = session_for_uuid.get(uuid)
+            if sid is not None:
+                processed_sessions.add(sid)
         if ok:
             df = pl.DataFrame(
                 ok,
@@ -569,6 +637,12 @@ async def _trajectory_async(
             time.monotonic() - t0,
         )
 
+    if processed_sessions:
+        checkpointer.mark_completed(
+            settings.checkpoint_parquet_path,
+            pipeline="trajectory",
+            rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
+        )
     logger.info("trajectory: wrote {} total rows", written)
     return written
 
@@ -637,15 +711,27 @@ async def _conflicts_async(
     ):
         already = set(pl.read_parquet(settings.conflicts_parquet_path)["session_id"].to_list())
 
+    bounds = session_bounds(con, since_days=since_days, limit=limit)
+    unchanged_pending, skipped = checkpointer.filter_unchanged(
+        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
+        pipeline="conflicts",
+        checkpoint_path=settings.checkpoint_parquet_path,
+    )
+    keep = set(unchanged_pending)
+
     pending: list[tuple[str, str]] = []
     for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
         if sid in already:
             continue
+        if sid not in keep:
+            continue
         pending.append((sid, text))
 
     if not pending:
-        logger.info("conflicts: no pending sessions")
+        logger.info("conflicts: no pending sessions (skipped={} via checkpoint)", skipped)
         return 0
+    if skipped:
+        logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
     sem = asyncio.Semaphore(settings.concurrency)
@@ -719,11 +805,18 @@ async def _conflicts_async(
                 },
             )
             _append_parquet(settings.conflicts_parquet_path, df)
-        written += sum(
-            1
-            for (_s, _t), r in zip(chunk, results, strict=True)
+        ok_sids = {
+            sid
+            for (sid, _t), r in zip(chunk, results, strict=True)
             if not isinstance(r, BaseException)
-        )
+        }
+        if ok_sids:
+            checkpointer.mark_completed(
+                settings.checkpoint_parquet_path,
+                pipeline="conflicts",
+                rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
+            )
+        written += len(ok_sids)
         logger.info(
             "conflicts chunk {}/{}: {} sessions processed, {} errors, {:.1f}s",
             i // chunk_size + 1,

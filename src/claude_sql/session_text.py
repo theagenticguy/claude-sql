@@ -27,7 +27,9 @@ iter_session_texts(con, *, settings, since_days=None, limit=None) -> Iterator[tu
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -217,6 +219,48 @@ def _load_session_order(
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
     return [r[0] for r in con.execute(sql).fetchall()]
+
+
+def session_bounds(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+) -> dict[str, tuple[datetime | None, datetime | None]]:
+    """Return ``{session_id: (last_ts, transcript_mtime)}`` for the window.
+
+    ``last_ts`` is ``max(messages_text.ts)`` for the session. ``transcript_mtime``
+    is ``os.stat(transcript_path).st_mtime`` for the JSONL file backing the
+    session — or ``None`` when the file is unreadable (stale glob entry, etc).
+
+    Used by the LLM worker pipelines to drive mtime-based checkpoint skip.
+    """
+    where = ["mt.text_content IS NOT NULL"]
+    if since_days is not None:
+        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
+    sql = f"""
+        SELECT CAST(mt.session_id AS VARCHAR) AS sid,
+               max(mt.ts) AS last_ts,
+               any_value(s.transcript_path) AS transcript_path
+          FROM messages_text mt
+          LEFT JOIN sessions s ON CAST(s.session_id AS VARCHAR) = CAST(mt.session_id AS VARCHAR)
+         WHERE {" AND ".join(where)}
+         GROUP BY 1
+         ORDER BY last_ts DESC
+    """
+    if limit is not None:
+        sql += f"\nLIMIT {int(limit)}"
+    out: dict[str, tuple[datetime | None, datetime | None]] = {}
+    for sid, last_ts, path in con.execute(sql).fetchall():
+        mtime: datetime | None = None
+        if path:
+            try:
+                st = os.stat(path)
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
+            except OSError:
+                mtime = None
+        out[str(sid)] = (last_ts, mtime)
+    return out
 
 
 def _load_messages_text(
