@@ -171,16 +171,17 @@ More recipes in [docs/analytics_cookbook.md](docs/analytics_cookbook.md).
 
 ## CLI surface
 
-All 12 subcommands follow the same shape: shared `--verbose`/`--quiet`,
-`--glob`, `--subagent-glob` flags on the top level; per-command flags as
-documented. Commands that spend real Bedrock money default to `--dry-run`.
+All 13 subcommands share top-level flags: `--verbose` / `--quiet`,
+`--glob`, `--subagent-glob`, and `--format {auto,table,json,ndjson,csv}`.
+Commands that spend real Bedrock money default to `--dry-run`.
 
 | Command | Purpose |
 |---|---|
 | `schema` | List every view + its columns, plus every macro |
-| `query <sql>` | Run a query, print the polars table |
-| `explain <sql>` | `EXPLAIN ANALYZE` with pushdown markers highlighted |
+| `query <sql>` | Run a query, emit result as table / JSON / NDJSON / CSV |
+| `explain <sql>` | Static `EXPLAIN` by default; `--analyze` for `EXPLAIN ANALYZE` |
 | `shell` | Launch the `duckdb` REPL with everything pre-registered |
+| `list-cache` | Report freshness + row counts for every parquet cache |
 | `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock |
 | `search <text>` | HNSW cosine semantic search over embeddings |
 | `classify` | Sonnet 4.6 → session autonomy + work category + success + goal |
@@ -189,6 +190,26 @@ documented. Commands that spend real Bedrock money default to `--dry-run`.
 | `cluster` | UMAP → HDBSCAN → c-TF-IDF over message embeddings |
 | `community` | Louvain over session centroids |
 | `analyze` | Run the whole pipeline in dependency order |
+
+### Agent-friendly defaults
+
+- **`--format auto`** emits a human table on a TTY and JSON when stdout is
+  piped, so agents don't have to set a flag. `json`, `ndjson`, and `csv` are
+  always available explicitly.
+- **Classified exit codes** for DuckDB errors — `64` for parse errors, `65`
+  for unknown view / column / macro, `70` for other runtime errors, `2` when
+  `search` is called before `embed` has run. On non-TTY stdout the error
+  comes back as `{"error": {"kind", "message", "hint"}}` on stderr so agents
+  don't have to scrape tracebacks.
+- **`list-cache`** reports every parquet (embeddings, classifications,
+  trajectory, conflicts, clusters, cluster_terms, communities) with its
+  `{exists, bytes, mtime, rows}`, so an agent can decide whether to run a
+  prerequisite stage before issuing a `search` or `query`.
+- **`explain`** is a static plan by default (no query execution); pass
+  `--analyze` for `EXPLAIN ANALYZE` when you actually want timings.
+- **`--quiet`** suppresses all INFO / WARNING logs to ERROR-only; view
+  registration happens at DEBUG level, so the default `query` stderr is
+  already empty unless something actually warrants attention.
 
 ## Views
 

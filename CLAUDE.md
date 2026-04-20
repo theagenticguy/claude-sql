@@ -116,6 +116,26 @@ math (per-class TF, IDF, L1 norm, ngram (1,2), min_df=2). Do not pull in
   before looking it up, so `claude-sonnet-4-6-20260315` matches the same
   entry as `claude-sonnet-4-6`.
 
+## Agent-friendly CLI surface (load-bearing — do not regress)
+
+- `--format {auto,table,json,ndjson,csv}` on every subcommand. `auto`
+  resolves to `table` on TTY, `json` on pipe — agents calling via
+  subprocess get JSON for free.
+- Structured DuckDB errors: parse → exit 64, catalog → exit 65, runtime
+  → exit 70. Non-TTY stderr carries `{"error": {"kind","message","hint"}}`.
+  Keep `claude_sql.output.classify_duckdb_error` in sync if new DuckDB
+  exception subclasses land.
+- `list-cache` reports every parquet's `{exists, bytes, mtime, rows}`.
+  When adding a new analytics parquet, extend `_describe_cache_entry`
+  calls in `cli.py` so it shows up.
+- `explain` default is static (`EXPLAIN`, no execution). `--analyze`
+  opts into `EXPLAIN ANALYZE`. Do NOT flip this back — the prior default
+  silently executed slow queries when agents probed plans.
+- `--quiet` is honored by every subcommand via `_configure`. View
+  registration logs are at DEBUG on purpose so the default stderr stays
+  empty for read-only flows. Warnings are reserved for genuinely
+  actionable state (e.g., missing embeddings parquet).
+
 ## Environment variables
 
 All prefixed `CLAUDE_SQL_`. Defaults are in `config.py`; see the README

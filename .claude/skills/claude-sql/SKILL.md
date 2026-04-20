@@ -71,8 +71,9 @@ repo or `uv tool install --from . claude-sql`.
 |---|---|---|
 | `schema` | List every view + macro | No |
 | `query <sql>` | Run a SQL query | No |
-| `explain <sql>` | EXPLAIN ANALYZE with pushdown markers | No |
+| `explain <sql>` | Static EXPLAIN; `--analyze` runs EXPLAIN ANALYZE | No (static) |
 | `shell` | DuckDB REPL with everything registered | No |
+| `list-cache` | Parquet freshness + row counts per analytics stage | No |
 | `search <text>` | HNSW cosine top-k semantic search | No |
 | `embed` | Backfill Cohere v4 embeddings | Yes (defaults to `--dry-run`) |
 | `classify` | Sonnet 4.6 session classification | Yes (defaults to `--dry-run`) |
@@ -83,6 +84,22 @@ repo or `uv tool install --from . claude-sql`.
 | `analyze` | Everything above, in order | Yes (defaults to `--dry-run`) |
 
 Full per-command flags and examples are in `references/commands.md`.
+
+## Agent-friendly invocation
+
+- **Always pass `--format json`** when scripting the CLI from an agent. The
+  default (`auto`) already picks JSON off a TTY, but being explicit makes
+  the invocation portable.
+- **Before `search` or an analytics query, run `claude-sql list-cache
+  --format json`** to confirm the backing parquet exists. An empty
+  embeddings cache means `search` exits with code `2`; an unpopulated
+  `session_classifications.parquet` means the analytics macros return
+  empty tables.
+- **Expect classified exit codes on errors** — parse=64, catalog=65,
+  runtime=70. Match on those rather than parsing error messages.
+- **Use `--quiet`** to suppress log noise when piping JSON into another
+  tool; the registration traffic is already at DEBUG by default but
+  `--quiet` makes stderr silent except for errors.
 
 ## Shape of the data
 
