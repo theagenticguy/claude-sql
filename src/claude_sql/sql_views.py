@@ -72,6 +72,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "user_friction",
 )
 
 # Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
@@ -86,6 +87,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "user_friction",
 )
 
 # Macro names registered by :func:`register_macros`.  The first six are the
@@ -106,6 +108,9 @@ MACRO_NAMES: tuple[str, ...] = (
     "cluster_top_terms",
     "community_top_topics",
     "sentiment_arc",
+    "friction_counts",
+    "friction_rate",
+    "friction_examples",
 )
 
 
@@ -818,6 +823,94 @@ def register_macros(
         """,
     )
 
+    # Counts per friction label, scoped to the last N days by message ``ts``
+    # (the user's actual utterance time, not detected_at).  Pass ``NULL`` to
+    # include the full corpus.  Excludes label='none' because that is the
+    # majority sentinel class and would swamp the output.
+    _safe_macro(
+        con,
+        "friction_counts",
+        """
+        CREATE OR REPLACE MACRO friction_counts(since_days) AS TABLE (
+            SELECT label,
+                   count(*)                       AS n,
+                   count(DISTINCT session_id)     AS sessions,
+                   avg(confidence)                AS avg_confidence,
+                   sum(CASE WHEN source='regex' THEN 1 ELSE 0 END) AS n_regex,
+                   sum(CASE WHEN source='llm'   THEN 1 ELSE 0 END) AS n_llm
+              FROM user_friction
+             WHERE label != 'none'
+               AND (since_days IS NULL
+                    OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
+             GROUP BY label
+             ORDER BY n DESC
+        );
+        """,
+    )
+
+    # Per-session friction pressure: how many non-'none' friction messages
+    # fired vs the total user message count.  A high rate is a strong proxy
+    # for a session where the agent repeatedly fell short of what the user
+    # expected.
+    _safe_macro(
+        con,
+        "friction_rate",
+        """
+        CREATE OR REPLACE MACRO friction_rate(since_days) AS TABLE (
+            WITH hits AS (
+                SELECT session_id,
+                       count(*) FILTER (WHERE label != 'none') AS n_friction,
+                       count(*) FILTER (WHERE label = 'status_ping')        AS n_status,
+                       count(*) FILTER (WHERE label = 'unmet_expectation')  AS n_unmet,
+                       count(*) FILTER (WHERE label = 'confusion')          AS n_confusion,
+                       count(*) FILTER (WHERE label = 'interruption')       AS n_interruption,
+                       count(*) FILTER (WHERE label = 'correction')         AS n_correction,
+                       count(*) FILTER (WHERE label = 'frustration')        AS n_frustration
+                  FROM user_friction
+                 WHERE since_days IS NULL
+                    OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY)
+                 GROUP BY session_id
+            ),
+            user_msgs AS (
+                SELECT CAST(mt.session_id AS VARCHAR) AS session_id,
+                       count(*) AS n_user_msgs
+                  FROM messages_text mt
+                 WHERE mt.role = 'user'
+                   AND (since_days IS NULL
+                        OR mt.ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
+                 GROUP BY 1
+            )
+            SELECT h.session_id,
+                   h.n_friction,
+                   h.n_status, h.n_unmet, h.n_confusion,
+                   h.n_interruption, h.n_correction, h.n_frustration,
+                   COALESCE(um.n_user_msgs, 0)                              AS n_user_msgs,
+                   h.n_friction::DOUBLE / NULLIF(um.n_user_msgs, 0)         AS rate
+              FROM hits h
+              LEFT JOIN user_msgs um USING (session_id)
+             WHERE h.n_friction > 0
+             ORDER BY h.n_friction DESC
+        );
+        """,
+    )
+
+    # Top-N example user messages for a given friction label, highest
+    # confidence first.  ``label_name`` is a VARCHAR so DuckDB callers
+    # don't have to quote-escape through the macro boundary.
+    _safe_macro(
+        con,
+        "friction_examples",
+        """
+        CREATE OR REPLACE MACRO friction_examples(label_name, n) AS TABLE (
+            SELECT session_id, ts, text_snippet, rationale, source, confidence
+              FROM user_friction
+             WHERE label = label_name
+             ORDER BY confidence DESC, ts DESC
+             LIMIT n
+        );
+        """,
+    )
+
 
 # ---------------------------------------------------------------------------
 # VSS
@@ -958,13 +1051,15 @@ def register_analytics(
     clusters_parquet: Path | None = None,
     cluster_terms_parquet: Path | None = None,
     communities_parquet: Path | None = None,
+    user_friction_parquet: Path | None = None,
 ) -> None:
     """Register v2 analytics parquets as DuckDB views.
 
     Creates one ``CREATE OR REPLACE VIEW`` per parquet that exists on disk:
     ``session_classifications``, ``message_trajectory``, ``session_conflicts``,
-    ``message_clusters``, ``cluster_terms``, ``session_communities``, plus the
-    derived ``session_goals`` projection over ``session_classifications``.
+    ``message_clusters``, ``cluster_terms``, ``session_communities``,
+    ``user_friction``, plus the derived ``session_goals`` projection over
+    ``session_classifications``.
 
     Each view is created only when its source parquet exists and is larger
     than an empty-file sentinel (>16 bytes).  Missing parquets are skipped
@@ -1011,6 +1106,9 @@ def register_analytics(
         "session_communities": communities_parquet
         if communities_parquet is not None
         else resolved.communities_parquet_path,
+        "user_friction": user_friction_parquet
+        if user_friction_parquet is not None
+        else resolved.user_friction_parquet_path,
     }
 
     registered: set[str] = set()

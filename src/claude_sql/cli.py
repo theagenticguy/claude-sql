@@ -40,6 +40,7 @@ from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
+from claude_sql.friction_worker import detect_user_friction
 from claude_sql.install_source import format_version
 from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
@@ -346,6 +347,7 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("message_clusters", settings.clusters_parquet_path),
         _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
         _describe_cache_entry("session_communities", settings.communities_parquet_path),
+        _describe_cache_entry("user_friction", settings.user_friction_parquet_path),
         _describe_checkpoint_entry(settings.checkpoint_db_path),
     ]
 
@@ -557,6 +559,38 @@ def conflicts(
 
 
 @app.command
+def friction(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Classify short user messages for friction signals (regex + Sonnet 4.6).
+
+    Detects status pings, unmet expectations ("screenshot?"), confusion,
+    interruptions, corrections, and frustration.  Default is ``--dry-run`` --
+    real Bedrock spend requires explicit ``--no-dry-run``.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    con = _open_connection(settings)
+    try:
+        n = detect_user_friction(
+            con,
+            settings,
+            since_days=since_days,
+            limit=limit,
+            dry_run=dry_run,
+            no_thinking=no_thinking,
+        )
+        logger.info("friction: {} rows written (dry_run={})", n, dry_run)
+    finally:
+        con.close()
+
+
+@app.command
 def cluster(*, force: bool = False, common: Common | None = None) -> None:
     """UMAP + HDBSCAN over message_embeddings; writes clusters.parquet."""
     _configure(common)
@@ -616,6 +650,7 @@ def analyze(
     skip_classify: bool = False,
     skip_trajectory: bool = False,
     skip_conflicts: bool = False,
+    skip_friction: bool = False,
     skip_cluster: bool = False,
     skip_community: bool = False,
     force_cluster: bool = False,
@@ -624,7 +659,7 @@ def analyze(
 ) -> None:
     """Run the full v2 analytics pipeline.
 
-    Stages: embed -> classify + cluster + community -> trajectory -> conflicts.
+    Stages: embed -> classify + cluster + community -> trajectory -> conflicts -> friction.
 
     Default is ``--dry-run`` -- every LLM-touching stage just prints pending
     counts and cost estimates.  Pass ``--no-dry-run`` to execute for real.
@@ -735,6 +770,22 @@ def analyze(
         finally:
             con.close()
 
+    # 7. Friction (LLM, short-message scope).
+    if not skip_friction:
+        con = _open_connection(settings)
+        try:
+            n = detect_user_friction(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                dry_run=dry_run,
+                no_thinking=no_thinking,
+            )
+            logger.info("analyze/friction: {} rows (dry_run={})", n, dry_run)
+        finally:
+            con.close()
+
     logger.info("analyze: done")
 
 
@@ -745,7 +796,7 @@ def _default(*, common: Common | None = None) -> None:
     print("claude-sql - pass a subcommand or --help")
     print("  schema | query | explain | shell | list-cache")
     print("  embed | search")
-    print("  classify | trajectory | conflicts | cluster | terms | community | analyze")
+    print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
 
 
 # ---------------------------------------------------------------------------

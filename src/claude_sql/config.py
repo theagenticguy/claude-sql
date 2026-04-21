@@ -57,6 +57,10 @@ def _default_communities_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
 
 
+def _default_user_friction_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/user_friction.parquet"))
+
+
 def _default_checkpoint_db() -> Path:
     return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
 
@@ -151,6 +155,17 @@ class Settings(BaseSettings):
     clusters_parquet_path: Path = Field(default_factory=_default_clusters_parquet)
     cluster_terms_parquet_path: Path = Field(default_factory=_default_cluster_terms_parquet)
     communities_parquet_path: Path = Field(default_factory=_default_communities_parquet)
+    #: Output of the user-friction classifier (see ``friction_worker.py``).
+    #: One row per user message flagged as status_ping, unmet_expectation,
+    #: confusion, interruption, correction, frustration, or (sentinel) none.
+    #: Backs the ``user_friction`` view and the ``friction_counts`` /
+    #: ``friction_rate`` analytics macros.
+    user_friction_parquet_path: Path = Field(default_factory=_default_user_friction_parquet)
+    #: Short-message cutoff for the friction classifier candidate filter.
+    #: Friction signals cluster in short messages ("screenshot?", "wait",
+    #: "why?"); long messages are almost always on-topic turns.  300 chars
+    #: captures ~95% of the interesting class without bloating Bedrock cost.
+    friction_max_chars: int = 300
     #: Per-(session_id, pipeline) checkpoint DuckDB file. See ``checkpointer.py``.
     checkpoint_db_path: Path = Field(default_factory=_default_checkpoint_db)
 

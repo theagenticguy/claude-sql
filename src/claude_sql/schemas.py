@@ -253,12 +253,85 @@ class SessionConflicts(BaseModel):
 SESSION_CONFLICTS_SCHEMA: dict = _bedrock_schema(SessionConflicts)
 
 
+class UserFrictionSignal(BaseModel):
+    """Classify a single short user message for friction signals.
+
+    A "friction signal" is anything in the user's utterance that implies the
+    agent's last turn fell short of expectations: an impatient status ping,
+    a one-word question pointing at a missed artifact (``screenshot?``,
+    ``tests?``), confusion about what happened, a hard interruption, a
+    correction, or open frustration.
+
+    Applied only to user-role messages below
+    :class:`Settings.friction_max_chars` (default 300).  Long user messages
+    are almost always genuine task turns rather than interrupt/confusion
+    signals -- the filter keeps Bedrock cost linear in the interesting slice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: Literal[
+        "status_ping",
+        "unmet_expectation",
+        "confusion",
+        "interruption",
+        "correction",
+        "frustration",
+        "none",
+    ] = Field(
+        ...,
+        description=(
+            "Dominant friction category for this single user message.  "
+            "'status_ping': the user asks about progress/ETA ('how's it going?', "
+            "'any update?', 'status?', 'where are we?'). "
+            "'unmet_expectation': a one- or two-word question that points at "
+            "something the agent should have done proactively but didn't "
+            "('screenshot?', 'tests?', 'link?', 'diff?'). "
+            "'confusion': the user signals they don't understand the output or "
+            "state ('what does that mean?', 'why did you do X?', 'I don't get it'). "
+            "'interruption': the user cuts the agent off or redirects mid-task "
+            "('wait', 'stop', 'hold on', 'actually...', 'before you do that'). "
+            "'correction': the user tells the agent its last action/answer was "
+            "wrong ('no, not that', 'that's wrong', 'nope', 'try again'). "
+            "'frustration': terse annoyance or sarcasm ('ugh', 'seriously?', "
+            "'are you kidding', 'really?'). "
+            "'none': ordinary task turn with no friction signal -- a substantive "
+            "instruction, a plain question, an acknowledgement. USE THIS FOR "
+            "THE MAJORITY OF MESSAGES."
+        ),
+    )
+    rationale: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "One short sentence (<=200 chars) naming the specific phrase or "
+            "structural cue that triggered the label.  Use an empty-ish "
+            "placeholder like 'ordinary instruction' when label='none'."
+        ),
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Classifier self-confidence 0.0-1.0.  Use <0.5 when the message is "
+            "genuinely ambiguous between 'none' and a friction label."
+        ),
+    )
+
+
+USER_FRICTION_SCHEMA: dict = _bedrock_schema(UserFrictionSignal)
+
+
 __all__ = [
     "MESSAGE_TRAJECTORY_SCHEMA",
     "SESSION_CLASSIFICATION_SCHEMA",
     "SESSION_CONFLICTS_SCHEMA",
+    "USER_FRICTION_SCHEMA",
     "Conflict",
     "MessageTrajectory",
     "SessionClassification",
     "SessionConflicts",
+    "UserFrictionSignal",
 ]
