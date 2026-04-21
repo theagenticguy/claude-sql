@@ -247,7 +247,7 @@ async def _classify_sessions_async(
     unchanged_pending, skipped = checkpointer.filter_unchanged(
         ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
         pipeline="classify",
-        checkpoint_path=settings.checkpoint_parquet_path,
+        checkpoint_db_path=settings.checkpoint_db_path,
     )
     keep = set(unchanged_pending)
 
@@ -336,7 +336,7 @@ async def _classify_sessions_async(
         # so a later re-run with no new messages is a no-op.
         if ok_rows:
             checkpointer.mark_completed(
-                settings.checkpoint_parquet_path,
+                settings.checkpoint_db_path,
                 pipeline="classify",
                 rows=[
                     (row["session_id"], *bounds.get(row["session_id"], (None, None)))
@@ -491,7 +491,7 @@ async def _trajectory_async(
     unchanged_pending, skipped_sessions = checkpointer.filter_unchanged(
         ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
         pipeline="trajectory",
-        checkpoint_path=settings.checkpoint_parquet_path,
+        checkpoint_db_path=settings.checkpoint_db_path,
     )
     active_sessions: set[str] = set(unchanged_pending)
 
@@ -565,7 +565,7 @@ async def _trajectory_async(
     if not llm_pending:
         if processed_sessions:
             checkpointer.mark_completed(
-                settings.checkpoint_parquet_path,
+                settings.checkpoint_db_path,
                 pipeline="trajectory",
                 rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
             )
@@ -639,7 +639,7 @@ async def _trajectory_async(
 
     if processed_sessions:
         checkpointer.mark_completed(
-            settings.checkpoint_parquet_path,
+            settings.checkpoint_db_path,
             pipeline="trajectory",
             rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
         )
@@ -715,7 +715,7 @@ async def _conflicts_async(
     unchanged_pending, skipped = checkpointer.filter_unchanged(
         ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
         pipeline="conflicts",
-        checkpoint_path=settings.checkpoint_parquet_path,
+        checkpoint_db_path=settings.checkpoint_db_path,
     )
     keep = set(unchanged_pending)
 
@@ -812,7 +812,7 @@ async def _conflicts_async(
         }
         if ok_sids:
             checkpointer.mark_completed(
-                settings.checkpoint_parquet_path,
+                settings.checkpoint_db_path,
                 pipeline="conflicts",
                 rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
             )

@@ -35,6 +35,7 @@ import polars as pl
 from cyclopts import App, Parameter
 from loguru import logger
 
+from claude_sql import checkpointer
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
@@ -136,6 +137,27 @@ _EXPLAIN_MARKERS: tuple[str, ...] = (
     "HNSW_INDEX_SCAN",
     "HASH_GROUP_BY",
 )
+
+
+def _describe_checkpoint_entry(path: Path) -> dict[str, object]:
+    """Report the persistent DuckDB checkpoint file alongside the parquet caches.
+
+    Keeps the same ``{name, path, exists[, bytes, mtime, rows]}`` shape as
+    :func:`_describe_cache_entry` so ``list-cache`` stays homogeneous.  Row
+    count is queried via :func:`checkpointer.count_rows`.
+    """
+    exists = path.exists() and path.is_file()
+    entry: dict[str, object] = {"name": "session_checkpoint", "path": str(path), "exists": exists}
+    if not exists:
+        return entry
+    stat = path.stat()
+    entry["bytes"] = stat.st_size
+    entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
+    try:
+        entry["rows"] = checkpointer.count_rows(path)
+    except duckdb.Error:
+        entry["rows"] = None
+    return entry
 
 
 def _describe_cache_entry(name: str, path: Path) -> dict[str, object]:
@@ -324,7 +346,7 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("message_clusters", settings.clusters_parquet_path),
         _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
         _describe_cache_entry("session_communities", settings.communities_parquet_path),
-        _describe_cache_entry("session_checkpoint", settings.checkpoint_parquet_path),
+        _describe_checkpoint_entry(settings.checkpoint_db_path),
     ]
 
     if fmt is OutputFormat.TABLE:

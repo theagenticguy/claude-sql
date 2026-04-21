@@ -57,8 +57,8 @@ def _default_communities_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
 
 
-def _default_checkpoint_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_checkpoint.parquet"))
+def _default_checkpoint_db() -> Path:
+    return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
 
 
 # Model pricing per 1M tokens (in_rate, out_rate).  Mirrors claude-mine/transform.py.
@@ -151,8 +151,8 @@ class Settings(BaseSettings):
     clusters_parquet_path: Path = Field(default_factory=_default_clusters_parquet)
     cluster_terms_parquet_path: Path = Field(default_factory=_default_cluster_terms_parquet)
     communities_parquet_path: Path = Field(default_factory=_default_communities_parquet)
-    #: Per-(session_id, pipeline) checkpoint parquet. See ``checkpointer.py``.
-    checkpoint_parquet_path: Path = Field(default_factory=_default_checkpoint_parquet)
+    #: Per-(session_id, pipeline) checkpoint DuckDB file. See ``checkpointer.py``.
+    checkpoint_db_path: Path = Field(default_factory=_default_checkpoint_db)
 
     # ------------------------------------------------------------------
     # v2: UMAP + HDBSCAN + Louvain hyperparameters

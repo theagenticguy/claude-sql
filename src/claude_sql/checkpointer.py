@@ -1,23 +1,27 @@
-"""Per-session checkpoint parquet.
+"""Per-(session_id, pipeline) checkpoint backed by a persistent DuckDB file.
 
-Tracks one row per ``(session_id, pipeline)`` recording the session's
-``last_ts`` (max ``mt.ts`` we've seen) and ``last_mtime`` (transcript JSONL
-filesystem mtime) at the moment the pipeline last finished. The worker
-pipelines (``classify``, ``trajectory``, ``conflicts``) read the checkpoint
-before enumerating pending work and skip any session whose
-``(last_ts, last_mtime)`` has not advanced since the last run.
+Tracks when each LLM pipeline last processed each session so re-runs skip
+sessions whose transcripts have not advanced. One row per
+``(session_id, pipeline)``; ``INSERT OR REPLACE`` is the upsert primitive.
 
 Schema::
 
-    session_id         VARCHAR     # key
-    pipeline           VARCHAR     # "classify" | "trajectory" | "conflicts"
-    last_ts_processed  TIMESTAMP   # max messages_text.ts the pipeline saw
-    last_mtime_processed TIMESTAMP # transcript JSONL mtime at run time
-    completed_at       TIMESTAMP   # wall-clock of the run that wrote the row
+    CREATE TABLE session_checkpoint (
+        session_id            VARCHAR,
+        pipeline              VARCHAR,
+        last_ts_processed     TIMESTAMP,
+        last_mtime_processed  TIMESTAMP,
+        completed_at          TIMESTAMP NOT NULL,
+        PRIMARY KEY (session_id, pipeline)
+    );
 
-Semantics are upsert-by-``(session_id, pipeline)``: a second call replaces
-the prior row, so the file stays small (hundreds of rows, not historical
-audit).
+All timestamps are UTC. Plain ``TIMESTAMP`` (not ``TIMESTAMP WITH TIME
+ZONE``) because DuckDB's tz-aware type requires ``pytz`` at query time —
+an extra dep we don't want. We stash tz-aware UTC datetimes by stripping
+``tzinfo`` at the boundary and re-attaching ``UTC`` on read.
+
+The file lives at ``~/.claude/claude_sql.duckdb`` (overridable via
+``CLAUDE_SQL_CHECKPOINT_DB_PATH``).
 """
 
 from __future__ import annotations
@@ -26,62 +30,70 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-import polars as pl
-from loguru import logger
+import duckdb
 
 PIPELINE_NAMES: tuple[str, ...] = ("classify", "trajectory", "conflicts")
 
-_SCHEMA: dict[str, pl.DataType | type] = {
-    "session_id": pl.Utf8,
-    "pipeline": pl.Utf8,
-    "last_ts_processed": pl.Datetime("us", "UTC"),
-    "last_mtime_processed": pl.Datetime("us", "UTC"),
-    "completed_at": pl.Datetime("us", "UTC"),
-}
+_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS session_checkpoint (
+    session_id            VARCHAR   NOT NULL,
+    pipeline              VARCHAR   NOT NULL,
+    last_ts_processed     TIMESTAMP,
+    last_mtime_processed  TIMESTAMP,
+    completed_at          TIMESTAMP NOT NULL,
+    PRIMARY KEY (session_id, pipeline)
+);
+"""
 
 
-def _parquet_is_populated(path: Path) -> bool:
-    """Match the ``>16 bytes`` sentinel used throughout the project."""
-    return path.exists() and path.stat().st_size > 16
+def _strip_tz(dt: datetime | None) -> datetime | None:
+    """Drop tz so DuckDB's naive TIMESTAMP round-trips without pytz."""
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).replace(tzinfo=None)
 
 
-def load(path: Path) -> pl.DataFrame:
-    """Return the checkpoint DataFrame, or an empty frame with the right schema."""
-    if not _parquet_is_populated(path):
-        return pl.DataFrame(schema=_SCHEMA)
-    try:
-        return pl.read_parquet(path)
-    except (OSError, pl.exceptions.ComputeError):
-        logger.warning("checkpoint: unreadable parquet at {} — treating as empty", path)
-        return pl.DataFrame(schema=_SCHEMA)
+def _attach_tz(dt: datetime | None) -> datetime | None:
+    """Re-attach UTC on read so callers always get aware datetimes back."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=UTC)
 
 
-def load_as_map(path: Path, pipeline: str) -> dict[str, tuple[datetime | None, datetime | None]]:
+def _connect(path: Path) -> duckdb.DuckDBPyConnection:
+    """Open the checkpoint DB and ensure the table exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(path))
+    con.execute(_CREATE_TABLE_SQL)
+    return con
+
+
+def load_as_map(db_path: Path, pipeline: str) -> dict[str, tuple[datetime | None, datetime | None]]:
     """Return ``{session_id: (last_ts, last_mtime)}`` for one pipeline.
 
-    Timestamps may be ``None`` for rows that were written with missing
-    metadata — callers treat ``None`` as "unknown, re-process".
+    Empty dict when the DB doesn't exist yet or the pipeline has no rows.
     """
-    df = load(path)
-    if df.is_empty():
+    if not db_path.exists():
         return {}
-    mine = df.filter(pl.col("pipeline") == pipeline)
-    if mine.is_empty():
-        return {}
-    out: dict[str, tuple[datetime | None, datetime | None]] = {}
-    for row in mine.iter_rows(named=True):
-        out[str(row["session_id"])] = (
-            row["last_ts_processed"],
-            row["last_mtime_processed"],
-        )
-    return out
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT session_id, last_ts_processed, last_mtime_processed "
+            "FROM session_checkpoint WHERE pipeline = ?",
+            [pipeline],
+        ).fetchall()
+    finally:
+        con.close()
+    return {
+        str(sid): (_attach_tz(last_ts), _attach_tz(last_mtime)) for sid, last_ts, last_mtime in rows
+    }
 
 
 def filter_unchanged(
     candidates: Iterable[tuple[str, datetime | None, datetime | None]],
     *,
     pipeline: str,
-    checkpoint_path: Path,
+    checkpoint_db_path: Path,
 ) -> tuple[list[str], int]:
     """Drop sessions whose ``(last_ts, last_mtime)`` has not advanced.
 
@@ -92,7 +104,7 @@ def filter_unchanged(
     both ``current_last_ts <= ckpt.last_ts`` AND ``current_last_mtime <=
     ckpt.last_mtime``. Either bound moving forward invalidates the skip.
     """
-    ckpt = load_as_map(checkpoint_path, pipeline)
+    ckpt = load_as_map(checkpoint_db_path, pipeline)
     pending: list[str] = []
     skipped = 0
     for sid, cur_ts, cur_mtime in candidates:
@@ -111,7 +123,7 @@ def filter_unchanged(
 
 
 def mark_completed(
-    path: Path,
+    db_path: Path,
     *,
     pipeline: str,
     rows: Iterable[tuple[str, datetime | None, datetime | None]],
@@ -121,35 +133,37 @@ def mark_completed(
     Each row is ``(session_id, last_ts_processed, last_mtime_processed)``.
     The ``completed_at`` column is stamped with ``datetime.now(UTC)``.
 
-    Returns the number of upserted rows. When ``rows`` is empty, the file is
+    Returns the number of upserted rows. When ``rows`` is empty, the DB is
     left untouched.
     """
     incoming = list(rows)
     if not incoming:
         return 0
-    now = datetime.now(UTC)
-    df = pl.DataFrame(
-        [
-            {
-                "session_id": sid,
-                "pipeline": pipeline,
-                "last_ts_processed": last_ts,
-                "last_mtime_processed": last_mtime,
-                "completed_at": now,
-            }
-            for sid, last_ts, last_mtime in incoming
-        ],
-        schema=_SCHEMA,
-    )
-    existing = load(path)
-    if existing.is_empty():
-        merged = df
-    else:
-        # Anti-join + concat: stable across polars versions, same result as
-        # ``existing.update(df, on=["session_id","pipeline"], how="full")``.
-        keys = ["session_id", "pipeline"]
-        kept = existing.join(df.select(keys), on=keys, how="anti")
-        merged = pl.concat([kept, df], how="diagonal_relaxed")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    merged.write_parquet(path)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    payload = [
+        (sid, pipeline, _strip_tz(last_ts), _strip_tz(last_mtime), now)
+        for sid, last_ts, last_mtime in incoming
+    ]
+    con = _connect(db_path)
+    try:
+        con.executemany(
+            "INSERT OR REPLACE INTO session_checkpoint "
+            "(session_id, pipeline, last_ts_processed, last_mtime_processed, completed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            payload,
+        )
+    finally:
+        con.close()
     return len(incoming)
+
+
+def count_rows(db_path: Path) -> int:
+    """Return the total number of checkpoint rows, or 0 when the DB is missing."""
+    if not db_path.exists():
+        return 0
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT count(*) FROM session_checkpoint").fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
