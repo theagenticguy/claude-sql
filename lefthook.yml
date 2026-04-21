@@ -45,9 +45,14 @@ pre-push:
   jobs:
     # Full test suite on push is a safety net: pre-commit only runs the
     # linters, not pytest.  Pushing without a green test pass is almost
-    # always a mistake on this project.
+    # always a mistake on this project.  ``files: git diff ... HEAD``
+    # makes lefthook always consider this job runnable (it stops looking
+    # for staged_files / push_files matches) so the pytest command fires
+    # on every push that touches Python.
     - name: pytest
       run: uv run pytest tests/ --no-header -q
+      files: "git diff --name-only @{push} HEAD || git diff --name-only HEAD~"
+      glob: "*.py"
       skip:
         - merge
         - rebase
