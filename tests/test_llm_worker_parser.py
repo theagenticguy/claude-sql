@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from claude_sql.llm_worker import _parse_structured_payload
+from claude_sql.llm_worker import BedrockRefusalError, _parse_structured_payload
 
 
 def test_parses_top_level_output_dict() -> None:
@@ -112,3 +112,19 @@ def test_observed_failure_shape_does_not_crash() -> None:
 def test_raises_on_truly_unknown_shape() -> None:
     with pytest.raises(RuntimeError, match="Unexpected response shape"):
         _parse_structured_payload({"mystery": "data"})
+
+
+def test_refusal_raises_bedrock_refusal() -> None:
+    """Bedrock content-policy refusals have stop_reason='refusal' + empty content."""
+    payload = {
+        "model": "global.anthropic.claude-sonnet-4-6",
+        "id": "msg_02",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "stop_reason": "refusal",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 40, "output_tokens": 0},
+    }
+    with pytest.raises(BedrockRefusalError):
+        _parse_structured_payload(payload)

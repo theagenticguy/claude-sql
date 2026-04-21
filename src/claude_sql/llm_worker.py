@@ -164,6 +164,16 @@ def _invoke_classifier_sync(
     return _parse_structured_payload(payload)
 
 
+class BedrockRefusalError(Exception):
+    """Bedrock declined to classify the input under its content policy.
+
+    Raised when the response has ``stop_reason == "refusal"`` and no
+    content blocks. Callers treat this as a terminal, non-retryable
+    outcome and can write a neutral placeholder row so the message is
+    not re-tried in every future run.
+    """
+
+
 def _parse_structured_payload(payload: dict) -> dict:
     """Pull the structured JSON object out of a Bedrock response.
 
@@ -181,6 +191,8 @@ def _parse_structured_payload(payload: dict) -> dict:
     A ``RuntimeError`` with the observed top-level keys is raised when
     no shape matches; the caller enqueues the unit on the retry queue.
     """
+    if payload.get("stop_reason") == "refusal":
+        raise BedrockRefusalError("Bedrock refused the input (stop_reason=refusal)")
     if "output" in payload and isinstance(payload["output"], dict):
         return payload["output"]
     content = payload.get("content")
@@ -670,8 +682,26 @@ async def _trajectory_async(
 
         ok: list[dict[str, Any]] = []
         ok_uuids: list[str] = []
+        refused_uuids: list[str] = []
         errors = 0
         for (uuid, _), res in zip(chunk, results, strict=True):
+            if isinstance(res, BedrockRefusalError):
+                # Terminal: Bedrock won't classify this body. Stamp a neutral
+                # placeholder so the session moves on and the retry queue
+                # doesn't cycle forever on the same refusal.
+                logger.info("trajectory: {} refused by Bedrock — marking neutral", uuid)
+                now = datetime.now(UTC)
+                ok.append(
+                    {
+                        "uuid": uuid,
+                        "sentiment_delta": "neutral",
+                        "is_transition": False,
+                        "confidence": 0.0,
+                        "classified_at": now,
+                    }
+                )
+                refused_uuids.append(uuid)
+                continue
             if isinstance(res, BaseException):
                 errors += 1
                 logger.warning("trajectory: {} failed (queued for retry): {}", uuid, res)
@@ -708,11 +738,16 @@ async def _trajectory_async(
                 },
             )
             _append_parquet(settings.trajectory_parquet_path, df)
-            retry_queue.mark_done(
-                settings.checkpoint_db_path,
-                pipeline="trajectory",
-                unit_ids=ok_uuids,
-            )
+            # Clear retry queue for both successful uuids AND refusals we just
+            # neutralised — the refusal placeholder lives in the parquet now,
+            # so these uuids must not loop back through the queue.
+            done_uuids = ok_uuids + refused_uuids
+            if done_uuids:
+                retry_queue.mark_done(
+                    settings.checkpoint_db_path,
+                    pipeline="trajectory",
+                    unit_ids=done_uuids,
+                )
             # Per-chunk checkpoint: stamp sessions we've fully processed so a
             # mid-run crash doesn't lose the whole trajectory run.
             chunk_sessions = {session_for_uuid[u] for u in ok_uuids if u in session_for_uuid}
