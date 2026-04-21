@@ -35,7 +35,13 @@ import polars as pl
 from cyclopts import App, Parameter
 from loguru import logger
 
+from claude_sql import blind_handover as _blind_handover
 from claude_sql import checkpointer
+from claude_sql import freeze as _freeze
+from claude_sql import judge_worker as _judge_worker
+from claude_sql import judges as _judge_catalog
+from claude_sql import kappa_worker as _kappa_worker
+from claude_sql import ungrounded_worker as _ungrounded_worker
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
@@ -1201,6 +1207,274 @@ def analyze(
     logger.info("analyze: done")
 
 
+@app.command(name="judges")
+def judges_cmd(*, common: Common | None = None) -> None:
+    """List the cross-provider Bedrock judge catalog (shortname, model ID, family, notes)."""
+    _configure(common)
+    fmt = _fmt(common)
+    rows = [
+        {
+            "shortname": j.shortname,
+            "model_id": j.model_id,
+            "provider": j.provider,
+            "family": j.family,
+            "role": j.role,
+            "notes": j.notes,
+        }
+        for j in _judge_catalog.catalog()
+    ]
+    df = pl.DataFrame(rows)
+    emit_dataframe(df, fmt=fmt)
+
+
+@app.command(name="freeze")
+def freeze_cmd(
+    rubric: Path,
+    /,
+    *,
+    panel: str,
+    embed_model: str = "global.cohere.embed-v4:0",
+    seed: int = 42,
+    min_turns: int = 10,
+    max_turns: int = 40,
+    common: Common | None = None,
+) -> None:
+    """Pre-register a study: write an immutable manifest under ~/.claude/studies/<sha>/.
+
+    ``panel`` is a comma-separated list of judge shortnames (see ``claude-sql
+    judges``).  The returned SHA is what every downstream worker consumes.
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    panel_list = [s.strip() for s in panel.split(",") if s.strip()]
+    if not panel_list:
+        raise InputValidationError("--panel must have at least one shortname")
+    scope = _freeze.SessionScope(min_turns=min_turns, max_turns=max_turns)
+    study = _freeze.freeze(
+        rubric_path=rubric,
+        panel_shortnames=tuple(panel_list),
+        embed_model_id=embed_model,
+        session_scope=scope,
+        seed=seed,
+    )
+    emit_json(
+        {
+            "manifest_sha": study.manifest_sha,
+            "rubric_path": study.rubric_path,
+            "panel_shortnames": list(study.panel_shortnames),
+            "commit_sha": study.commit_sha,
+            "created_at_utc": study.created_at_utc,
+        },
+        fmt=fmt,
+    )
+
+
+@app.command(name="replay")
+def replay_cmd(manifest_sha: str, /, *, common: Common | None = None) -> None:
+    """Load and echo a frozen study manifest by SHA."""
+    _configure(common)
+    fmt = _fmt(common)
+    study = _freeze.replay(manifest_sha)
+    emit_json(study.to_dict(), fmt=fmt)
+
+
+@app.command(name="blind-handover")
+def blind_handover_cmd(
+    input_path: Path,
+    /,
+    output_path: Path,
+    *,
+    common: Common | None = None,
+) -> None:
+    """Strip identity markers from a parquet of sessions for grader-safe handover.
+
+    Input parquet must have (session_id, text) columns.  Writes the same
+    parquet with text stripped and an ``original_hash`` column added.
+    """
+    _configure(common)
+    df = pl.read_parquet(input_path)
+    required = {"session_id", "text"}
+    missing = required - set(df.columns)
+    if missing:
+        raise InputValidationError(f"input parquet missing columns: {sorted(missing)}")
+    stripped = [_blind_handover.strip_text(t) for t in df["text"].to_list()]
+    out = df.with_columns(
+        pl.Series("text", [r.text for r in stripped]),
+        pl.Series(
+            "original_hash",
+            [_blind_handover.original_hash(s) for s in df["session_id"].to_list()],
+        ),
+    )
+    out.write_parquet(output_path)
+    logger.info("blind-handover: wrote {} stripped rows to {}", out.height, output_path)
+
+
+@app.command(name="judge")
+def judge_cmd(
+    manifest_sha: str,
+    /,
+    *,
+    sessions_parquet: Path,
+    output_parquet: Path,
+    dry_run: bool = True,
+    concurrency: int = 4,
+    region: str = "us-east-1",
+    common: Common | None = None,
+) -> None:
+    """Dispatch a frozen study's judge panel over a sessions parquet.
+
+    ``sessions_parquet`` must have (session_id, text) columns.  Defaults to
+    ``--dry-run`` per the project cost-guard convention.
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    study = _freeze.replay(manifest_sha)
+    df = pl.read_parquet(sessions_parquet)
+    required = {"session_id", "text"}
+    missing = required - set(df.columns)
+    if missing:
+        raise InputValidationError(f"sessions parquet missing columns: {sorted(missing)}")
+    sessions = list(zip(df["session_id"].to_list(), df["text"].to_list(), strict=True))
+    result = _judge_worker.run(
+        sessions=sessions,
+        panel_shortnames=list(study.panel_shortnames),
+        rubric_yaml_path=Path(study.rubric_path),
+        freeze_sha=study.manifest_sha,
+        out_parquet=output_parquet,
+        dry_run=dry_run,
+        concurrency=concurrency,
+        region=region,
+    )
+    if isinstance(result, _judge_worker.GradePlan):
+        emit_json(
+            {
+                "dry_run": True,
+                "n_sessions": result.n_sessions,
+                "n_judges": result.n_judges,
+                "n_axes": result.n_axes,
+                "n_calls": result.n_calls,
+                "est_input_tokens": result.est_input_tokens,
+                "est_output_tokens": result.est_output_tokens,
+                "est_usd": result.est_usd,
+            },
+            fmt=fmt,
+        )
+    else:
+        emit_json({"dry_run": False, "n_scores": len(result), "out": str(output_parquet)}, fmt=fmt)
+
+
+@app.command(name="ungrounded-claim")
+def ungrounded_cmd(
+    manifest_sha: str,
+    /,
+    *,
+    turns_parquet: Path,
+    output_parquet: Path,
+    common: Common | None = None,
+) -> None:
+    """Run the ungrounded-claim detector over a turns parquet.
+
+    ``turns_parquet`` needs (session_id, turn_idx, assistant_text,
+    tool_output_text) columns.  Writes per-claim grounded flags.
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    study = _freeze.replay(manifest_sha)
+    df = pl.read_parquet(turns_parquet)
+    required = {"session_id", "turn_idx", "assistant_text", "tool_output_text"}
+    missing = required - set(df.columns)
+    if missing:
+        raise InputValidationError(f"turns parquet missing columns: {sorted(missing)}")
+    turns = [
+        _ungrounded_worker.Turn(
+            session_id=row["session_id"],
+            turn_idx=int(row["turn_idx"]),
+            assistant_text=row["assistant_text"],
+            tool_output_text=row["tool_output_text"],
+        )
+        for row in df.iter_rows(named=True)
+    ]
+    out = _ungrounded_worker.detect(turns, freeze_sha=study.manifest_sha)
+    _ungrounded_worker.to_parquet(out, output_parquet)
+    summary = _ungrounded_worker.summarize(out)
+    emit_dataframe(summary, fmt=fmt)
+
+
+@app.command(name="kappa")
+def kappa_cmd(
+    scores_parquet: Path,
+    /,
+    *,
+    bootstrap: int = 1000,
+    floor: float = 0.6,
+    delta_gate: Path | None = None,
+    common: Common | None = None,
+) -> None:
+    """Compute Cohen's + Fleiss' kappa with bootstrapped 95% CI.
+
+    Exits non-zero (66) if any axis has Fleiss kappa below ``--floor`` OR
+    if ``--delta-gate <prior.parquet>`` is set and the delta-kappa CI
+    excludes zero on any axis (pre-registered stopping rule).
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    df = _kappa_worker.load_scores(scores_parquet)
+    pairs = _kappa_worker.compute_pairwise(df, n_bootstrap=bootstrap)
+    fleiss = _kappa_worker.compute_fleiss(df, n_bootstrap=bootstrap)
+    report = {
+        "pairs": [
+            {
+                "axis": p.axis,
+                "judge_a": p.judge_a,
+                "judge_b": p.judge_b,
+                "n_items": p.n_items,
+                "kappa": round(p.kappa, 4),
+                "ci_low": round(p.ci_low, 4),
+                "ci_high": round(p.ci_high, 4),
+            }
+            for p in pairs
+        ],
+        "fleiss": [
+            {
+                "axis": f.axis,
+                "n_judges": f.n_judges,
+                "n_items": f.n_items,
+                "kappa": round(f.kappa, 4),
+                "ci_low": round(f.ci_low, 4),
+                "ci_high": round(f.ci_high, 4),
+                "below_floor": f.kappa < floor,
+            }
+            for f in fleiss
+        ],
+        "floor": floor,
+    }
+    any_gate_tripped = any(row["below_floor"] for row in report["fleiss"])
+    if delta_gate is not None:
+        prior_df = _kappa_worker.load_scores(delta_gate)
+        prior_fleiss = {
+            f.axis: f for f in _kappa_worker.compute_fleiss(prior_df, n_bootstrap=bootstrap)
+        }
+        delta_rows = []
+        for cur in fleiss:
+            prior = prior_fleiss.get(cur.axis)
+            if prior is None:
+                continue
+            tripped = _kappa_worker.delta_gate_excludes_zero(cur, prior, n_bootstrap=bootstrap)
+            delta_rows.append(
+                {
+                    "axis": cur.axis,
+                    "delta_excludes_zero": tripped,
+                    "current_kappa": cur.kappa,
+                    "prior_kappa": prior.kappa,
+                }
+            )
+            any_gate_tripped = any_gate_tripped or tripped
+        report["delta_gate"] = delta_rows
+    emit_json(report, fmt=fmt)
+    if any_gate_tripped:
+        sys.exit(66)
+
+
 @app.default
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
@@ -1209,6 +1483,7 @@ def _default(*, common: Common | None = None) -> None:
     print("  schema | query | explain | shell | list-cache")
     print("  embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
+    print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
 
 
 # ---------------------------------------------------------------------------
