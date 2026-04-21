@@ -354,7 +354,7 @@ async def run_backfill(
     since_days: int | None = None,
     limit: int | None = None,
     dry_run: bool = False,
-) -> int:
+) -> int | dict[str, Any]:
     """Discover unembedded messages, embed them, and append to parquet.
 
     Parameters
@@ -368,13 +368,14 @@ async def run_backfill(
     limit
         Optional cap on number of messages to embed this run.
     dry_run
-        If true, log the plan and return 0 without calling Bedrock.
+        If true, log the plan and return a plan dict without calling Bedrock.
 
     Returns
     -------
-    int
-        Count of newly embedded rows (0 for ``dry_run`` or when nothing is
-        pending).
+    int | dict
+        Under ``dry_run=True``, a plan dict with ``{pipeline, candidates,
+        batches, batch_size, concurrency, model, since_days, limit}``.
+        Otherwise, count of newly embedded rows (0 when nothing is pending).
     """
     pending = discover_unembedded(
         con,
@@ -384,6 +385,18 @@ async def run_backfill(
     )
     if not pending:
         logger.info("No unembedded messages found - nothing to do")
+        if dry_run:
+            return {
+                "pipeline": "embed",
+                "candidates": 0,
+                "batches": 0,
+                "batch_size": settings.batch_size,
+                "concurrency": settings.concurrency,
+                "model": settings.active_model_id,
+                "since_days": since_days,
+                "limit": limit,
+                "dry_run": True,
+            }
         return 0
 
     n_batches = (len(pending) + settings.batch_size - 1) // settings.batch_size
@@ -396,7 +409,17 @@ async def run_backfill(
     )
     if dry_run:
         logger.info("dry_run=True - skipping Bedrock calls")
-        return 0
+        return {
+            "pipeline": "embed",
+            "candidates": len(pending),
+            "batches": n_batches,
+            "batch_size": settings.batch_size,
+            "concurrency": settings.concurrency,
+            "model": settings.active_model_id,
+            "since_days": since_days,
+            "limit": limit,
+            "dry_run": True,
+        }
 
     # Checkpoint every N messages so a throttling-induced timeout doesn't
     # discard work already embedded.  chunk must be a multiple of batch_size.

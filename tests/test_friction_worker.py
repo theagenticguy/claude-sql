@@ -264,15 +264,18 @@ def test_dry_run_counts_short_user_messages(tmp_path: Path) -> None:
         checkpoint_db_path=tmp_path / "checkpoint.duckdb",
         friction_max_chars=300,
     )
-    n = friction_worker.detect_user_friction(
+    plan = friction_worker.detect_user_friction(
         con,
         settings,
         since_days=None,
         limit=None,
         dry_run=True,
     )
-    # Dry run returns 0 (nothing written); the log output is not asserted
-    # here, but the short-message filter should have kept u1/u2/u3 in scope
-    # and dropped u4 (assistant) and u5 (too long).
-    assert n == 0
+    # Dry run returns a plan dict with the short-message candidate count.
+    # The short-message filter should have kept u1/u2/u3 in scope and
+    # dropped u4 (assistant) and u5 (too long) -- candidates must be 3.
+    assert isinstance(plan, dict)
+    assert plan["pipeline"] == "friction"
+    assert plan["candidates"] == 3
+    assert plan["dry_run"] is True
     assert not (tmp_path / "user_friction.parquet").exists()

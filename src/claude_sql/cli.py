@@ -46,11 +46,15 @@ from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajector
 from claude_sql.logging_setup import configure_logging
 from claude_sql.output import (
     EXIT_CODES,
+    ClassifiedError,
+    InputValidationError,
     OutputFormat,
     emit_dataframe,
+    emit_error,
     emit_json,
     resolve_format,
     run_or_die,
+    validate_glob,
 )
 from claude_sql.sql_views import (
     describe_all,
@@ -61,10 +65,59 @@ from claude_sql.sql_views import (
 )
 from claude_sql.terms_worker import run_terms
 
+_APP_HELP = """\
+Zero-copy SQL + Cohere Embed v4 semantic search + Sonnet 4.6 analytics over
+~/.claude/ JSONL transcripts (and their subagent sidecars).
+
+Surfaces at a glance
+--------------------
+  schema / list-cache / explain   introspection (read-only, zero cost)
+  query / shell                   run SQL against 18 views + 14 macros
+  embed / search                  Cohere Embed v4 + HNSW cosine search
+  classify / trajectory /         Sonnet 4.6 analytics -- each defaults to
+  conflicts / friction            --dry-run; pass --no-dry-run to spend
+  cluster / terms / community     UMAP+HDBSCAN, c-TF-IDF, Louvain
+  analyze                         composite pipeline over every stage above
+
+Flag placement (important for agents)
+-------------------------------------
+All flags attach to a SUBCOMMAND, not the top-level binary. Correct:
+    claude-sql query --format json "SELECT 1"
+    claude-sql classify --no-dry-run --limit 5
+Incorrect (flag gets swallowed as the subcommand argument):
+    claude-sql --format json query "SELECT 1"
+
+Output & exit codes
+-------------------
+* --format {auto,table,json,ndjson,csv} on every subcommand. auto = table on
+  TTY / json on pipe, so `claude-sql <cmd> | jq` works without a flag.
+* 0   success
+* 2   missing embeddings parquet (run: claude-sql embed --since-days N --no-dry-run)
+* 64  invalid input -- malformed --glob, unparseable SQL, bad flag
+* 65  catalog error -- unknown view/column; run `claude-sql schema` for the catalog
+* 70  runtime error -- everything else DuckDB raises (check --format json stderr)
+* 127 system `duckdb` binary not on PATH (only affects `shell`)
+
+Cost guard
+----------
+Every command that calls Bedrock (embed, classify, trajectory, conflicts,
+friction, analyze) defaults to --dry-run. Dry-run emits a plan JSON to stdout
+with candidate counts, estimated tokens, and dollar estimate -- agents can
+parse that to decide whether to proceed. Real spend requires --no-dry-run.
+
+Glob scoping (cheaper workers)
+------------------------------
+Narrow to one project with --glob to cut worker budget:
+    --glob "/home/you/.claude/projects/-efs-you-workplace-bonk/*.jsonl"
+At most one '**' segment is allowed per pattern (DuckDB limitation) -- the
+CLI rejects multi-star globs with a clear hint before DuckDB sees them.
+"""
+
+
 app = App(
     name="claude-sql",
     version=format_version,
-    help=("Zero-copy SQL over ~/.claude/ JSONL transcripts with Cohere Embed v4 semantic search."),
+    help=_APP_HELP,
 )
 
 
@@ -107,10 +160,28 @@ def _fmt(common: Common | None) -> OutputFormat:
 
 
 def _resolve_settings(common: Common | None) -> Settings:
-    """Build :class:`Settings` from env then apply CLI overrides."""
+    """Build :class:`Settings` from env then apply CLI overrides.
+
+    Validates ``--glob`` / ``--subagent-glob`` up front so DuckDB never sees
+    a pattern it cannot consume (e.g. ``**/.../**``).  On failure emits a
+    classified error and exits with code 64 so every subcommand gets the
+    same treatment without wrapping each call site.
+    """
     settings = Settings()
     if common is None:
         return settings
+    try:
+        validate_glob(common.glob, flag="--glob")
+        validate_glob(common.subagent_glob, flag="--subagent-glob")
+    except InputValidationError as exc:
+        err = ClassifiedError(
+            kind="invalid_input",
+            exit_code=EXIT_CODES["invalid_input"],
+            message=str(exc),
+            hint=exc.hint,
+        )
+        emit_error(err, _fmt(common))
+        sys.exit(err.exit_code)
     updates: dict[str, str] = {}
     if common.glob is not None:
         updates["default_glob"] = common.glob
@@ -126,6 +197,21 @@ def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(":memory:")
     register_all(con, settings=settings)
     return con
+
+
+def _emit_worker_result(result: int | dict, common: Common | None, pipeline: str) -> None:
+    """Normalize worker results for stdout.
+
+    Workers return either an ``int`` (rows processed) or a plan ``dict`` when
+    ``--dry-run`` is set. Agents parse stdout JSON, so we always emit something
+    machine-readable: the plan dict under dry-run, or a compact summary dict
+    when real work runs.
+    """
+    fmt = _fmt(common)
+    if isinstance(result, dict):
+        emit_json(result, fmt)
+    else:
+        emit_json({"pipeline": pipeline, "rows_processed": int(result), "dry_run": False}, fmt)
 
 
 # EXPLAIN plan markers that indicate pushdown or noteworthy physical ops.
@@ -200,12 +286,30 @@ def _describe_cache_entry(name: str, path: Path) -> dict[str, object]:
 
 @app.command
 def shell(*, common: Common | None = None) -> None:
-    """Launch the ``duckdb`` REPL with all views, macros, and VSS pre-registered.
+    """Launch the interactive duckdb REPL with every view, macro, and the HNSW index pre-registered.
 
-    Writes a temporary on-disk DuckDB database, calls :func:`register_all` to
-    materialize every view / macro / HNSW index into it, closes the Python
-    connection, then execs the ``duckdb`` binary against that DB file.  The
-    DB path is printed so the user can reopen it later or clean it up.
+    When to use
+    -----------
+    Interactive exploration -- iterating on SQL joins, inspecting macros,
+    feeling out the catalog. Agents should prefer ``query`` (single-shot)
+    or ``shell`` via a subprocess only when they truly need a session.
+
+    What it does
+    ------------
+    1. Creates a temporary on-disk DuckDB file.
+    2. Runs ``register_all`` to materialize 18 views + 14 macros + VSS.
+    3. Execs the system ``duckdb`` binary against the file.
+
+    Exit codes
+    ----------
+    * 127  ``duckdb`` binary not on PATH (install it with `uv tool install
+      duckdb` or your OS package manager).
+
+    Notes
+    -----
+    The temp DB path is printed on startup so you can reopen it later or
+    delete it. The path is NOT cleaned up automatically on exit -- that's
+    intentional so long-running sessions can be resumed.
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -234,11 +338,56 @@ def shell(*, common: Common | None = None) -> None:
 
 @app.command
 def query(sql: str, /, *, common: Common | None = None) -> None:
-    """Run a SQL query and emit the result in the requested format.
+    """Run one SQL query against the claude-sql catalog and emit results.
 
-    Default format is ``auto`` (table on TTY, JSON otherwise).  DuckDB errors
-    are classified into parse / catalog / runtime and exit with codes 64 / 65
-    / 70 respectively.
+    When to use
+    -----------
+    Read-only exploration and aggregation against the 18 pre-registered
+    views. The catalog is free (no Bedrock, no LLM, no cost), so run queries
+    liberally -- they're the cheapest way to introspect sessions / messages
+    / tool calls / analytics.
+
+    Positional args
+    ---------------
+    SQL
+        A single SQL statement. Multi-statement scripts are rejected by
+        DuckDB's single-exec path -- use ``shell`` for those.
+
+    Key flags
+    ---------
+    --glob PATTERN
+        Narrow the universe of JSONLs scanned. Must have at most one '**'
+        segment. Example:
+            --glob "/home/you/.claude/projects/-efs-you-bonk/*.jsonl"
+    --subagent-glob PATTERN
+        Same, for subagent sidecar files.
+    --format {auto,table,json,ndjson,csv}
+        auto emits table on TTY, json on pipe.
+
+    Output
+    ------
+    TTY default: Polars-rendered table.
+    Non-TTY: JSON array of row dicts (ideal for `jq` / agent parsing).
+
+    Exit codes
+    ----------
+    * 64  parse_error   malformed SQL (see error.hint for the fix)
+    * 65  catalog_error unknown view/macro/column (try ``schema``)
+    * 70  runtime_error everything else DuckDB raises
+
+    Catalog discovery
+    -----------------
+    Run ``claude-sql schema --format json`` for the full view + macro list,
+    or ``claude-sql list-cache`` to see which analytics parquets exist.
+
+    Examples
+    --------
+    Session counts:
+        claude-sql query "SELECT COUNT(*) FROM sessions"
+    Top assistants by token spend:
+        claude-sql query --format json "
+          SELECT model, SUM(input_tokens + output_tokens) AS toks
+          FROM messages GROUP BY 1 ORDER BY 2 DESC LIMIT 5"
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -259,14 +408,26 @@ def explain(
     analyze: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Show the EXPLAIN plan for ``sql`` and highlight pushdown markers.
+    """Show the DuckDB query plan and highlight pushdown / noteworthy operators.
 
-    Defaults to a static plan (``EXPLAIN``) so probing slow or expensive
-    queries doesn't execute them.  Pass ``--analyze`` to run ``EXPLAIN
-    ANALYZE`` when you actually want timings.
+    When to use
+    -----------
+    Before running a ``query`` that might scan a lot of JSONLs -- confirm
+    filter pushdown, spot accidental full scans, verify HNSW_INDEX_SCAN
+    kicks in for vector searches.
 
-    When ``--format=json``, emits ``{"plan": "<text>"}`` without the ANSI
-    highlights so agents can consume the plan cleanly.
+    Flags
+    -----
+    --analyze
+        Run ``EXPLAIN ANALYZE`` (executes the query and reports real
+        timings). Off by default so probing slow queries is free.
+    --format {auto,table,json,...}
+        TTY table highlights READ_JSON / Filter / HASH_JOIN / HASH_GROUP_BY
+        / HNSW_INDEX_SCAN in green. JSON emits ``{"plan": "<text>"}``.
+
+    Exit codes
+    ----------
+    Same as ``query``: 64 parse / 65 catalog / 70 runtime.
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -292,11 +453,32 @@ def explain(
 
 @app.command
 def schema(*, common: Common | None = None) -> None:
-    """List every registered view with its columns, plus the macro inventory.
+    """List every registered view (with columns) and every macro in one pass.
 
-    ``--format table`` (default on TTY) prints a compact human layout; every
-    other format emits ``{"views": {...}, "macros": [...]}`` so agents can
-    parse the catalog without scraping.
+    When to use
+    -----------
+    First thing an agent should call after ``--help``: it's the canonical
+    catalog. Use it to discover column names before composing ``query``
+    calls -- e.g., ``session_classifications`` uses both ``autonomy_tier``
+    (canonical) and ``autonomy`` (alias), and the schema lists both.
+
+    Output shape (non-TTY / JSON)
+    -----------------------------
+    ::
+
+        {
+          "views": {
+            "sessions": [{"column": "session_id", "type": "VARCHAR"}, ...],
+            "messages": [...],
+            "session_classifications": [...],   // only if parquet exists
+            ...
+          },
+          "macros": ["autonomy_trend", "conflict_rate", ...]
+        }
+
+    Missing analytics parquets are silently omitted (register_analytics
+    skips them). Use ``list-cache`` to see which generators still need to
+    run.
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -328,13 +510,31 @@ def schema(*, common: Common | None = None) -> None:
 
 @app.command(name="list-cache")
 def list_cache(*, common: Common | None = None) -> None:
-    """Introspect parquet cache state -- which outputs exist, how fresh, how many rows.
+    """Report each parquet cache's presence, size, freshness, and row count.
 
-    Exists so agents can decide, before issuing ``search`` or ``query``,
-    whether the prerequisite pipeline stage (``embed`` / ``classify`` /
-    ``cluster`` / ``community``) needs to be run.  Each entry reports
-    ``{name, path, exists, bytes, mtime, rows}`` where the last three are
-    omitted when the parquet is absent.
+    When to use
+    -----------
+    Before running ``search`` (requires ``embeddings``) or composing
+    analytics queries (require ``session_classifications`` /
+    ``message_trajectory`` / ``session_conflicts`` / ``message_clusters``
+    / ``cluster_terms`` / ``session_communities`` / ``user_friction``).
+
+    What it reports
+    ---------------
+    One entry per cache (plus the persistent checkpointer DB):
+    ``{name, path, exists, bytes, mtime, rows}``.  When ``exists`` is
+    false, ``bytes`` / ``mtime`` / ``rows`` are omitted.
+
+    How to populate each cache
+    --------------------------
+    * embeddings              → ``claude-sql embed --no-dry-run``
+    * session_classifications → ``claude-sql classify --no-dry-run``
+    * message_trajectory      → ``claude-sql trajectory --no-dry-run``
+    * session_conflicts       → ``claude-sql conflicts --no-dry-run``
+    * message_clusters        → ``claude-sql cluster``
+    * cluster_terms           → ``claude-sql terms``
+    * session_communities     → ``claude-sql community``
+    * user_friction           → ``claude-sql friction --no-dry-run``
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -376,11 +576,34 @@ def embed(
     dry_run: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Embed unembedded messages to the configured parquet via Cohere Embed v4.
+    """Embed new messages with Cohere Embed v4 and append to the embeddings parquet.
 
-    Only registers raw + derived views (not VSS) because the backfill reads
-    ``messages_text`` for discovery and the existing parquet for the anti-join;
-    it does not need the HNSW index.
+    Cost
+    ----
+    Calls Bedrock (``global.cohere.embed-v4:0``) on every unembedded
+    message. ``--dry-run`` is OFF by default here (unlike LLM workers);
+    pass it if you only want to see the plan.
+
+    Flags
+    -----
+    --since-days N     Only consider messages newer than N days.
+    --limit N          Cap the number of messages embedded this run.
+    --dry-run          Preview only; emit plan JSON, no Bedrock calls.
+    --glob PATTERN     Narrow the universe (see top-level --help).
+
+    Dry-run output (stdout JSON)
+    ----------------------------
+    ::
+
+        {"pipeline": "embed", "candidates": N, "batches": B,
+         "batch_size": 96, "concurrency": 2, "model": "...",
+         "since_days": null, "limit": null, "dry_run": true}
+
+    Real-run output
+    ---------------
+    ``{"pipeline": "embed", "rows_processed": N, "dry_run": false}``
+
+    Exit codes: 0 success, 70 runtime (Bedrock / DuckDB failure).
     """
     import asyncio
 
@@ -395,7 +618,7 @@ def embed(
             subagent_meta_glob=settings.subagent_meta_glob,
         )
         register_views(con)
-        count = asyncio.run(
+        result = asyncio.run(
             run_backfill(
                 con=con,
                 settings=settings,
@@ -404,7 +627,8 @@ def embed(
                 dry_run=dry_run,
             )
         )
-        logger.info("Embedded {} messages (dry_run={})", count, dry_run)
+        logger.info("Embedded {} messages (dry_run={})", result, dry_run)
+        _emit_worker_result(result, common, pipeline="embed")
     finally:
         con.close()
 
@@ -417,11 +641,36 @@ def search(
     k: int = 10,
     common: Common | None = None,
 ) -> None:
-    """Semantic search over ``message_embeddings`` using HNSW cosine distance.
+    """Semantic top-k nearest-neighbor search over message embeddings via HNSW.
 
-    Embeds ``query_text`` with Cohere Embed v4 ``search_query`` mode, then
-    returns the top-``k`` nearest messages along with a snippet of their text.
-    Exits with code 2 (with a clear hint) when the embeddings parquet is empty.
+    Pipeline
+    --------
+    1. Embed ``query_text`` with Cohere Embed v4 ``search_query`` mode.
+    2. DuckDB VSS HNSW cosine lookup against the existing embeddings parquet.
+    3. Join back to ``messages_text`` for a 200-char snippet.
+
+    Prereq
+    ------
+    The embeddings parquet must exist. If it's empty or missing, the
+    command exits with code 2 and a hint. Run
+    ``claude-sql embed --since-days 7 --no-dry-run`` to populate.
+
+    Positional args
+    ---------------
+    QUERY_TEXT    A single natural-language query string.
+
+    Flags
+    -----
+    --k N              Top-k (default 10).
+    --glob PATTERN     Narrow the messages_text view before the HNSW join.
+    --format ...       See top-level --help.
+
+    Output columns
+    --------------
+    uuid, session_id, role, sim (cosine similarity ∈ [-1, 1]), snippet.
+    Sorted by cosine distance ascending -- highest sim first.
+
+    Exit codes: 0 success, 2 no_embeddings, 70 runtime.
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -474,16 +723,51 @@ def classify(
     no_thinking: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Classify sessions via Sonnet 4.6 (autonomy, work category, success, goal).
+    """Classify sessions with Sonnet 4.6: autonomy tier, work category, success, goal.
 
-    Default is ``--dry-run`` -- real Bedrock spend requires explicit
+    Output columns (``session_classifications`` view)
+    -------------------------------------------------
+    session_id, autonomy_tier ∈ {autonomous,assisted,manual},
+    work_category (sde/admin/strategy_business/thought_leadership/other),
+    success ∈ {success,partial,failure,unknown}, goal (string),
+    confidence ∈ [0,1], classified_at.
+    Alias columns added by the view layer: ``autonomy``,
+    ``success_outcome``, ``category`` (same values as above).
+
+    Cost (defaults to --dry-run)
+    ----------------------------
+    Back-of-envelope ~8K input + ~300 output tokens per session. With
+    Sonnet 4.6 pricing, 1,000 sessions ≈ $25-30. Always start with
+    ``--dry-run`` (default) to see the plan JSON, then confirm with
     ``--no-dry-run``.
+
+    Flags
+    -----
+    --since-days N   Only classify sessions newer than N days.
+    --limit N        Cap at N sessions this run.
+    --dry-run        (DEFAULT) emit plan JSON, no Bedrock calls.
+    --no-dry-run     Spend real money.
+    --no-thinking    Disable Sonnet adaptive thinking (cheaper, less precise).
+    --glob PATTERN   Narrow the corpus (recommended for first runs).
+
+    Dry-run stdout JSON
+    -------------------
+    ``{"pipeline":"classify","candidates":N,"llm_calls":N,
+       "avg_input_tokens":8000,"avg_output_tokens":300,
+       "estimated_cost_usd":X,"model":"...","thinking":"adaptive",
+       "since_days":null,"limit":null,"dry_run":true}``
+
+    Checkpointing
+    -------------
+    Session-level checkpoint in ``~/.claude/claude_sql.duckdb`` means
+    reruns on unchanged sessions are free -- only sessions whose JSONL
+    mtime changed are re-processed.
     """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
-        n = classify_sessions(
+        result = classify_sessions(
             con,
             settings,
             since_days=since_days,
@@ -491,7 +775,8 @@ def classify(
             dry_run=dry_run,
             no_thinking=no_thinking,
         )
-        logger.info("classify: {} sessions processed (dry_run={})", n, dry_run)
+        logger.info("classify: {} sessions processed (dry_run={})", result, dry_run)
+        _emit_worker_result(result, common, pipeline="classify")
     finally:
         con.close()
 
@@ -505,16 +790,32 @@ def trajectory(
     no_thinking: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Per-message sentiment + is_transition (regex prefilter -> Sonnet 4.6).
+    """Per-message sentiment + topic-transition classification (regex prefilter → Sonnet 4.6).
 
-    Default is ``--dry-run`` -- real Bedrock spend requires explicit
-    ``--no-dry-run``.
+    Output columns (``message_trajectory`` view)
+    --------------------------------------------
+    uuid, sentiment_delta ∈ {positive,neutral,negative},
+    is_transition (boolean -- does this message mark a topic shift?),
+    confidence ∈ [0,1], classified_at.
+    Alias columns: ``sentiment`` (same as sentiment_delta),
+    ``transition`` (same as is_transition).
+
+    Pipeline
+    --------
+    1. Regex prefilter catches ~50% of obvious transitions for free.
+    2. Sonnet 4.6 classifies the remainder with structured output.
+
+    Cost: defaults to ``--dry-run``. ~500 input / 50 output tokens per LLM
+    call.
+
+    Flags / exit codes identical to ``classify``.  See its help for the
+    dry-run JSON schema.
     """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
-        n = trajectory_messages(
+        result = trajectory_messages(
             con,
             settings,
             since_days=since_days,
@@ -522,7 +823,8 @@ def trajectory(
             dry_run=dry_run,
             no_thinking=no_thinking,
         )
-        logger.info("trajectory: {} messages processed (dry_run={})", n, dry_run)
+        logger.info("trajectory: {} messages processed (dry_run={})", result, dry_run)
+        _emit_worker_result(result, common, pipeline="trajectory")
     finally:
         con.close()
 
@@ -538,14 +840,26 @@ def conflicts(
 ) -> None:
     """Per-session stance-conflict detection via Sonnet 4.6.
 
-    Default is ``--dry-run`` -- real Bedrock spend requires explicit
-    ``--no-dry-run``.
+    What it finds
+    -------------
+    Places where the user and the agent disagreed on approach or scope,
+    or where the agent contradicted itself. Each conflict gets two stance
+    snippets (``stance_a`` / ``stance_b``), a resolution label
+    ∈ {resolved, unresolved, abandoned, null}, and a detected_at timestamp.
+
+    Output columns (``session_conflicts`` view)
+    -------------------------------------------
+    session_id, conflict_idx, stance_a, stance_b, resolution,
+    detected_at, empty. Alias: ``conflict_resolution`` = resolution.
+
+    Cost: defaults to ``--dry-run``. ~6K input / 400 output tokens / session.
+    Flags / exit codes identical to ``classify``.
     """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
-        n = detect_conflicts(
+        result = detect_conflicts(
             con,
             settings,
             since_days=since_days,
@@ -553,7 +867,8 @@ def conflicts(
             dry_run=dry_run,
             no_thinking=no_thinking,
         )
-        logger.info("conflicts: {} sessions processed (dry_run={})", n, dry_run)
+        logger.info("conflicts: {} sessions processed (dry_run={})", result, dry_run)
+        _emit_worker_result(result, common, pipeline="conflicts")
     finally:
         con.close()
 
@@ -567,17 +882,34 @@ def friction(
     no_thinking: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Classify short user messages for friction signals (regex + Sonnet 4.6).
+    """Classify short user messages (≤300 chars) for friction signals.
 
-    Detects status pings, unmet expectations ("screenshot?"), confusion,
-    interruptions, corrections, and frustration.  Default is ``--dry-run`` --
-    real Bedrock spend requires explicit ``--no-dry-run``.
+    Labels
+    ------
+    status_ping / unmet_expectation / confusion / interruption /
+    correction / frustration / none.
+
+    Pipeline
+    --------
+    1. Pull user-role messages ≤ ``CLAUDE_SQL_FRICTION_MAX_CHARS`` (300).
+    2. Regex fast-path catches ``status_ping`` / ``interruption`` /
+       ``correction`` at 0.9 confidence.
+    3. Everything else → Sonnet 4.6 with the USER_FRICTION_SCHEMA.
+
+    Output columns (``user_friction`` view)
+    ---------------------------------------
+    uuid, session_id, ts, label, source ∈ {regex, llm, refused},
+    confidence, rationale, text (the original user message).
+
+    Cost: defaults to ``--dry-run``. Short prompts (~200 in / 60 out),
+    so even 10K candidates cost ≈ $3-4.
+    Flags / exit codes identical to ``classify``.
     """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
     try:
-        n = detect_user_friction(
+        result = detect_user_friction(
             con,
             settings,
             since_days=since_days,
@@ -585,14 +917,31 @@ def friction(
             dry_run=dry_run,
             no_thinking=no_thinking,
         )
-        logger.info("friction: {} rows written (dry_run={})", n, dry_run)
+        logger.info("friction: {} rows written (dry_run={})", result, dry_run)
+        _emit_worker_result(result, common, pipeline="friction")
     finally:
         con.close()
 
 
 @app.command
 def cluster(*, force: bool = False, common: Common | None = None) -> None:
-    """UMAP + HDBSCAN over message_embeddings; writes clusters.parquet."""
+    """Cluster message embeddings with UMAP (8D) + HDBSCAN. Writes clusters.parquet.
+
+    Prereq
+    ------
+    The embeddings parquet must exist. Run ``embed --no-dry-run`` first.
+
+    Output columns (``message_clusters`` view)
+    ------------------------------------------
+    uuid, cluster_id (int; -1 = noise), probability (HDBSCAN soft label).
+
+    Cost: zero (CPU-only, no Bedrock). Seeded by ``CLAUDE_SQL_SEED=42`` so
+    cluster IDs are stable across reruns unless the embedding set changes.
+
+    Flags
+    -----
+    --force   Re-cluster even if clusters.parquet already exists.
+    """
     _configure(common)
     settings = _resolve_settings(common)
     stats = run_clustering(settings, force=force)
@@ -607,7 +956,22 @@ def cluster(*, force: bool = False, common: Common | None = None) -> None:
 
 @app.command
 def terms(*, force: bool = False, common: Common | None = None) -> None:
-    """Compute c-TF-IDF term labels per cluster; writes cluster_terms.parquet."""
+    """Compute c-TF-IDF per-cluster term labels; writes cluster_terms.parquet.
+
+    Prereq: ``cluster`` (i.e., clusters.parquet must exist).
+
+    Output columns (``cluster_terms`` view)
+    ---------------------------------------
+    cluster_id (int), term (unigram or bigram), weight (float),
+    rank (int, 1 = strongest term in that cluster).
+
+    Math: per-class TF → IDF → L1 normalize, ngram (1,2), min_df=2.
+    Cost: zero (sklearn CountVectorizer). See CLAUDE.md for design rationale.
+
+    Flags
+    -----
+    --force   Recompute even if cluster_terms.parquet already exists.
+    """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
@@ -624,7 +988,22 @@ def terms(*, force: bool = False, common: Common | None = None) -> None:
 
 @app.command
 def community(*, force: bool = False, common: Common | None = None) -> None:
-    """Session-level Louvain community detection from cosine-similarity graph."""
+    """Session-level Louvain community detection over a cosine-similarity graph.
+
+    Prereq: ``embed`` (needs the embeddings parquet).
+
+    Output columns (``session_communities`` view)
+    ---------------------------------------------
+    session_id, community_id (int; -1 = isolated).
+
+    Method: build a session-centroid-cosine KNN graph, then run
+    ``networkx.community.louvain_communities`` (networkx ≥3.4).
+    Cost: zero. Seeded by ``CLAUDE_SQL_SEED=42``.
+
+    Flags
+    -----
+    --force   Re-detect even if session_communities.parquet exists.
+    """
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection(settings)
@@ -657,15 +1036,48 @@ def analyze(
     force_community: bool = False,
     common: Common | None = None,
 ) -> None:
-    """Run the full v2 analytics pipeline.
+    """Run the full analytics pipeline end-to-end: embed → structure → LLM analytics.
 
-    Stages: embed -> classify + cluster + community -> trajectory -> conflicts -> friction.
+    Stages (in order)
+    -----------------
+    1. embed        (Bedrock Cohere Embed v4; honors --dry-run)
+    2. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
+    3. terms        (c-TF-IDF labels for clusters; zero-cost)
+    4. community    (Louvain; zero-cost; --force_community to rebuild)
+    5. classify     (Sonnet 4.6; honors --dry-run)
+    6. trajectory   (Sonnet 4.6; honors --dry-run)
+    7. conflicts    (Sonnet 4.6; honors --dry-run)
+    8. friction     (Sonnet 4.6; honors --dry-run)
 
-    Default is ``--dry-run`` -- every LLM-touching stage just prints pending
-    counts and cost estimates.  Pass ``--no-dry-run`` to execute for real.
-    Use ``--skip-<stage>`` to drop a stage entirely.  ``--force-cluster`` /
-    ``--force-community`` rebuild those parquet outputs even if they already
-    exist.
+    Cost
+    ----
+    Every LLM-touching stage defaults to ``--dry-run`` -- stdout logs the
+    plan per stage. Pass ``--no-dry-run`` to execute for real.
+
+    Flags
+    -----
+    --since-days N         Scope all stages to the last N days (default 30).
+    --limit N              Cap each LLM stage at N items.
+    --dry-run / --no-dry-run  (default --dry-run)
+    --no-thinking          Disable Sonnet adaptive thinking across all stages.
+    --skip-<stage>         Drop a stage:
+                           embed, cluster, community, classify, trajectory,
+                           conflicts, friction. Terms is bound to cluster.
+    --force-cluster        Rebuild clusters.parquet (+ terms) even if present.
+    --force-community      Rebuild session_communities.parquet even if present.
+    --glob / --subagent-glob  Narrow the corpus (applies to every stage).
+
+    Typical recipes
+    ---------------
+    Preview spend over the last week::
+
+        claude-sql analyze --since-days 7
+
+    Run the non-LLM stages only (cluster + terms + community)::
+
+        claude-sql analyze --skip-embed --skip-classify \
+            --skip-trajectory --skip-conflicts --skip-friction \
+            --force-cluster --force-community
     """
     import asyncio
 

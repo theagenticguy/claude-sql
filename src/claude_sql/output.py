@@ -43,6 +43,7 @@ class OutputFormat(StrEnum):
 EXIT_CODES: dict[str, int] = {
     "ok": 0,
     "no_embeddings": 2,
+    "invalid_input": 64,  # malformed user-supplied flags (e.g. --glob)
     "parse_error": 64,  # malformed SQL
     "catalog_error": 65,  # unknown view/macro/column
     "runtime_error": 70,  # everything else from duckdb.Error
@@ -133,6 +134,42 @@ class ClassifiedError:
         }
 
 
+class InputValidationError(ValueError):
+    """Raised when a user-supplied flag (e.g. ``--glob``) is malformed.
+
+    Carries its own ``hint`` so ``run_or_die`` can surface the fix alongside
+    the failure. Maps to exit code 64 (``invalid_input``).
+    """
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+def validate_glob(pattern: str | None, *, flag: str = "--glob") -> None:
+    """Reject glob patterns DuckDB's ``read_json`` cannot accept.
+
+    DuckDB raises ``IO Error: Cannot use multiple '**' in one path`` when a
+    glob contains more than one recursive segment. We catch that up front so
+    the failure surfaces with a useful hint instead of a raw traceback.
+
+    Pass-through for ``None`` / empty strings: the caller will fall back to
+    its default glob.
+    """
+    if not pattern:
+        return
+    if pattern.count("**") > 1:
+        raise InputValidationError(
+            f"{flag} pattern {pattern!r} contains more than one '**' segment; "
+            "DuckDB's read_json rejects it.",
+            hint=(
+                "use at most one '**' recursive wildcard -- e.g. "
+                "'/home/you/.claude/projects/**/*.jsonl' or "
+                "'/home/you/.claude/projects/<project>/*.jsonl'"
+            ),
+        )
+
+
 def classify_duckdb_error(exc: duckdb.Error) -> ClassifiedError:
     """Classify a ``duckdb.Error`` into one of our stable kinds + exit codes.
 
@@ -195,6 +232,15 @@ def run_or_die(
     """
     try:
         return fn(*args, **kwargs)
+    except InputValidationError as exc:
+        err = ClassifiedError(
+            kind="invalid_input",
+            exit_code=EXIT_CODES["invalid_input"],
+            message=str(exc),
+            hint=exc.hint,
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
     except duckdb.Error as exc:
         err = classify_duckdb_error(exc)
         emit_error(err, fmt)

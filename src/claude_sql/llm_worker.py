@@ -486,8 +486,14 @@ def classify_sessions(
     limit: int | None = None,
     dry_run: bool = False,
     no_thinking: bool = False,
-) -> int:
-    """Classify pending sessions and return count of successful classifications."""
+) -> int | dict[str, Any]:
+    """Classify pending sessions and return count of successful classifications.
+
+    In ``--dry-run`` mode, returns a plan dict with keys ``{pipeline,
+    candidates, llm_calls, avg_input_tokens, avg_output_tokens,
+    estimated_cost_usd, model, thinking, since_days, limit}`` instead of the
+    row count, so the CLI can emit it as structured JSON.
+    """
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
 
     if dry_run:
@@ -512,7 +518,19 @@ def classify_sessions(
             thinking_mode,
             settings.sonnet_model_id,
         )
-        return 0
+        return {
+            "pipeline": "classify",
+            "candidates": pending_count,
+            "llm_calls": pending_count,
+            "avg_input_tokens": 8000,
+            "avg_output_tokens": 300,
+            "estimated_cost_usd": round(cost, 4),
+            "model": settings.sonnet_model_id,
+            "thinking": thinking_mode,
+            "since_days": since_days,
+            "limit": limit,
+            "dry_run": True,
+        }
 
     return asyncio.run(
         _classify_sessions_async(
@@ -785,8 +803,11 @@ def trajectory_messages(
     limit: int | None = None,
     dry_run: bool = False,
     no_thinking: bool = False,
-) -> int:
-    """Per-message sentiment + transition classification."""
+) -> int | dict[str, Any]:
+    """Per-message sentiment + transition classification.
+
+    In ``--dry-run`` mode returns a plan dict (see :func:`classify_sessions`).
+    """
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
     if dry_run:
         where = ["mt.text_content IS NOT NULL"]
@@ -802,13 +823,26 @@ def trajectory_messages(
         row = con.execute(sql).fetchone()
         n = int(row[0]) if row is not None else 0
         # Roughly half survive heuristic pre-filter.
-        cost = _estimate_cost(n // 2, 500, 50, settings.sonnet_pricing)
+        llm_n = n // 2
+        cost = _estimate_cost(llm_n, 500, 50, settings.sonnet_pricing)
         logger.info(
             "trajectory --dry-run: {} messages, estimated LLM cost ~${:.2f}",
             n,
             cost,
         )
-        return 0
+        return {
+            "pipeline": "trajectory",
+            "candidates": n,
+            "llm_calls": llm_n,
+            "avg_input_tokens": 500,
+            "avg_output_tokens": 50,
+            "estimated_cost_usd": round(cost, 4),
+            "model": settings.sonnet_model_id,
+            "thinking": thinking_mode,
+            "since_days": since_days,
+            "limit": limit,
+            "dry_run": True,
+        }
     return asyncio.run(
         _trajectory_async(
             con,
@@ -985,8 +1019,11 @@ def detect_conflicts(
     limit: int | None = None,
     dry_run: bool = False,
     no_thinking: bool = False,
-) -> int:
-    """Detect stance conflicts per session and return count processed."""
+) -> int | dict[str, Any]:
+    """Detect stance conflicts per session and return count processed.
+
+    In ``--dry-run`` mode returns a plan dict (see :func:`classify_sessions`).
+    """
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
     if dry_run:
         already: set[str] = set()
@@ -1004,7 +1041,19 @@ def detect_conflicts(
             pending_count,
             cost,
         )
-        return 0
+        return {
+            "pipeline": "conflicts",
+            "candidates": pending_count,
+            "llm_calls": pending_count,
+            "avg_input_tokens": 6000,
+            "avg_output_tokens": 400,
+            "estimated_cost_usd": round(cost, 4),
+            "model": settings.sonnet_model_id,
+            "thinking": thinking_mode,
+            "since_days": since_days,
+            "limit": limit,
+            "dry_run": True,
+        }
     return asyncio.run(
         _conflicts_async(
             con,

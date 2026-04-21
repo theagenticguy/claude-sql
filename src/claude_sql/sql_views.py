@@ -1111,6 +1111,19 @@ def register_analytics(
         else resolved.user_friction_parquet_path,
     }
 
+    # View projections keyed by view name. A ``None`` projection means
+    # ``SELECT *``; a string is spliced in verbatim so the wrapper view can
+    # add convenience alias columns (e.g. ``autonomy`` alongside
+    # ``autonomy_tier``).  These aliases are additive: the original column
+    # names continue to work so existing queries never break.
+    view_projections: dict[str, str | None] = {
+        "session_classifications": (
+            "*, autonomy_tier AS autonomy, success AS success_outcome, work_category AS category"
+        ),
+        "message_trajectory": ("*, sentiment_delta AS sentiment, is_transition AS transition"),
+        "session_conflicts": ("*, resolution AS conflict_resolution"),
+    }
+
     registered: set[str] = set()
     for view_name, path in view_to_path.items():
         if not _parquet_is_populated(path):
@@ -1124,10 +1137,11 @@ def register_analytics(
                 path,
             )
             continue
+        projection = view_projections.get(view_name) or "*"
         try:
             con.execute(
                 f"CREATE OR REPLACE VIEW {view_name} AS "
-                f"SELECT * FROM read_parquet({_sql_str(str(path))});"
+                f"SELECT {projection} FROM read_parquet({_sql_str(str(path))});"
             )
             logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)

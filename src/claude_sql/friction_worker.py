@@ -283,10 +283,10 @@ async def _classify_async(
     sql, _ = _candidate_sql(settings.friction_max_chars, since_days)
     if active_sessions:
         sql = sql.replace(
-            "FROM messages_text mt",
-            "FROM messages_text mt WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT unnest(?))",
+            " WHERE ",
+            " WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT unnest(?)) AND ",
             1,
-        ).replace(" WHERE ", " AND ", 1)
+        )
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
 
@@ -468,7 +468,7 @@ def detect_user_friction(
     limit: int | None = None,
     dry_run: bool = False,
     no_thinking: bool = False,
-) -> int:
+) -> int | dict[str, Any]:
     """Classify short user messages for friction signals.
 
     See module docstring for category definitions and pipeline shape.
@@ -493,8 +493,10 @@ def detect_user_friction(
 
     Returns
     -------
-    int
-        Number of rows written (or candidate count under ``dry_run``).
+    int | dict
+        Under ``dry_run=True`` a plan dict with ``{pipeline, candidates,
+        llm_calls, estimated_cost_usd, ...}``; otherwise the count of rows
+        written to the parquet.
     """
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
 
@@ -517,7 +519,20 @@ def detect_user_friction(
             llm_n,
             cost,
         )
-        return 0
+        return {
+            "pipeline": "friction",
+            "candidates": n,
+            "llm_calls": llm_n,
+            "avg_input_tokens": 200,
+            "avg_output_tokens": 60,
+            "estimated_cost_usd": round(cost, 4),
+            "model": settings.sonnet_model_id,
+            "thinking": thinking_mode,
+            "since_days": since_days,
+            "limit": limit,
+            "friction_max_chars": settings.friction_max_chars,
+            "dry_run": True,
+        }
 
     return asyncio.run(
         _classify_async(
