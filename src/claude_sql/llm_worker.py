@@ -49,7 +49,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from claude_sql import checkpointer
+from claude_sql import checkpointer, retry_queue
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
@@ -161,16 +161,64 @@ def _invoke_classifier_sync(
         accept="application/json",
     )
     payload = json.loads(resp["body"].read())
-    # Response shape is not yet pinned from live calls.  Try the two plausible
-    # shapes: (1) structured output lands as payload["output"]; (2) fallback to
-    # the Anthropic-style content-blocks where we parse the first text block
-    # as JSON.  Wave 7 will tighten this once we see a real response.
+    return _parse_structured_payload(payload)
+
+
+def _parse_structured_payload(payload: dict) -> dict:
+    """Pull the structured JSON object out of a Bedrock response.
+
+    Four shapes observed in production (2026-04):
+
+    1. ``payload["output"]`` is a dict — early GA shape, straight return.
+    2. Content block with ``type == "output"`` (current GA shape for
+       ``output_config.format``) — the structured object is the block
+       itself, typically under ``"output"`` / ``"json"`` / ``"content"``.
+    3. Anthropic message shape (``content`` is a list of blocks with
+       ``type == "text"``) — parse the first text block as JSON.
+    4. Bare dict that already matches the schema — return as-is if it
+       looks nothing like a Bedrock envelope.
+
+    A ``RuntimeError`` with the observed top-level keys is raised when
+    no shape matches; the caller enqueues the unit on the retry queue.
+    """
     if "output" in payload and isinstance(payload["output"], dict):
         return payload["output"]
-    for block in payload.get("content", []):
-        if block.get("type") == "text":
-            return json.loads(block["text"])
-    raise RuntimeError(f"Unexpected response shape: {list(payload.keys())}")
+    content = payload.get("content")
+    if isinstance(content, list):
+        # Shape 2: structured-output block.
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "output":
+                for key in ("output", "json", "content"):
+                    val = block.get(key)
+                    if isinstance(val, dict):
+                        return val
+                    if isinstance(val, str):
+                        try:
+                            return json.loads(val)
+                        except json.JSONDecodeError:
+                            continue
+        # Shape 3: text block whose body is the structured JSON.
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = block.get("text", "")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                stripped = text.strip()
+                if stripped.startswith("```"):
+                    stripped = stripped.strip("`").lstrip("json").strip()
+                    try:
+                        return json.loads(stripped)
+                    except json.JSONDecodeError:
+                        pass
+        # Shape 3b: message with only non-text blocks (thinking, tool_use)
+        # but a stop_reason of end_turn — no structured payload to parse.
+    if payload.keys() == {"output"} and isinstance(payload["output"], str):
+        return json.loads(payload["output"])
+    raise RuntimeError(f"Unexpected response shape: {sorted(payload.keys())}")
 
 
 async def _classify_one(
@@ -251,9 +299,16 @@ async def _classify_sessions_async(
     )
     keep = set(unchanged_pending)
 
+    # Retry queue: pull pending retries first so they're re-enqueued into
+    # `keep` even when the checkpoint would otherwise skip them.
+    retry_ids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="classify"))
+    if retry_ids:
+        logger.info("classify: draining {} retry-queue entries", len(retry_ids))
+        keep |= retry_ids
+
     pending: list[tuple[str, str]] = []
     for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
-        if sid in already:
+        if sid in already and sid not in retry_ids:
             continue
         if sid not in keep:
             continue
@@ -302,7 +357,13 @@ async def _classify_sessions_async(
         for (sid, _), res in zip(chunk, results, strict=True):
             if isinstance(res, BaseException):
                 errors += 1
-                logger.error("classify: {} failed: {}", sid, res)
+                logger.warning("classify: {} failed (queued for retry): {}", sid, res)
+                retry_queue.enqueue(
+                    settings.checkpoint_db_path,
+                    pipeline="classify",
+                    unit_id=sid,
+                    error=str(res),
+                )
                 continue
             res_dict: dict[str, Any] = res
             ok_rows.append(
@@ -333,15 +394,19 @@ async def _classify_sessions_async(
             _append_parquet(settings.classifications_parquet_path, df)
 
         # Checkpoint the sessions we just classified — at their CURRENT bounds,
-        # so a later re-run with no new messages is a no-op.
+        # so a later re-run with no new messages is a no-op. Also clear those
+        # sessions from the retry queue.
         if ok_rows:
+            ok_sids = [row["session_id"] for row in ok_rows]
             checkpointer.mark_completed(
                 settings.checkpoint_db_path,
                 pipeline="classify",
-                rows=[
-                    (row["session_id"], *bounds.get(row["session_id"], (None, None)))
-                    for row in ok_rows
-                ],
+                rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
+            )
+            retry_queue.mark_done(
+                settings.checkpoint_db_path,
+                pipeline="classify",
+                unit_ids=ok_sids,
             )
 
         written += len(ok_rows)
@@ -495,6 +560,14 @@ async def _trajectory_async(
     )
     active_sessions: set[str] = set(unchanged_pending)
 
+    # Retry queue: drain pending failed uuids into the `already`-bypass set
+    # so they get retried even though they landed in the parquet the first
+    # time they were attempted.
+    retry_uuids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="trajectory"))
+    if retry_uuids:
+        logger.info("trajectory: draining {} retry-queue entries", len(retry_uuids))
+        already -= retry_uuids
+
     where = ["mt.text_content IS NOT NULL", "length(mt.text_content) >= 1"]
     if since_days is not None:
         where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
@@ -596,11 +669,18 @@ async def _trajectory_async(
         now = datetime.now(UTC)
 
         ok: list[dict[str, Any]] = []
+        ok_uuids: list[str] = []
         errors = 0
         for (uuid, _), res in zip(chunk, results, strict=True):
             if isinstance(res, BaseException):
                 errors += 1
-                logger.error("trajectory: {} failed: {}", uuid, res)
+                logger.warning("trajectory: {} failed (queued for retry): {}", uuid, res)
+                retry_queue.enqueue(
+                    settings.checkpoint_db_path,
+                    pipeline="trajectory",
+                    unit_id=uuid,
+                    error=str(res),
+                )
                 continue
             res_dict: dict[str, Any] = res
             ok.append(
@@ -612,6 +692,7 @@ async def _trajectory_async(
                     "classified_at": now,
                 }
             )
+            ok_uuids.append(uuid)
             sid = session_for_uuid.get(uuid)
             if sid is not None:
                 processed_sessions.add(sid)
@@ -627,6 +708,20 @@ async def _trajectory_async(
                 },
             )
             _append_parquet(settings.trajectory_parquet_path, df)
+            retry_queue.mark_done(
+                settings.checkpoint_db_path,
+                pipeline="trajectory",
+                unit_ids=ok_uuids,
+            )
+            # Per-chunk checkpoint: stamp sessions we've fully processed so a
+            # mid-run crash doesn't lose the whole trajectory run.
+            chunk_sessions = {session_for_uuid[u] for u in ok_uuids if u in session_for_uuid}
+            if chunk_sessions:
+                checkpointer.mark_completed(
+                    settings.checkpoint_db_path,
+                    pipeline="trajectory",
+                    rows=[(sid, *bounds.get(sid, (None, None))) for sid in chunk_sessions],
+                )
         written += len(ok)
         logger.info(
             "trajectory chunk {}/{}: {} ok, {} errors, {:.1f}s",
@@ -719,9 +814,14 @@ async def _conflicts_async(
     )
     keep = set(unchanged_pending)
 
+    retry_ids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="conflicts"))
+    if retry_ids:
+        logger.info("conflicts: draining {} retry-queue entries", len(retry_ids))
+        keep |= retry_ids
+
     pending: list[tuple[str, str]] = []
     for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
-        if sid in already:
+        if sid in already and sid not in retry_ids:
             continue
         if sid not in keep:
             continue
@@ -762,6 +862,13 @@ async def _conflicts_async(
         for (sid, _), res in zip(chunk, results, strict=True):
             if isinstance(res, BaseException):
                 errors += 1
+                logger.warning("conflicts: {} failed (queued for retry): {}", sid, res)
+                retry_queue.enqueue(
+                    settings.checkpoint_db_path,
+                    pipeline="conflicts",
+                    unit_id=sid,
+                    error=str(res),
+                )
                 continue
             res_dict: dict[str, Any] = res
             conflicts = res_dict.get("conflicts") or []
@@ -815,6 +922,11 @@ async def _conflicts_async(
                 settings.checkpoint_db_path,
                 pipeline="conflicts",
                 rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
+            )
+            retry_queue.mark_done(
+                settings.checkpoint_db_path,
+                pipeline="conflicts",
+                unit_ids=list(ok_sids),
             )
         written += len(ok_sids)
         logger.info(
