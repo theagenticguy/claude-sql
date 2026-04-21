@@ -20,6 +20,7 @@ table so a single file holds all durable worker state.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,12 +46,28 @@ CREATE TABLE IF NOT EXISTS retry_queue (
 """
 
 
-def _connect(path: Path) -> duckdb.DuckDBPyConnection:
-    """Open the queue DB and ensure the table exists."""
+def _connect(path: Path, *, max_attempts: int = 20) -> duckdb.DuckDBPyConnection:
+    """Open the queue DB, retrying on lock contention.
+
+    The same DB file backs both ``session_checkpoint`` and ``retry_queue``;
+    three pipelines running in parallel will occasionally collide on the
+    file lock. Retry with exponential backoff so concurrent callers
+    serialize instead of crashing.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(path))
-    con.execute(_CREATE_TABLE_SQL)
-    return con
+    delay = 0.05
+    last_err: duckdb.IOException | None = None
+    for _ in range(max_attempts):
+        try:
+            con = duckdb.connect(str(path))
+            con.execute(_CREATE_TABLE_SQL)
+            return con
+        except duckdb.IOException as exc:
+            last_err = exc
+            time.sleep(delay)
+            delay = min(delay * 1.5, 1.6)
+    assert last_err is not None
+    raise last_err
 
 
 def _backoff_delta(attempts: int) -> timedelta:

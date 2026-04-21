@@ -26,6 +26,7 @@ The file lives at ``~/.claude/claude_sql.duckdb`` (overridable via
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,12 +61,29 @@ def _attach_tz(dt: datetime | None) -> datetime | None:
     return dt.replace(tzinfo=UTC)
 
 
-def _connect(path: Path) -> duckdb.DuckDBPyConnection:
-    """Open the checkpoint DB and ensure the table exists."""
+def _connect(path: Path, *, max_attempts: int = 20) -> duckdb.DuckDBPyConnection:
+    """Open the checkpoint DB and ensure the table exists.
+
+    DuckDB file connections are exclusive at the process level — when three
+    pipelines run in parallel, one grabs the lock and the others see
+    ``IOException: Could not set lock``. Retry with exponential backoff so
+    concurrent callers serialize rather than crash. 20 attempts × up to
+    1.6s each covers the multi-minute chunk cadence comfortably.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(path))
-    con.execute(_CREATE_TABLE_SQL)
-    return con
+    delay = 0.05
+    last_err: duckdb.IOException | None = None
+    for _ in range(max_attempts):
+        try:
+            con = duckdb.connect(str(path))
+            con.execute(_CREATE_TABLE_SQL)
+            return con
+        except duckdb.IOException as exc:
+            last_err = exc
+            time.sleep(delay)
+            delay = min(delay * 1.5, 1.6)
+    assert last_err is not None
+    raise last_err
 
 
 def load_as_map(db_path: Path, pipeline: str) -> dict[str, tuple[datetime | None, datetime | None]]:
@@ -113,13 +131,28 @@ def filter_unchanged(
             pending.append(sid)
             continue
         prev_ts, prev_mtime = prev
-        ts_ok = cur_ts is not None and prev_ts is not None and cur_ts <= prev_ts
-        mtime_ok = cur_mtime is not None and prev_mtime is not None and cur_mtime <= prev_mtime
-        if ts_ok and mtime_ok:
+        if _stale_or_equal(cur_ts, prev_ts) and _stale_or_equal(cur_mtime, prev_mtime):
             skipped += 1
             continue
         pending.append(sid)
     return pending, skipped
+
+
+def _stale_or_equal(cur: datetime | None, prev: datetime | None) -> bool:
+    """True iff both are present and ``cur`` has not advanced past ``prev``.
+
+    Normalises both operands to naive-UTC before comparing so aware-vs-naive
+    drift from different upstream sources (read_json → aware, checkpoint
+    re-attach → aware, raw DuckDB TIMESTAMP fetch → naive) never raises
+    ``TypeError``.
+    """
+    if cur is None or prev is None:
+        return False
+    cur_naive = _strip_tz(cur)
+    prev_naive = _strip_tz(prev)
+    if cur_naive is None or prev_naive is None:
+        return False
+    return cur_naive <= prev_naive
 
 
 def mark_completed(
