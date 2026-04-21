@@ -8,21 +8,24 @@ time.
 
 A standalone Python CLI that makes the user's own Claude Code transcripts —
 everything under `~/.claude/projects/**/*.jsonl` plus subagent sidecar files —
-queryable in place. Three layers stack on top of those JSONLs:
+queryable in place. Four analytics layers stack on top of those JSONLs:
 
-1. **SQL** — DuckDB reads the JSONLs with zero copy; 18 views + 12 macros
+1. **SQL** — DuckDB reads the JSONLs with zero copy; 18 views + 14 macros
    normalize messages, tool calls, todos, subagents, costs.
 2. **Semantic search** — Cohere Embed v4 (Bedrock, global CRIS) embeds every
    message; DuckDB VSS HNSW cosine index serves top-k in milliseconds.
 3. **LLM analytics** — Sonnet 4.6 (global CRIS, `output_config.format`
    structured output) classifies sessions (autonomy tier, work category,
-   success, goal), scores per-message sentiment, and detects stance conflicts.
-   UMAP + HDBSCAN cluster message embeddings; c-TF-IDF names the clusters;
-   Louvain groups sessions into communities.
+   success, goal), scores per-message sentiment, detects stance conflicts,
+   and classifies short user messages for friction signals (status pings,
+   unmet expectations, confusion, interruption, correction, frustration).
+4. **Structure** — UMAP + HDBSCAN cluster message embeddings, c-TF-IDF names
+   the clusters, Louvain groups sessions into communities over cosine-
+   similarity session centroids.
 
-Every expensive output (embeddings, classifications, clusters, communities)
-is cached in parquet under `~/.claude/`. Views register only the parquets
-that exist — missing ones warn and no-op, never crash.
+Every expensive output (embeddings, classifications, clusters, communities,
+friction) is cached in parquet under `~/.claude/`. Views register only the
+parquets that exist — missing ones warn and no-op, never crash.
 
 ## How to work on it
 
@@ -36,18 +39,69 @@ that exist — missing ones warn and no-op, never crash.
   non-zero exit as a blocker, not a "pre-existing" issue to skip past.
 - **Formatting:** `mise run fmt:write` applies ruff formatting. Line length
   is 100. Ruff lint selectors are `E, F, I, N, UP, B, SIM`.
-- **Type checker:** `ty` (not `mypy`). `mise run typecheck`.
+- **Type checker:** `ty` (not `mypy` or `pyright`). `mise run typecheck`.
+  Editor Pyright warnings about unresolved imports are false positives from
+  a global install that can't see the project's `.venv`; trust `ty`.
 - **Tests:** `pytest` under `tests/`. `mise run test`. Tests must not hit
   Bedrock — mock the client. The live corpus is the one under
   `~/.claude/projects/`, so integration tests should use a small fixture
   directory, not the live one.
 
+## Git hooks (lefthook) and commit conventions (commitizen)
+
+First-time setup after cloning:
+
+```bash
+mise run install          # also runs hooks:install as a dependency
+```
+
+That installs `pre-commit`, `commit-msg`, and `pre-push` git hooks via
+lefthook. See `lefthook.yml` for the exact wiring. TL;DR:
+
+- **pre-commit** — runs `ruff check --fix` + `ruff format` on staged Python
+  files (auto-stages fixes) and `ty check src/` across the whole source
+  tree. Fast in parallel.
+- **commit-msg** — `cz check --allow-abort --commit-msg-file {1}` validates
+  the message against the conventional-commits schema.
+- **pre-push** — full `pytest` run. The belt + suspenders for the belt.
+
+Every commit message must follow
+[Conventional Commits](https://www.conventionalcommits.org/). The
+commitizen types supported out of the box are `feat`, `fix`, `docs`,
+`style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+Scope is optional but preferred (`feat(friction): ...`).
+
+Use `mise run commit` for the interactive wizard if you want prompts, or
+write the message yourself — either way the `commit-msg` hook validates it.
+Bypass with `git commit --no-verify` only when you're landing a WIP and
+intend to amend it into a conventional message before pushing.
+
+## Version bumping & changelog
+
+Version management is driven by `cz bump`, which reads commit history,
+picks MAJOR/MINOR/PATCH from the conventional-commits types, updates
+`pyproject.toml` + `uv.lock` (via `version_provider = "uv"`), writes
+`CHANGELOG.md`, and creates an annotated tag.
+
+- `mise run bump:dry-run` — preview the next version + tag without writing.
+- `mise run bump` — bump, update changelog, commit as
+  `chore(release): X → Y`, create annotated `vY` tag.
+- `mise run changelog` — regenerate `CHANGELOG.md` from history without bumping.
+
+Commitizen config lives in `[tool.commitizen]` in `pyproject.toml`:
+`tag_format = "v$version"`, `version_provider = "uv"`,
+`major_version_zero = true`, `update_changelog_on_bump = true`,
+`annotated_tag = true`.
+
 ## How to run it
 
 - **As a uv tool** (preferred end-user path): `mise run tool:install` →
-  `claude-sql --version`. Upgrade with `uv tool upgrade claude-sql`, remove
-  with `mise run tool:uninstall`.
-- **In the project venv** (development): `mise run install` → `mise run cli -- <subcommand>`.
+  `claude-sql --version`. Reinstall after pulling with
+  `mise run tool:upgrade` (same command — `uv tool upgrade claude-sql`
+  does NOT work because the package is not on PyPI). Remove with
+  `mise run tool:uninstall`.
+- **In the project venv** (development): `mise run install` →
+  `mise run cli -- <subcommand>`.
 - **REPL:** `claude-sql shell` drops into DuckDB with every view + macro
   already registered.
 
@@ -56,15 +110,15 @@ that exist — missing ones warn and no-op, never crash.
 - **Region:** `us-east-1`. Embeds + Sonnet classification go through the
   **global** CRIS profiles — `global.cohere.embed-v4:0` and
   `global.anthropic.claude-sonnet-4-6`. Direct model IDs and US-only CRIS
-  throttled under load; global is the only path that sustains throughput.
+  throttle under load; global is the only path that sustains throughput.
 - **IAM:** `bedrock:InvokeModel` on both inference profiles above.
 - **Credentials:** `AWS_PROFILE=<your-profile>` in the environment. The CLI
   reads it via boto3's standard chain.
 - **Cost guard:** every command that spends real money defaults to
   `--dry-run`. `analyze` chains embed → cluster → classify → trajectory →
-  conflicts and respects `--dry-run` on every step. The dry-run path uses
-  a pure-SQL count, not a full materialization, so it stays fast on large
-  corpora.
+  conflicts → friction and respects `--dry-run` on every step. The dry-run
+  path uses a pure-SQL count, not a full materialization, so it stays fast
+  on large corpora.
 
 ## Structured output (Sonnet classification)
 
@@ -75,6 +129,25 @@ that exist — missing ones warn and no-op, never crash.
   2020-12 subset.
 - Adaptive thinking stays on. `citations` is the only feature incompatible
   with structured output — do not add it.
+
+## Friction classifier (`friction_worker.py`)
+
+Detects user-friction signals in short user-role messages (≤300 chars by
+default). Seven labels: `status_ping`, `unmet_expectation`, `confusion`,
+`interruption`, `correction`, `frustration`, `none`. Pipeline:
+
+1. Pull user-role messages ≤`friction_max_chars` via `messages_text`.
+2. Regex fast-path (`regex_fast_path`) catches unambiguous cases —
+   `status_ping`, `interruption`, `correction`. Confidence 0.9.
+3. Everything else goes to Sonnet 4.6 with `USER_FRICTION_SCHEMA`.
+4. Session-level checkpointer + per-uuid anti-join so reruns on untouched
+   sessions are free.
+5. Output: `~/.claude/user_friction.parquet` with `source ∈ {regex, llm,
+   refused}`.
+
+**Why `unmet_expectation` lives in the LLM path, not regex:** a message
+like `screenshot?` needs session context to disambiguate from a genuine
+topic question. The LLM does this right; regex can't.
 
 ## Analytics pipeline determinism
 
@@ -110,11 +183,13 @@ math (per-class TF, IDF, L1 norm, ngram (1,2), min_df=2). Do not pull in
 - Embeddings parquet: write with explicit `pl.Array(pl.Float32,
   output_dimension)` schema, otherwise polars infers `Object` and the
   roundtrip breaks.
-- Model-ID cost lookup: strip the dated suffix via `re.sub(r'-\d{8}
-
-, '', model_id)`
-  before looking it up, so `claude-sonnet-4-6-20260315` matches the same
-  entry as `claude-sonnet-4-6`.
+- Model-ID cost lookup: strip the dated suffix via
+  `re.sub(r'-\d{8}$', '', model_id)` before looking it up, so
+  `claude-sonnet-4-6-20260315` matches the same entry as
+  `claude-sonnet-4-6`.
+- `BedrockRefusalError` is terminal: the LLM pipelines stamp a neutral
+  placeholder row and clear the retry queue so refused messages don't
+  cycle forever.
 
 ## Agent-friendly CLI surface (load-bearing — do not regress)
 
@@ -143,11 +218,19 @@ for the full table. The common overrides:
 
 - `CLAUDE_SQL_DEFAULT_GLOB` — override the main transcript glob
 - `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` — move the embeddings cache
+- `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` — move the friction cache
+- `CLAUDE_SQL_FRICTION_MAX_CHARS` — short-message cutoff (default 300)
 - `CLAUDE_SQL_CONCURRENCY` — bump parallel Bedrock calls (default 2)
 
 ## Commits & pushes
 
 - Keep commits small and focused — one logical change per commit, per the
   project's established rhythm.
-- `mise run check` must pass before every commit.
-- Push to `origin/main` only after the local check is green.
+- **All commits must be conventional** — the `commit-msg` hook enforces
+  this; `git commit --no-verify` is an escape hatch, not a policy.
+- `mise run check` must pass before every commit (pre-commit runs
+  ruff + ty automatically; `mise run check` additionally runs pytest).
+- Push to `origin/main` only after the local check is green. `pre-push`
+  runs pytest as a final safety net.
+- Use `mise run bump` (not hand-rolled tags) for version releases. It
+  updates `CHANGELOG.md` + `pyproject.toml` + `uv.lock` atomically.

@@ -21,12 +21,49 @@ _.python.venv = { path = ".venv", create = true }
 # ---------------------------------------------------------------------------
 
 [tasks.install]
-description = "Install all deps from uv.lock into .venv"
+description = "Install all deps from uv.lock into .venv and git hooks"
+depends = ["hooks:install"]
 run = "uv sync --all-extras"
 
 [tasks.upgrade]
 description = "Upgrade every dependency to the latest compatible version"
 run = "uv lock --upgrade && uv sync"
+
+# ---------------------------------------------------------------------------
+# Git hooks (lefthook)
+# ---------------------------------------------------------------------------
+
+[tasks."hooks:install"]
+description = "Install lefthook git hooks (pre-commit + commit-msg + pre-push)"
+run = "uv run lefthook install"
+
+[tasks."hooks:uninstall"]
+description = "Uninstall lefthook git hooks"
+run = "uv run lefthook uninstall"
+
+[tasks."hooks:run"]
+description = "Run a lefthook manually: `mise run hooks:run -- pre-commit`"
+run = "uv run lefthook run"
+
+# ---------------------------------------------------------------------------
+# Commitizen (conventional commits + version bump + changelog)
+# ---------------------------------------------------------------------------
+
+[tasks.commit]
+description = "Interactive commit wizard (conventional commits)"
+run = "uv run cz commit"
+
+[tasks.bump]
+description = "Bump version + changelog + git tag from conventional commits"
+run = "uv run cz bump"
+
+[tasks."bump:dry-run"]
+description = "Preview what `cz bump` would do without changing anything"
+run = "uv run cz bump --dry-run"
+
+[tasks.changelog]
+description = "Regenerate CHANGELOG.md from commit history"
+run = "uv run cz changelog"
 
 # ---------------------------------------------------------------------------
 # Quality gates (run in parallel inside `mise run check`)

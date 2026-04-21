@@ -1,0 +1,61 @@
+# Lefthook — Git hooks runner.  Installed by ``mise run hooks:install`` and
+# activated by ``uv run lefthook install`` once per clone.
+#
+# Invariants:
+#   * Every hook runs inside the project's uv venv via ``uv run`` so
+#     contributors don't need system-wide ruff / ty / cz installs.
+#   * Pre-commit jobs run in parallel and are scoped to staged files via
+#     ``{staged_files}`` so partial commits stay fast.
+#   * ``stage_fixed: true`` on the formatter so auto-fixes land in the commit
+#     instead of the working tree.
+#   * Commitizen validates every commit message against
+#     conventional-commits; bypass with ``git commit --no-verify`` only in
+#     the rare case you need to land a WIP.
+#
+# Uninstall: ``uv run lefthook uninstall``.
+
+min_version: 2.0.0
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: ruff-lint
+      run: uv run ruff check --fix {staged_files}
+      glob: "*.py"
+      stage_fixed: true
+
+    - name: ruff-format
+      run: uv run ruff format {staged_files}
+      glob: "*.py"
+      stage_fixed: true
+
+    # ``ty`` runs over the whole ``src/`` tree because Python type-checking
+    # is semantic — changing one file can break imports elsewhere.  Still
+    # fast (~2s on this repo) because ty caches aggressively.
+    - name: ty
+      run: uv run ty check src/
+      glob: "*.py"
+      # Only run when Python files actually changed — avoids the ty boot
+      # cost on pure-doc / config commits.
+      skip:
+        - merge
+        - rebase
+
+pre-push:
+  jobs:
+    # Full test suite on push is a safety net: pre-commit only runs the
+    # linters, not pytest.  Pushing without a green test pass is almost
+    # always a mistake on this project.
+    - name: pytest
+      run: uv run pytest tests/ --no-header -q
+      skip:
+        - merge
+        - rebase
+
+commit-msg:
+  jobs:
+    # ``cz check --commit-msg-file`` validates the message against the
+    # configured rule (conventional commits).  ``--allow-abort`` lets an
+    # empty message (e.g. when aborting a commit) pass through.
+    - name: commitizen
+      run: uv run cz check --allow-abort --commit-msg-file {1}

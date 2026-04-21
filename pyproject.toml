@@ -35,6 +35,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "commitizen>=4.13.10",
+    "lefthook>=2.1.6",
     "pytest>=9.0.3",
     "ruff>=0.15.11",
     "ty>=0.0.31",
@@ -49,3 +51,23 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------
+# Commitizen — conventional commits + version bumping.
+# ---------------------------------------------------------------------------
+#
+# version_provider = "uv" keeps pyproject.toml[project.version] and uv.lock
+# in sync on every ``cz bump``, so we don't maintain a separate
+# ``__version__.py``.  update_changelog_on_bump writes CHANGELOG.md from
+# commit history using the conventional-commits parser.  major_version_zero
+# keeps us in 0.x until the first intentional breaking release.
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "uv"
+version_scheme = "pep440"
+tag_format = "v$version"
+update_changelog_on_bump = true
+major_version_zero = true
+annotated_tag = true
+changelog_incremental = true
+bump_message = "chore(release): $current_version → $new_version"

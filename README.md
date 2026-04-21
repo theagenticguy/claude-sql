@@ -41,6 +41,14 @@
 - "Find sessions where I took two opposing positions on the same
   decision — and flag which ones got resolved vs. abandoned."
 
+**Spot where the agent left you hanging.**
+
+- "Which sessions had me pinging for status the most? What was the
+  agent doing?"
+- "Show me every time I asked a one-word question like *screenshot?*
+  because the agent didn't proactively share one."
+- "Rank sessions by how often I had to interrupt or correct the agent."
+
 `claude-sql` turns every one of those into a SQL query that runs in
 under a second on the live JSONL corpus — no export, no pipeline.
 
@@ -56,8 +64,8 @@ flowchart LR
     E --> P["embeddings.parquet"]
     P --> H["HNSW index<br/>(DuckDB VSS)"]
     H --> S[["claude-sql search"]]
-    V --> L["claude-sql classify / trajectory /<br/>conflicts (Sonnet 4.6 +<br/>output_config.format)"]
-    L --> PA["classifications / trajectory /<br/>conflicts parquets"]
+    V --> L["claude-sql classify / trajectory /<br/>conflicts / friction (Sonnet 4.6 +<br/>output_config.format)"]
+    L --> PA["classifications / trajectory /<br/>conflicts / user_friction parquets"]
     P --> C["claude-sql cluster<br/>(UMAP + HDBSCAN)"]
     C --> PC["clusters + cluster_terms<br/>(c-TF-IDF)"]
     P --> CM["claude-sql community<br/>(Louvain over centroids)"]
@@ -112,12 +120,17 @@ mise run tool:uninstall   # → uv tool uninstall claude-sql
 git clone https://github.com/theagenticguy/claude-sql.git
 cd claude-sql
 mise install              # fetch pinned Python 3.12 + uv
-mise run install          # uv sync --all-extras
+mise run install          # uv sync --all-extras + install lefthook git hooks
 mise run check            # ruff + fmt + ty + pytest
 ```
 
 `mise` auto-activates `.venv` on `cd`. Every command below is also
 available as a mise task: `mise tasks` prints the full list.
+
+`mise run install` also installs the lefthook git hooks (pre-commit runs
+ruff + ty on staged files, commit-msg validates conventional commits via
+commitizen, pre-push runs the full pytest suite). Re-run
+`mise run hooks:install` anytime the hook config changes.
 
 ### AWS creds
 
@@ -164,7 +177,13 @@ claude-sql search "temporal workflow determinism" --k 10
 claude-sql classify --dry-run --since-days 30
 AWS_PROFILE=... claude-sql classify --no-dry-run --since-days 30
 
-# Full analytics pipeline (embed → cluster → classify → trajectory → conflicts)
+# Friction classifier — status pings, unmet expectations, interruptions
+claude-sql friction --dry-run --since-days 14
+AWS_PROFILE=... claude-sql friction --no-dry-run --since-days 14
+claude-sql query "SELECT * FROM friction_counts(14)"
+claude-sql query "SELECT * FROM friction_examples('unmet_expectation', 10)"
+
+# Full analytics pipeline (embed → cluster → classify → trajectory → conflicts → friction)
 AWS_PROFILE=... claude-sql analyze --since-days 30 --no-dry-run
 ```
 
@@ -172,7 +191,7 @@ More recipes in [docs/analytics_cookbook.md](docs/analytics_cookbook.md).
 
 ## CLI surface
 
-All 13 subcommands share top-level flags: `--verbose` / `--quiet`,
+All 14 subcommands share top-level flags: `--verbose` / `--quiet`,
 `--glob`, `--subagent-glob`, and `--format {auto,table,json,ndjson,csv}`.
 Commands that spend real Bedrock money default to `--dry-run`.
 
@@ -188,6 +207,7 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `classify` | Sonnet 4.6 → session autonomy + work category + success + goal |
 | `trajectory` | Per-message sentiment + is_transition |
 | `conflicts` | Per-session stance-conflict detection |
+| `friction` | Regex + Sonnet 4.6 → status pings, unmet expectations, confusion, etc. |
 | `cluster` | UMAP → HDBSCAN → c-TF-IDF over message embeddings |
 | `community` | Louvain over session centroids |
 | `analyze` | Run the whole pipeline in dependency order |
@@ -234,6 +254,7 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `message_clusters` | cluster id + 2d viz coords | `cluster_id`, `x`, `y`, `is_noise` |
 | `cluster_terms` | c-TF-IDF top terms per cluster | `cluster_id`, `term`, `weight`, `rank` |
 | `session_communities` | Louvain community per session | `community_id`, `size` |
+| `user_friction` | one row per classified short user message | `label` (7-way), `rationale`, `source` (`regex`/`llm`/`refused`), `confidence` |
 
 ## Macros
 
@@ -251,6 +272,9 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `cluster_top_terms(cid, n)` | table | Top-N terms for a cluster |
 | `community_top_topics(cid, n)` | table | Dominant clusters within a community |
 | `sentiment_arc(sid)` | table | Per-message sentiment timeline for one session |
+| `friction_counts(since_days)` | table | Count + session breadth per friction label |
+| `friction_rate(since_days)` | table | Per-session friction pressure vs. user message count |
+| `friction_examples(label, n)` | table | Top-N example messages for a given friction label |
 
 ## Environment variables
 
@@ -267,12 +291,14 @@ All configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_CONCURRENCY` | `2` | Parallel Bedrock calls |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Cohere batch size |
 | `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings.parquet` | Embeddings cache |
+| `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction.parquet` | Friction cache |
+| `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Short-message cutoff for the friction classifier |
 | `CLAUDE_SQL_SEED` | `42` | UMAP/HDBSCAN/Louvain determinism |
 
 ## Development
 
 ```bash
-mise run check           # lint + fmt-check + typecheck + 40 tests
+mise run check           # lint + fmt-check + typecheck + 127 tests
 mise run fmt:write       # auto-apply ruff formatting
 mise run upgrade         # uv lock --upgrade && uv sync
 mise run build           # uv build → dist/*.whl + *.tar.gz
@@ -280,6 +306,43 @@ mise run tool:install    # install claude-sql as a uv tool (global)
 mise run cli -- schema   # run the CLI in the project venv
 mise tasks               # list every mise task
 ```
+
+### Git hooks + conventional commits
+
+`mise run install` installs **lefthook** git hooks:
+
+- **pre-commit** — parallel `ruff check --fix` + `ruff format` on staged
+  Python files (auto-staged), plus `ty check src/` across the whole tree.
+- **commit-msg** — validates the message via
+  `cz check --allow-abort` against the conventional-commits schema.
+- **pre-push** — runs the full pytest suite before the push lands.
+
+Config lives in `lefthook.yml`. Reinstall anytime that file changes:
+
+```bash
+mise run hooks:install
+mise run hooks:uninstall   # if you need to opt out
+```
+
+### Version bumps + changelog (commitizen)
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/).
+The supported types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
+`test`, `build`, `ci`, `chore`, `revert`. Use
+`mise run commit` for the interactive wizard or write the message yourself —
+either way the `commit-msg` hook validates it.
+
+Version bumps are driven by `cz bump`, which reads commit history and
+decides MAJOR/MINOR/PATCH from the conventional-commits types:
+
+```bash
+mise run bump:dry-run    # preview next version + tag
+mise run bump            # bump + changelog + annotated tag (vX.Y.Z)
+mise run changelog       # regenerate CHANGELOG.md without bumping
+```
+
+`[tool.commitizen]` is wired to `version_provider = "uv"`, so every bump
+keeps `pyproject.toml[project.version]` and `uv.lock` in sync atomically.
 
 ## Design notes
 
@@ -302,6 +365,14 @@ mise tasks               # list every mise task
   across runs.
 - Louvain community detection uses `networkx.community.louvain_communities`
   (built into `networkx>=3.4`), not the abandoned `python-louvain`.
+- Friction classification is a hybrid regex + LLM pipeline: a hand-curated
+  regex bank catches the unambiguous `status_ping` / `interruption` /
+  `correction` cases at zero Bedrock cost, and the ambiguous class —
+  especially `unmet_expectation` (one-word questions like `screenshot?`
+  that imply the agent missed a proactive step) — falls through to
+  Sonnet 4.6 structured output. The classifier is scoped to user-role
+  messages under 300 chars by default; longer turns are almost always
+  genuine task instructions.
 
 ## Links
 
