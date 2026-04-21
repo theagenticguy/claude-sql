@@ -250,8 +250,16 @@ def session_bounds(
     """
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
+    # Claude Code rotates transcripts; a file visible during glob scan can
+    # vanish before the JOIN onto ``sessions`` runs. One IOException retry
+    # refreshes the glob-backed views and succeeds on the second pass.
+    try:
+        rows = con.execute(sql).fetchall()
+    except duckdb.IOException as exc:
+        logger.warning("session_bounds: stale glob entry — retrying once ({})", exc)
+        rows = con.execute(sql).fetchall()
     out: dict[str, tuple[datetime | None, datetime | None]] = {}
-    for sid, last_ts, path in con.execute(sql).fetchall():
+    for sid, last_ts, path in rows:
         mtime: datetime | None = None
         if path:
             try:
