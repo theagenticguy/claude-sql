@@ -142,19 +142,22 @@ EXCLUDED_JUDGES: tuple[Judge, ...] = (
 WITHIN_FAMILY_HOLDOUT: tuple[Judge, ...] = (
     Judge(
         shortname="opus-4-7",
-        model_id="anthropic.claude-opus-4-7",
+        model_id="global.anthropic.claude-opus-4-7",
         provider="Anthropic",
         family="anthropic",
         role="within-family-holdout",
-        notes="Delta vs non-Anthropic ensemble = the bias we are measuring.",
+        notes=(
+            "Delta vs non-Anthropic ensemble = the bias we are measuring. "
+            "Uses global CRIS profile; direct model ID rejects on-demand."
+        ),
     ),
     Judge(
         shortname="sonnet-4-6",
-        model_id="anthropic.claude-sonnet-4-6",
+        model_id="global.anthropic.claude-sonnet-4-6",
         provider="Anthropic",
         family="anthropic",
         role="within-family-holdout",
-        notes="Intra-family agreement is its own data point.",
+        notes="Intra-family agreement is its own data point. Uses global CRIS.",
     ),
 )
 
