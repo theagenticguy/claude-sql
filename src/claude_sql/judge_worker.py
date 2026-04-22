@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -30,10 +31,50 @@ from typing import Any
 import boto3
 import polars as pl
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    SSLError,
+)
+from botocore.exceptions import (
+    ConnectionError as BotoConnectionError,
+)
 from loguru import logger
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from claude_sql import judges as judge_catalog
 from claude_sql.judges import Judge
+
+_retry_logger = logging.getLogger("claude_sql.judge_worker")
+_RETRY_CODES: set[str] = {
+    "ThrottlingException",
+    "ServiceUnavailableException",
+    "ModelTimeoutException",
+    "ModelErrorException",
+    "InternalServerException",
+}
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry policy for Bedrock Converse calls.
+
+    Matches ``embed_worker`` / ``llm_worker`` convention so throttling
+    behaves the same across the whole CLI.
+    """
+    if isinstance(exc, SSLError | BotoConnectionError | EndpointConnectionError | ReadTimeoutError):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        return code in _RETRY_CODES
+    return False
+
 
 # Rough per-1M-token cost estimates (USD).  Conservative; updated as
 # Bedrock publishes list prices.  Missing entries fall through to a
@@ -189,10 +230,22 @@ def _bedrock_client(region: str = "us-east-1"):
     return boto3.client("bedrock-runtime", config=cfg)
 
 
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    retry=retry_if_exception(_is_retryable),
+    before_sleep=before_sleep_log(_retry_logger, logging.WARNING),
+    reraise=True,
+)
 def _converse_once(
     client: Any, model_id: str, prompt: str, max_tokens: int = 4096, temperature: float = 0.0
 ) -> str:
-    """One Bedrock Converse call; returns the model's plain text response."""
+    """One Bedrock Converse call; returns the model's plain text response.
+
+    Retries throttling / ServiceUnavailable / connection errors with
+    exponential backoff (10 attempts, 2\u201360s).  Botocore's own retry
+    policy is disabled in ``_bedrock_client`` so tenacity owns backoff.
+    """
     resp = client.converse(
         modelId=model_id,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
