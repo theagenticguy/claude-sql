@@ -7,12 +7,28 @@ import pytest
 from claude_sql import judges
 
 
-def test_catalog_has_ten_primary_judges() -> None:
-    """Primary panel must span 10 non-within-family models."""
-    assert len(judges.PRIMARY_PANEL) == 10
+def test_catalog_has_eight_primary_judges() -> None:
+    """Primary panel spans 8 non-within-family models (Mistral dropped 2026-04-21)."""
+    assert len(judges.PRIMARY_PANEL) == 8
     for j in judges.PRIMARY_PANEL:
         assert j.family == "non-anthropic-non-amazon"
         assert j.role == "judge"
+
+
+def test_mistral_judges_are_excluded_not_primary() -> None:
+    """Both Mistral shortnames must be in EXCLUDED_JUDGES, not PRIMARY_PANEL."""
+    primary = {j.shortname for j in judges.PRIMARY_PANEL}
+    excluded = {j.shortname for j in judges.EXCLUDED_JUDGES}
+    assert "mistral-large-3" not in primary
+    assert "magistral-small" not in primary
+    assert "mistral-large-3" in excluded
+    assert "magistral-small" in excluded
+
+
+def test_excluded_judges_still_resolvable() -> None:
+    """Dropped judges remain resolvable so --panel can re-opt-in."""
+    assert judges.resolve("mistral-large-3").shortname == "mistral-large-3"
+    assert judges.resolve("magistral-small").shortname == "magistral-small"
 
 
 def test_within_family_holdout_is_anthropic_only() -> None:

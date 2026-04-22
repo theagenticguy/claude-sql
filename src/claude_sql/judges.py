@@ -34,8 +34,14 @@ class Judge:
 
 
 #: Primary ensemble: non-Anthropic, non-Amazon judges for cross-lineage
-#: variance.  Ten distinct training corpora across Chinese, European, and
-#: North American labs.
+#: variance.  Eight distinct training corpora across Chinese, North
+#: American, European labs.
+#:
+#: Mistral Large 3 and Magistral-Small were dropped after the first
+#: gym run (study ``ab0bf2eeb481fdd2``, 2026-04-21) because they
+#: produced 4/50 unparseable responses \u2014 worst rubric discipline of
+#: the panel.  They remain in ``EXCLUDED_JUDGES`` below so the history
+#: is self-documenting and they can be re-opted-in via ``--panel``.
 PRIMARY_PANEL: tuple[Judge, ...] = (
     Judge(
         shortname="kimi-k2.5",
@@ -86,22 +92,6 @@ PRIMARY_PANEL: tuple[Judge, ...] = (
         notes="Qwen3-Next 80B MoE; structured-output strong.",
     ),
     Judge(
-        shortname="mistral-large-3",
-        model_id="mistral.mistral-large-3-675b-instruct",
-        provider="Mistral AI",
-        family="non-anthropic-non-amazon",
-        role="judge",
-        notes="European lineage; fourth continent represented.",
-    ),
-    Judge(
-        shortname="magistral-small",
-        model_id="mistral.magistral-small-2509",
-        provider="Mistral AI",
-        family="non-anthropic-non-amazon",
-        role="judge",
-        notes="Mistral reasoning variant; hedge/reversal detection.",
-    ),
-    Judge(
         shortname="palmyra-x5",
         model_id="writer.palmyra-x5-v1:0",
         provider="Writer",
@@ -116,6 +106,34 @@ PRIMARY_PANEL: tuple[Judge, ...] = (
         family="non-anthropic-non-amazon",
         role="judge",
         notes="NVIDIA's largest open reasoning model.",
+    ),
+)
+
+#: Judges evaluated and dropped.  Reachable via ``resolve()`` /
+#: ``--panel`` for anyone who wants to re-test them, but not part of
+#: the default ensemble.
+EXCLUDED_JUDGES: tuple[Judge, ...] = (
+    Judge(
+        shortname="mistral-large-3",
+        model_id="mistral.mistral-large-3-675b-instruct",
+        provider="Mistral AI",
+        family="non-anthropic-non-amazon",
+        role="judge",
+        notes=(
+            "Dropped 2026-04-21 after study ab0bf2eeb481fdd2: produced 4/50 "
+            "unparseable responses (worst rubric discipline in panel)."
+        ),
+    ),
+    Judge(
+        shortname="magistral-small",
+        model_id="mistral.magistral-small-2509",
+        provider="Mistral AI",
+        family="non-anthropic-non-amazon",
+        role="judge",
+        notes=(
+            "Dropped 2026-04-21 alongside mistral-large-3 (Mistral family "
+            "entirely excluded pending rubric-discipline fix)."
+        ),
     ),
 )
 
@@ -162,12 +180,16 @@ BULK_PANEL: tuple[Judge, ...] = (
 )
 
 #: Flat lookup keyed by shortname (CLI-facing) and by model_id (internal).
-_BY_SHORTNAME: dict[str, Judge] = {
-    j.shortname: j for j in (*PRIMARY_PANEL, *WITHIN_FAMILY_HOLDOUT, *BULK_PANEL)
-}
-_BY_MODEL_ID: dict[str, Judge] = {
-    j.model_id: j for j in (*PRIMARY_PANEL, *WITHIN_FAMILY_HOLDOUT, *BULK_PANEL)
-}
+#: Includes ``EXCLUDED_JUDGES`` so ``--panel mistral-large-3`` still
+#: resolves for anyone re-testing a dropped judge.
+_ALL: tuple[Judge, ...] = (
+    *PRIMARY_PANEL,
+    *WITHIN_FAMILY_HOLDOUT,
+    *BULK_PANEL,
+    *EXCLUDED_JUDGES,
+)
+_BY_SHORTNAME: dict[str, Judge] = {j.shortname: j for j in _ALL}
+_BY_MODEL_ID: dict[str, Judge] = {j.model_id: j for j in _ALL}
 
 
 def resolve(name: str) -> Judge:
@@ -204,6 +226,11 @@ def all_bulk() -> tuple[Judge, ...]:
     return BULK_PANEL
 
 
+def all_excluded() -> tuple[Judge, ...]:
+    """Return judges that were evaluated and dropped from the primary panel."""
+    return EXCLUDED_JUDGES
+
+
 def catalog() -> list[Judge]:
-    """Every judge in the catalog, primary first, then holdout, then bulk."""
-    return [*PRIMARY_PANEL, *WITHIN_FAMILY_HOLDOUT, *BULK_PANEL]
+    """Every judge in the catalog, primary first, then holdout, bulk, excluded."""
+    return [*PRIMARY_PANEL, *WITHIN_FAMILY_HOLDOUT, *BULK_PANEL, *EXCLUDED_JUDGES]
