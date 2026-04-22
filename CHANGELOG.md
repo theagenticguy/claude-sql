@@ -1,3 +1,9 @@
+## v0.2.1 (2026-04-22)
+
+### Fix
+
+- **judge**: remove rationale truncation, raise output cap to 4096 tokens
+
 ## v0.2.0 (2026-04-21)
 
 ### Feat
