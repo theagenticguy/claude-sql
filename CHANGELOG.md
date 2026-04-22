@@ -1,3 +1,9 @@
+## v0.2.3 (2026-04-22)
+
+### Refactor
+
+- **judges**: drop Mistral Large 3 and Magistral-Small from primary panel
+
 ## v0.2.2 (2026-04-22)
 
 ### Fix
