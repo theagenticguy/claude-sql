@@ -169,7 +169,7 @@ def parse_judge_response(text: str) -> tuple[int | None, str]:
         except (ValueError, TypeError):
             pass
     r = _RATIONALE_RE.search(text)
-    rationale = r.group(1).strip() if r else text.strip()[:1000]
+    rationale = r.group(1).strip() if r else text.strip()
     return score, rationale
 
 
@@ -190,7 +190,7 @@ def _bedrock_client(region: str = "us-east-1"):
 
 
 def _converse_once(
-    client: Any, model_id: str, prompt: str, max_tokens: int = 512, temperature: float = 0.0
+    client: Any, model_id: str, prompt: str, max_tokens: int = 4096, temperature: float = 0.0
 ) -> str:
     """One Bedrock Converse call; returns the model's plain text response."""
     resp = client.converse(
@@ -294,9 +294,19 @@ async def _grade_one(
             judge.shortname,
             session_id,
             axis.name,
-            text[:200],
+            text[:2000],
         )
-        return None
+        # Persist the full text as the rationale so post-hoc triage can
+        # see what the judge actually returned. score=None is the sentinel.
+        return JudgeScore(
+            session_id=session_id,
+            axis=axis.name,
+            judge_shortname=judge.shortname,
+            judge_model_id=judge.model_id,
+            score=-1,
+            rationale=f"[unparseable] {rationale}",
+            freeze_sha=freeze_sha,
+        )
     return JudgeScore(
         session_id=session_id,
         axis=axis.name,

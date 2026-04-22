@@ -72,7 +72,16 @@ def test_parse_judge_response_no_score_returns_none() -> None:
     text = "I cannot score this."
     score, rationale = jw.parse_judge_response(text)
     assert score is None
-    assert "cannot" in rationale
+    # No truncation: the full malformed response is preserved so a human
+    # reviewer can see exactly what the judge emitted.
+    assert rationale == "I cannot score this."
+
+
+def test_parse_judge_response_preserves_long_malformed_text() -> None:
+    """Regression: the fallback path previously truncated to 1000 chars."""
+    text = "no-score-here " + ("x" * 5000)
+    _, rationale = jw.parse_judge_response(text)
+    assert len(rationale) > 4000
 
 
 def test_plan_estimates_calls_and_dollars() -> None:
