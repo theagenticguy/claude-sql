@@ -1,3 +1,9 @@
+## v0.2.2 (2026-04-22)
+
+### Fix
+
+- **judge**: add tenacity retries to Converse calls
+
 ## v0.2.1 (2026-04-22)
 
 ### Fix
