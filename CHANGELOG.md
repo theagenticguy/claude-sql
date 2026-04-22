@@ -1,3 +1,9 @@
+## v0.2.4 (2026-04-22)
+
+### Fix
+
+- **judges**: use global CRIS profile for Anthropic holdouts
+
 ## v0.2.3 (2026-04-22)
 
 ### Refactor
