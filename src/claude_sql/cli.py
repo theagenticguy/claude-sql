@@ -676,6 +676,23 @@ def search(
     uuid, session_id, role, sim (cosine similarity ∈ [-1, 1]), snippet.
     Sorted by cosine distance ascending -- highest sim first.
 
+    When to prefer ``query`` instead
+    --------------------------------
+    Semantic search is good at recall but bad at tie-breaking when the
+    topic is over-represented in the corpus. If you are pinpointing a
+    single known session (not a theme) and the subject is frequent --
+    "the claude-sql session where I ran over 30 days", "the session
+    where the test suite failed" -- a literal ILIKE on a distinctive
+    token finds it in one hop:
+
+        claude-sql query "SELECT DISTINCT session_id FROM messages_text
+          WHERE text_content ILIKE '%--since-days 30%'"
+
+    Good distinctive tokens: exact CLI flags, dollar amounts from a
+    dry-run cost table, precise error strings, the exact command the
+    user ran. If the first search returns >3 plausible sessions at
+    similar ``sim``, stop rephrasing and switch modality.
+
     Exit codes: 0 success, 2 no_embeddings, 70 runtime.
     """
     _configure(common)

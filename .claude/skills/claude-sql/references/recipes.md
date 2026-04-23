@@ -32,6 +32,36 @@ For fuzzy/conceptual matches, prefer:
 claude-sql search "temporal workflow determinism" --k 20
 ```
 
+### 2b. Find *the one* session where I ran X
+
+When the user wants a specific session (not a theme) and the topic is
+frequent in the corpus, semantic search returns many near-ties ranked
+by generic boilerplate. Pivot to a literal `ILIKE` on a distinctive
+token — a flag, a dollar amount from a cost table, a precise error,
+the exact command.
+
+Distinctive flag (narrows >170k messages to ~3 sessions):
+
+```sql
+SELECT session_id, MIN(ts) AS start_ts, COUNT(*) AS hits
+FROM messages_text
+WHERE text_content ILIKE '%--since-days 30%'
+GROUP BY session_id
+ORDER BY start_ts DESC;
+```
+
+Distinctive dollar amount lifted from a dry-run cost table:
+
+```sql
+SELECT DISTINCT session_id
+FROM messages_text
+WHERE text_content ILIKE '%$177.64%';
+```
+
+**Anti-pattern:** rephrasing the same `claude-sql search` call three
+times. If rank 1 is ambiguous or the same session keeps drifting out
+of the top-k, switch modality (semantic → literal), not phrasing.
+
 ### 3. The longest session of the last week
 
 ```sql

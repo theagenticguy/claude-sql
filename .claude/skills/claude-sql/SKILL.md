@@ -49,6 +49,17 @@ repo or `uv tool install --from . claude-sql`.
    If embeddings don't exist yet, run `claude-sql embed --since-days N`
    first.
 
+   **Finding *the one* session, not a theme?** If the user wants a
+   specific session ("the one where I ran the full pipeline on 30
+   days") and the topic is frequent in the corpus, semantic search
+   will return many near-ties ranked by generic boilerplate. Prefer a
+   literal `ILIKE` on a distinctive token — an exact flag
+   (`%--since-days 30%`), a dollar amount from a cost table
+   (`%$177.64%`), a specific error string, or the precise command the
+   user ran. If the first `search` call returns >3 plausible sessions
+   at similar `sim`, stop rephrasing and pivot to `claude-sql query`
+   with SQL — rephrasing the same semantic query rarely breaks ties.
+
 3. **Need classifications or trajectory?** (autonomy tier, work
    category, success, sentiment arc, conflicts): these are LLM outputs.
    Run the relevant `claude-sql classify|trajectory|conflicts` command
@@ -90,6 +101,10 @@ Full per-command flags and examples are in `references/commands.md`.
 - **Always pass `--format json`** when scripting the CLI from an agent. The
   default (`auto`) already picks JSON off a TTY, but being explicit makes
   the invocation portable.
+- **Run `claude-sql schema --format json` once at the start** to cache the
+  real column names before writing ad-hoc SQL. The base view is
+  `messages_text` with a `text_content` column (not `content`) — guessing
+  costs a round-trip on a Binder Error.
 - **Before `search` or an analytics query, run `claude-sql list-cache
   --format json`** to confirm the backing parquet exists. An empty
   embeddings cache means `search` exits with code `2`; an unpopulated

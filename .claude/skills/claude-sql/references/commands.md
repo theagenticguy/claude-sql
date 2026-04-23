@@ -125,6 +125,20 @@ claude-sql search "..." --format ndjson | jq -r '.session_id' | sort -u
 Flags:
 - `--k N` (default 10)
 
+**When NOT to use.** Pinpointing a single known session in a corpus where
+the topic is common (e.g. "the one claude-sql session where I ran over 30
+days") — semantic similarity will rank dozens of near-ties by generic
+boilerplate and the target often sits outside the top-k. Use
+`claude-sql query` with `ILIKE` on a distinctive token instead:
+
+```bash
+claude-sql query "SELECT DISTINCT session_id FROM messages_text \
+  WHERE text_content ILIKE '%--since-days 30%'"
+```
+
+Rule of thumb: if the first `search` call returns >3 plausible hits at
+similar `sim`, switch to SQL rather than rephrasing the query.
+
 ## `classify`
 
 Sonnet 4.6 classifies each session on autonomy_tier (1/2/3), work_category,
