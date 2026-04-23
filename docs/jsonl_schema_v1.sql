@@ -1,18 +1,18 @@
 -- jsonl_schema_v1.sql
--- Captured from ~/.claude/projects/ (9,503 top-level sessions,
--- 3,145 subagent sessions, 10,077 TodoWrite events) on 2026-04-19.
--- Produced by `uv run claude-sql schema`.
+-- Snapshot of the v1 views registered by `claude-sql` over
+-- ~/.claude/projects/**/*.jsonl.
 --
 -- See docs/research_notes.md for why these views are shaped the way they are,
 -- and docs/cookbook.md for usable recipes built on top of them.
 --
 -- File extension is .sql for editor syntax highlighting, but the payload is
 -- DESCRIBE output (column_name + column_type), not executable DDL. The real
--- DDL lives in src/claude_sql/sql_views.py (register_views).
+-- DDL lives in src/claude_sql/sql_views.py (register_views). The v2
+-- analytics views (session_classifications, message_trajectory,
+-- session_conflicts, message_clusters, cluster_terms, session_communities,
+-- user_friction) are parquet-backed; see docs/analytics_cookbook.md.
 --
--- 11 views + 6 claude-sql macros (model_used, cost_estimate, tool_rank,
--- todo_velocity, subagent_fanout, semantic_search) are registered by
--- `register_all()`. Regenerate with: `uv run claude-sql schema`.
+-- Regenerate this file with: `claude-sql schema`.
 
 -- =====================================================================
 -- sessions (8 cols)
