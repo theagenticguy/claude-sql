@@ -201,11 +201,70 @@ CREATE VIEW subagent_messages (
 );
 
 -- =====================================================================
--- Macros (6 claude-sql + DuckDB built-ins)
---   model_used(sid)         -> VARCHAR    latest model used in a session
---   cost_estimate(sid)      -> DOUBLE     USD via config.DEFAULT_PRICING
---   tool_rank(last_n_days)  -> TABLE      tool_name, n (call count)
---   todo_velocity(sid)      -> DOUBLE     completed / distinct todos
---   subagent_fanout(sid)    -> BIGINT     count of subagent runs for session
---   semantic_search(qv, k)  -> TABLE      uuid, sim, distance via HNSW
+-- skill_invocations (7 cols)
+--   Every Skill invocation observable in the transcripts, unioned across
+--   the two shapes: the assistant's ``Skill`` tool call (source='tool')
+--   and the user's <command-name>/<name></command-name> slash command
+--   (source='slash_command').  skill_id stays raw so bare ('erpaval')
+--   and namespaced ('personal-plugins:erpaval') live side by side.
+-- =====================================================================
+CREATE VIEW skill_invocations (
+    session_id           UUID,
+    ts                   TIMESTAMP,
+    message_uuid         UUID,
+    source               VARCHAR,      -- 'tool' | 'slash_command'
+    skill_id             VARCHAR,
+    args                 VARCHAR,
+    tool_use_id          VARCHAR
+);
+
+-- =====================================================================
+-- skills_catalog (9 cols) -- parquet-backed, populated by
+--   ``claude-sql skills sync``.  Walks ~/.claude/skills/ and
+--   ~/.claude/plugins/cache/** for SKILL.md + commands/*.md files.
+-- =====================================================================
+CREATE VIEW skills_catalog (
+    skill_id             VARCHAR,      -- bare ('erpaval') or 'plugin:name'
+    name                 VARCHAR,      -- bare name, never namespaced
+    plugin               VARCHAR,      -- owning plugin or NULL for user skills
+    plugin_version       VARCHAR,
+    source_kind          VARCHAR,      -- user-skill | plugin-skill | plugin-command | builtin
+    description          VARCHAR,
+    argument_hint        VARCHAR,
+    source_path          VARCHAR,      -- absolute path, for audit
+    synced_at            TIMESTAMP
+);
+
+-- =====================================================================
+-- skill_usage (13 cols) -- LEFT JOIN of skill_invocations against
+--   skills_catalog on skill_id.  Falls back to skill_id pass-through
+--   when the catalog parquet is missing.
+-- =====================================================================
+CREATE VIEW skill_usage (
+    session_id           UUID,
+    ts                   TIMESTAMP,
+    message_uuid         UUID,
+    source               VARCHAR,
+    skill_id             VARCHAR,
+    args                 VARCHAR,
+    tool_use_id          VARCHAR,
+    skill_name           VARCHAR,
+    plugin               VARCHAR,
+    plugin_version       VARCHAR,
+    description          VARCHAR,
+    source_kind          VARCHAR,
+    is_builtin           BOOLEAN
+);
+
+-- =====================================================================
+-- Macros (claude-sql + DuckDB built-ins)
+--   model_used(sid)             -> VARCHAR    latest model used in a session
+--   cost_estimate(sid)          -> DOUBLE     USD via config.DEFAULT_PRICING
+--   tool_rank(last_n_days)      -> TABLE      tool_name, n (call count)
+--   todo_velocity(sid)          -> DOUBLE     completed / distinct todos
+--   subagent_fanout(sid)        -> BIGINT     count of subagent runs for session
+--   semantic_search(qv, k)      -> TABLE      uuid, sim, distance via HNSW
+--   skill_rank(last_n_days)     -> TABLE      skill leaderboard (tool + slash counts)
+--   skill_source_mix(last_n_days) -> TABLE    per skill: n_tool vs n_slash
+--   unused_skills(last_n_days)  -> TABLE      catalog entries never invoked in window
 -- =====================================================================

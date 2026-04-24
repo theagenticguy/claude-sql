@@ -373,6 +373,93 @@ LIMIT 10;
 Primary use case: given an interesting message, surface other times you
 asked the same question or hit the same bug.
 
+## 6. Skills
+
+`skill_invocations` captures every way a user or the assistant reaches for a
+named Skill in the transcripts:
+
+- `source = 'tool'` — the assistant invoked the built-in `Skill` tool with
+  `tool_input = {"skill": "<name>", "args": "..."}`.
+- `source = 'slash_command'` — the user typed `/<name>` in chat, which
+  Claude Code serializes as `<command-name>/<name></command-name>` inside
+  the user-role text block.
+
+`skills_catalog` is the seedable side — a parquet written by
+`claude-sql skills sync` that walks `~/.claude/skills/` and
+`~/.claude/plugins/cache/**` to bind a `skill_id` (bare *and* namespaced
+`plugin:name`) to its human description, owning plugin, and version.
+Built-in slash commands (`/clear`, `/compact`, `/plugin`, `/mcp`, …) are
+also seeded and tagged with `source_kind = 'builtin'`. The
+`skill_usage` view joins the two so every row is enriched with
+`skill_name`, `plugin`, and `is_builtin`.
+
+### 6.1 Seed the catalog
+
+```bash
+claude-sql skills sync
+```
+
+Run it whenever you install or upgrade a plugin. The output parquet is
+cheap to rebuild (filesystem walk, no Bedrock). `claude-sql analyze`
+runs it automatically as step 0; pass `--skip-skills-sync` to freeze the
+catalog.
+
+### 6.2 Top skills in the last 30 days
+
+```sql
+SELECT * FROM skill_rank(30) LIMIT 20;
+```
+
+Returns `skill_id, skill_name, plugin, is_builtin, n, sessions`. Filter
+out the built-ins to focus on real skills:
+
+```sql
+SELECT skill_id, skill_name, plugin, n, sessions
+FROM skill_rank(30)
+WHERE NOT is_builtin
+ORDER BY n DESC
+LIMIT 20;
+```
+
+### 6.3 How is each skill invoked?
+
+`/erpaval` from chat and an assistant-driven `Skill` call are two valid
+shapes — `skill_source_mix` splits them.
+
+```sql
+SELECT * FROM skill_source_mix(30) LIMIT 15;
+```
+
+Returns `skill_id, skill_name, n_tool, n_slash, n_total`. Built-ins are
+excluded — they'd drown the rest. A skill with `n_tool = 0, n_slash > 0`
+is one you drive by hand; `n_tool > 0, n_slash = 0` is one you let the
+agent reach for.
+
+### 6.4 Skills you have but never use
+
+```sql
+SELECT * FROM unused_skills(30) LIMIT 20;
+```
+
+Returns every `user-skill` / `plugin-skill` / `plugin-command` in the
+catalog that the window missed. Useful after installing a big plugin
+pack — lets you spot the skills that never caught on.
+
+### 6.5 Join through to see what a skill is *for*
+
+Chain `skill_usage` back to `messages_text` to read the actual user
+intent behind each invocation:
+
+```sql
+SELECT su.ts, su.source, su.skill_name, su.plugin,
+       substr(mt.text_content, 1, 160) AS context
+FROM skill_usage su
+JOIN messages_text mt ON mt.uuid = su.message_uuid
+WHERE su.skill_id = 'erpaval'
+ORDER BY su.ts DESC
+LIMIT 10;
+```
+
 ## Explain: prove the pushdown
 
 ```bash

@@ -183,7 +183,14 @@ claude-sql friction --no-dry-run --since-days 14
 claude-sql query "SELECT * FROM friction_counts(14)"
 claude-sql query "SELECT * FROM friction_examples('unmet_expectation', 10)"
 
-# Full analytics pipeline.
+# Seed the Skills catalog from ~/.claude/skills + ~/.claude/plugins/cache.
+claude-sql skills sync
+claude-sql skills ls --kind plugin-skill | head
+claude-sql query "SELECT * FROM skill_rank(30) LIMIT 15"
+claude-sql query "SELECT * FROM skill_source_mix(30) WHERE skill_id LIKE '%erpaval%'"
+claude-sql query "SELECT * FROM unused_skills(30) LIMIT 20"
+
+# Full analytics pipeline (includes a zero-cost `skills sync` at step 0).
 claude-sql analyze --since-days 30 --no-dry-run
 ```
 
@@ -213,6 +220,8 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `friction` | Regex + Sonnet 4.6 → status pings, unmet expectations, confusion, etc. |
 | `cluster` | UMAP → HDBSCAN → c-TF-IDF over message embeddings |
 | `community` | Louvain over session centroids |
+| `skills sync` | Walk `~/.claude/skills/` + `~/.claude/plugins/cache/` → seedable skills catalog |
+| `skills ls` | List catalog entries, filterable by `--kind` and `--plugin` |
 | `analyze` | Run the whole pipeline in dependency order |
 
 ### Agent-friendly defaults
@@ -250,6 +259,7 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `todo_events` | one row per todo per `TodoWrite` snapshot | `subject`, `status`, `snapshot_ix` |
 | `todo_state_current` | latest status per `(session, subject)` | `status`, `written_at` |
 | `task_spawns` | `Task` / `Agent` / `TaskCreate` launch sites | `subagent_type`, `prompt` |
+| `skill_invocations` | every `Skill` tool call + `<command-name>/foo</command-name>` user slash | `source` (`tool` / `slash_command`), `skill_id`, `args` |
 | `subagent_sessions` | rolled-up subagent runs | `parent_session_id`, `agent_hex`, `agent_type`, `description`, `started_at`, `ended_at`, `message_count`, `transcript_path` |
 | `subagent_messages` | user + assistant events from subagent transcripts | `uuid`, `parent_session_id` |
 | `session_classifications` | one row per classified session | `autonomy_tier`, `work_category`, `success`, `goal` |
@@ -260,6 +270,8 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `cluster_terms` | c-TF-IDF top terms per cluster | `cluster_id`, `term`, `weight`, `rank` |
 | `session_communities` | Louvain community per session | `community_id`, `size` |
 | `user_friction` | one row per classified short user message | `label` (7-way), `rationale`, `source` (`regex` / `llm` / `refused`), `confidence` |
+| `skills_catalog` | one row per known skill / slash command (seed by `claude-sql skills sync`) | `skill_id`, `name`, `plugin`, `plugin_version`, `source_kind` (`user-skill` / `plugin-skill` / `plugin-command` / `builtin`), `description` |
+| `skill_usage` | `skill_invocations` ⟕ `skills_catalog` | `source`, `skill_id`, `skill_name`, `plugin`, `is_builtin`, `description` |
 
 ## Macros
 
@@ -280,6 +292,9 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `friction_counts(since_days)` | table | Count + session breadth per friction label |
 | `friction_rate(since_days)` | table | Per-session friction pressure vs. user message count |
 | `friction_examples(label, n)` | table | Top-N example messages for a friction label |
+| `skill_rank(last_n_days)` | table | Skill / slash leaderboard over a window (counts both `tool` and `slash_command` sources) |
+| `skill_source_mix(last_n_days)` | table | Per skill `n_tool` vs. `n_slash` — how is each skill invoked? |
+| `unused_skills(last_n_days)` | table | Catalog entries with zero invocations in the window (needs `skills sync`) |
 
 ## Environment variables
 
@@ -298,6 +313,9 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings.parquet` | Embeddings cache |
 | `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction.parquet` | Friction cache |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Short-message cutoff for the friction classifier |
+| `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `~/.claude/skills_catalog.parquet` | Skills catalog parquet |
+| `CLAUDE_SQL_USER_SKILLS_DIR` | `~/.claude/skills` | Root scanned for user-installed skills |
+| `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `~/.claude/plugins/cache` | Root scanned for plugin skills + commands |
 | `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Louvain determinism |
 
 ## Development

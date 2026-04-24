@@ -41,6 +41,7 @@ from claude_sql import freeze as _freeze
 from claude_sql import judge_worker as _judge_worker
 from claude_sql import judges as _judge_catalog
 from claude_sql import kappa_worker as _kappa_worker
+from claude_sql import skills_catalog as _skills_catalog
 from claude_sql import ungrounded_worker as _ungrounded_worker
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
@@ -541,6 +542,7 @@ def list_cache(*, common: Common | None = None) -> None:
     * cluster_terms           → ``claude-sql terms``
     * session_communities     → ``claude-sql community``
     * user_friction           → ``claude-sql friction --no-dry-run``
+    * skills_catalog          → ``claude-sql skills sync``
     """
     _configure(common)
     settings = _resolve_settings(common)
@@ -554,6 +556,7 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
         _describe_cache_entry("session_communities", settings.communities_parquet_path),
         _describe_cache_entry("user_friction", settings.user_friction_parquet_path),
+        _describe_cache_entry("skills_catalog", settings.skills_catalog_parquet_path),
         _describe_checkpoint_entry(settings.checkpoint_db_path),
     ]
 
@@ -572,6 +575,111 @@ def list_cache(*, common: Common | None = None) -> None:
         emit_dataframe(pl.DataFrame(entries), OutputFormat.CSV)
         return
     emit_json(entries, fmt)
+
+
+# ---------------------------------------------------------------------------
+# ``skills`` sub-app — catalog of locally-available Skills and slash commands.
+# ---------------------------------------------------------------------------
+
+skills_app = App(
+    name="skills",
+    help=(
+        "Seed and inspect the local Skills catalog.\n\n"
+        "The catalog binds skill_id (e.g. 'erpaval', 'personal-plugins:erpaval') "
+        "to its human description, source plugin, and version so skill_usage can "
+        "enrich raw invocations. Seeded from ~/.claude/skills/ and "
+        "~/.claude/plugins/cache/**; no Bedrock cost."
+    ),
+)
+app.command(skills_app)
+
+
+@skills_app.command(name="sync")
+def skills_sync(
+    *,
+    dry_run: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Walk ``~/.claude/skills`` and ``~/.claude/plugins/cache`` → skills_catalog.parquet.
+
+    Sources
+    -------
+    * ``~/.claude/skills/<name>/SKILL.md``                        → ``user-skill``
+    * ``<plugins_cache>/<owner>/<plugin>/<v>/skills/<n>/SKILL.md``
+      → ``plugin-skill`` (bare + ``<plugin>:<n>``)
+    * ``<plugins_cache>/<owner>/<plugin>/<v>/commands/<n>.md``
+      → ``plugin-command`` (bare + ``<plugin>:<n>``)
+    * Built-in slash commands (``/clear``, ``/compact``, …)       → ``builtin``
+
+    Cost: zero (pure filesystem walk).  Run whenever you install or
+    upgrade a plugin; ``claude-sql analyze`` runs it automatically.
+
+    Flags
+    -----
+    --dry-run  Count rows without writing the parquet.  Useful for
+               previewing how many skills will be catalogued.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    stats = _skills_catalog.sync(settings, dry_run=dry_run)
+    target = "would write" if dry_run else "wrote"
+    logger.info(
+        "skills sync: {} {} rows to {} ({} skills, {} commands, {} builtins)",
+        target,
+        stats["rows"],
+        settings.skills_catalog_parquet_path,
+        stats["skills"],
+        stats["commands"],
+        stats["builtins"],
+    )
+
+
+@skills_app.command(name="ls")
+def skills_ls(
+    *,
+    kind: str | None = None,
+    plugin: str | None = None,
+    common: Common | None = None,
+) -> None:
+    """List entries from the skills catalog parquet.
+
+    Run ``claude-sql skills sync`` first.  Emits the catalog in the
+    shared ``--format`` shape (table on TTY, JSON on pipe).
+
+    Flags
+    -----
+    --kind <value>    Filter by ``source_kind`` (``user-skill``,
+                      ``plugin-skill``, ``plugin-command``, ``builtin``).
+    --plugin <value>  Filter by plugin name (exact match).
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
+    path = settings.skills_catalog_parquet_path
+    if not path.exists():
+        logger.error(
+            "skills catalog parquet missing at {}. Run `claude-sql skills sync` first.",
+            path,
+        )
+        sys.exit(EXIT_CODES["no_embeddings"])
+    df = pl.read_parquet(path)
+    if kind is not None:
+        df = df.filter(pl.col("source_kind") == kind)
+    if plugin is not None:
+        df = df.filter(pl.col("plugin") == plugin)
+    df = df.sort(["source_kind", "plugin", "name"], nulls_last=True)
+    if fmt is OutputFormat.TABLE:
+        emit_dataframe(df, OutputFormat.TABLE)
+        return
+    if fmt is OutputFormat.CSV:
+        emit_dataframe(df, OutputFormat.CSV)
+        return
+    if fmt is OutputFormat.NDJSON:
+        for row in df.iter_rows(named=True):
+            sys.stdout.write(json.dumps(row, default=str))
+            sys.stdout.write("\n")
+        return
+    emit_json(df.to_dicts(), fmt)
 
 
 @app.command
@@ -1055,6 +1163,7 @@ def analyze(
     skip_friction: bool = False,
     skip_cluster: bool = False,
     skip_community: bool = False,
+    skip_skills_sync: bool = False,
     force_cluster: bool = False,
     force_community: bool = False,
     common: Common | None = None,
@@ -1063,6 +1172,7 @@ def analyze(
 
     Stages (in order)
     -----------------
+    0. skills sync  (filesystem walk; zero-cost; produces skills_catalog.parquet)
     1. embed        (Bedrock Cohere Embed v4; honors --dry-run)
     2. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
     3. terms        (c-TF-IDF labels for clusters; zero-cost)
@@ -1106,6 +1216,20 @@ def analyze(
 
     _configure(common)
     settings = _resolve_settings(common)
+
+    # 0. Skills catalog sync (filesystem walk, zero cost).  Runs even in
+    # --dry-run because it does not hit Bedrock; opt out via
+    # --skip-skills-sync if you want to keep the parquet frozen.
+    if not skip_skills_sync:
+        stats = _skills_catalog.sync(settings)
+        logger.info(
+            "analyze/skills: wrote {} rows to {} ({} skills, {} commands, {} builtins)",
+            stats["rows"],
+            settings.skills_catalog_parquet_path,
+            stats["skills"],
+            stats["commands"],
+            stats["builtins"],
+        )
 
     # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
     if not skip_embed:

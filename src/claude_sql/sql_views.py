@@ -62,6 +62,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "todo_events",
     "todo_state_current",
     "task_spawns",
+    "skill_invocations",
     "subagent_sessions",
     "subagent_messages",
     # v2 analytics views (materialize when the matching parquet exists).
@@ -73,6 +74,8 @@ VIEW_NAMES: tuple[str, ...] = (
     "cluster_terms",
     "session_communities",
     "user_friction",
+    "skills_catalog",
+    "skill_usage",
 )
 
 # Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
@@ -88,6 +91,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "cluster_terms",
     "session_communities",
     "user_friction",
+    "skills_catalog",
 )
 
 # Macro names registered by :func:`register_macros`.  The first six are the
@@ -101,6 +105,8 @@ MACRO_NAMES: tuple[str, ...] = (
     "todo_velocity",
     "subagent_fanout",
     "semantic_search",
+    "skill_rank",
+    "skill_source_mix",
     # v2 analytics macros
     "autonomy_trend",
     "work_mix",
@@ -111,6 +117,7 @@ MACRO_NAMES: tuple[str, ...] = (
     "friction_counts",
     "friction_rate",
     "friction_examples",
+    "unused_skills",
 )
 
 
@@ -475,6 +482,73 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.debug("Registered view: task_spawns")
 
+        # Every Skill / slash-command invocation observable in the transcripts,
+        # unioned across the two shapes they take:
+        #
+        # * ``tool`` — the assistant invokes the built-in ``Skill`` tool with
+        #   ``tool_input.skill = '<name>'``.  Lives in ``tool_calls`` already.
+        # * ``slash_command`` — the user types ``/<name>`` in chat, which
+        #   Claude Code serializes into the text block as
+        #   ``<command-name>/<name></command-name>`` (sometimes paired with
+        #   ``<command-message>`` and ``<command-args>``).
+        #
+        # ``skill_id`` stays raw (``erpaval`` and ``personal-plugins:erpaval``
+        # are distinct rows) — the ``skills_catalog`` seed emits both shapes
+        # so the enriched ``skill_usage`` view joins cleanly either way.
+        # ``<command-name>/<name></command-name>`` slash-command text lands in
+        # two shapes across the corpus: inside a ``text`` block of a
+        # list-typed ``content`` array (newer transcripts), and as a bare
+        # VARCHAR ``message.content`` (older user turns).  We scan both
+        # so the slash-command surface isn't biased toward one era.
+        cmd_name_re = "<command-name>/([A-Za-z0-9_:.-]+)</command-name>"
+        args_re = "<command-args>([^<]*)</command-args>"
+        con.execute(
+            f"""
+            CREATE OR REPLACE VIEW skill_invocations AS
+            SELECT
+                tc.session_id,
+                tc.ts,
+                tc.message_uuid,
+                'tool'                                        AS source,
+                json_extract_string(tc.tool_input, '$.skill') AS skill_id,
+                json_extract_string(tc.tool_input, '$.args')  AS args,
+                tc.tool_use_id
+            FROM tool_calls tc
+            WHERE tc.tool_name = 'Skill'
+              AND json_extract_string(tc.tool_input, '$.skill') IS NOT NULL
+            UNION ALL
+            SELECT
+                cb.session_id,
+                cb.ts,
+                cb.message_uuid,
+                'slash_command'                                    AS source,
+                regexp_extract(cb.text, '{cmd_name_re}', 1)        AS skill_id,
+                NULLIF(regexp_extract(cb.text, '{args_re}', 1), '') AS args,
+                NULL                                                AS tool_use_id
+            FROM content_blocks cb
+            WHERE cb.role = 'user'
+              AND cb.block_type = 'text'
+              AND cb.text LIKE '%<command-name>/%'
+              AND regexp_extract(cb.text, '{cmd_name_re}', 1) != ''
+            UNION ALL
+            SELECT
+                m.session_id,
+                m.ts,
+                m.uuid                                                 AS message_uuid,
+                'slash_command'                                        AS source,
+                regexp_extract(raw.txt, '{cmd_name_re}', 1)            AS skill_id,
+                NULLIF(regexp_extract(raw.txt, '{args_re}', 1), '')    AS args,
+                NULL                                                   AS tool_use_id
+            FROM messages m,
+                 LATERAL (SELECT json_extract_string(m.content_json, '$') AS txt) raw
+            WHERE m.role = 'user'
+              AND json_type(m.content_json) = 'VARCHAR'
+              AND raw.txt LIKE '%<command-name>/%'
+              AND regexp_extract(raw.txt, '{cmd_name_re}', 1) != '';
+            """
+        )
+        logger.debug("Registered view: skill_invocations")
+
         con.execute(
             """
             CREATE OR REPLACE VIEW subagent_sessions AS
@@ -690,9 +764,55 @@ def register_macros(
         """
     )
 
+    # Skill / slash-command leaderboard over the last N days.  Resolves
+    # against ``skill_usage``, which always exists (with or without the
+    # catalog), so this macro is safe to register unconditionally.
+    _safe_macro(
+        con,
+        "skill_rank",
+        """
+        CREATE OR REPLACE MACRO skill_rank(last_n_days) AS TABLE (
+            SELECT skill_id,
+                   skill_name,
+                   plugin,
+                   is_builtin,
+                   count(*)                   AS n,
+                   count(DISTINCT session_id) AS sessions
+              FROM skill_usage
+             WHERE ts >= current_timestamp - (last_n_days * INTERVAL 1 DAY)
+             GROUP BY 1, 2, 3, 4
+             ORDER BY n DESC
+        );
+        """,
+    )
+
+    # How is each skill invoked? ``n_tool`` comes from the ``Skill`` tool,
+    # ``n_slash`` from user-typed ``/<name>`` in chat.  Built-ins are
+    # excluded because they're almost always slash-only and would drown
+    # everything else out.
+    _safe_macro(
+        con,
+        "skill_source_mix",
+        """
+        CREATE OR REPLACE MACRO skill_source_mix(last_n_days) AS TABLE (
+            SELECT skill_id,
+                   skill_name,
+                   count(*) FILTER (WHERE source = 'tool')          AS n_tool,
+                   count(*) FILTER (WHERE source = 'slash_command') AS n_slash,
+                   count(*)                                         AS n_total
+              FROM skill_usage
+             WHERE ts >= current_timestamp - (last_n_days * INTERVAL 1 DAY)
+               AND NOT is_builtin
+             GROUP BY 1, 2
+             ORDER BY n_total DESC
+        );
+        """,
+    )
+
     logger.debug(
         "Registered macros: model_used, cost_estimate, tool_rank, "
-        "todo_velocity, subagent_fanout, semantic_search"
+        "todo_velocity, subagent_fanout, semantic_search, skill_rank, "
+        "skill_source_mix"
     )
 
     # ------------------------------------------------------------------
@@ -911,6 +1031,35 @@ def register_macros(
         """,
     )
 
+    # Catalog entries the user has NOT invoked in the last N days.  Pure
+    # catalog lookup; ``skills_catalog`` may be missing pre-sync, so this
+    # is wrapped in ``_safe_macro`` and skipped cleanly in that case.
+    # ``source_kind`` filter keeps out the 'builtin' rows (users don't
+    # install or uninstall ``/clear``).
+    _safe_macro(
+        con,
+        "unused_skills",
+        """
+        CREATE OR REPLACE MACRO unused_skills(last_n_days) AS TABLE (
+            SELECT cat.skill_id,
+                   cat.name,
+                   cat.plugin,
+                   cat.plugin_version,
+                   cat.source_kind,
+                   cat.description
+              FROM skills_catalog cat
+              LEFT JOIN (
+                  SELECT DISTINCT skill_id
+                    FROM skill_invocations
+                   WHERE ts >= current_timestamp - (last_n_days * INTERVAL 1 DAY)
+              ) used USING (skill_id)
+             WHERE used.skill_id IS NULL
+               AND cat.source_kind IN ('user-skill', 'plugin-skill', 'plugin-command')
+             ORDER BY cat.plugin NULLS FIRST, cat.name
+        );
+        """,
+    )
+
 
 # ---------------------------------------------------------------------------
 # VSS
@@ -1052,6 +1201,7 @@ def register_analytics(
     cluster_terms_parquet: Path | None = None,
     communities_parquet: Path | None = None,
     user_friction_parquet: Path | None = None,
+    skills_catalog_parquet: Path | None = None,
 ) -> None:
     """Register v2 analytics parquets as DuckDB views.
 
@@ -1109,6 +1259,9 @@ def register_analytics(
         "user_friction": user_friction_parquet
         if user_friction_parquet is not None
         else resolved.user_friction_parquet_path,
+        "skills_catalog": skills_catalog_parquet
+        if skills_catalog_parquet is not None
+        else resolved.skills_catalog_parquet_path,
     }
 
     # View projections keyed by view name. A ``None`` projection means
@@ -1162,6 +1315,58 @@ def register_analytics(
             logger.debug("Registered analytics view: session_goals")
         except duckdb.Error:
             logger.exception("Failed to register session_goals view")
+
+    # ``skill_usage`` joins ``skill_invocations`` (always-on) against the
+    # catalog for human-readable labels + ``is_builtin`` tagging.  When the
+    # catalog parquet is absent the view still works, but every row gets a
+    # ``skill_name = skill_id`` pass-through and ``is_builtin = false``.
+    try:
+        if "skills_catalog" in registered:
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW skill_usage AS
+                SELECT
+                    si.session_id,
+                    si.ts,
+                    si.message_uuid,
+                    si.source,
+                    si.skill_id,
+                    si.args,
+                    si.tool_use_id,
+                    coalesce(cat.name, si.skill_id)               AS skill_name,
+                    cat.plugin                                    AS plugin,
+                    cat.plugin_version                            AS plugin_version,
+                    cat.description                               AS description,
+                    cat.source_kind                               AS source_kind,
+                    coalesce(cat.source_kind = 'builtin', false)  AS is_builtin
+                FROM skill_invocations si
+                LEFT JOIN skills_catalog cat ON cat.skill_id = si.skill_id;
+                """
+            )
+        else:
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW skill_usage AS
+                SELECT
+                    si.session_id,
+                    si.ts,
+                    si.message_uuid,
+                    si.source,
+                    si.skill_id,
+                    si.args,
+                    si.tool_use_id,
+                    si.skill_id                          AS skill_name,
+                    CAST(NULL AS VARCHAR)                AS plugin,
+                    CAST(NULL AS VARCHAR)                AS plugin_version,
+                    CAST(NULL AS VARCHAR)                AS description,
+                    CAST(NULL AS VARCHAR)                AS source_kind,
+                    false                                AS is_builtin
+                FROM skill_invocations si;
+                """
+            )
+        logger.debug("Registered analytics view: skill_usage")
+    except duckdb.Error:
+        logger.exception("Failed to register skill_usage view")
 
 
 def register_all(

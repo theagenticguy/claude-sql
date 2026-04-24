@@ -61,6 +61,18 @@ def _default_user_friction_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/user_friction.parquet"))
 
 
+def _default_skills_catalog_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/skills_catalog.parquet"))
+
+
+def _default_user_skills_dir() -> Path:
+    return Path(os.path.expanduser("~/.claude/skills"))
+
+
+def _default_plugins_cache_dir() -> Path:
+    return Path(os.path.expanduser("~/.claude/plugins/cache"))
+
+
 def _default_checkpoint_db() -> Path:
     return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
 
@@ -166,6 +178,20 @@ class Settings(BaseSettings):
     #: "why?"); long messages are almost always on-topic turns.  300 chars
     #: captures ~95% of the interesting class without bloating Bedrock cost.
     friction_max_chars: int = 300
+
+    #: Catalog of locally-available Skills and slash commands, produced by
+    #: ``claude-sql skills sync`` (see :mod:`claude_sql.skills_catalog`).
+    #: Backs the ``skills_catalog`` view, the ``skill_usage`` enrichment join,
+    #: and the ``unused_skills`` macro.  Walked from :attr:`user_skills_dir`
+    #: and :attr:`plugins_cache_dir`.
+    skills_catalog_parquet_path: Path = Field(default_factory=_default_skills_catalog_parquet)
+    #: Root of user-level skills (each entry has a ``SKILL.md``).
+    user_skills_dir: Path = Field(default_factory=_default_user_skills_dir)
+    #: Root of the plugins cache maintained by Claude Code.  The walker
+    #: expects ``<owner>/<plugin>/<version>/`` underneath, each with a
+    #: ``.claude-plugin/plugin.json`` and ``skills/`` / ``commands/`` subdirs.
+    plugins_cache_dir: Path = Field(default_factory=_default_plugins_cache_dir)
+
     #: Per-(session_id, pipeline) checkpoint DuckDB file. See ``checkpointer.py``.
     checkpoint_db_path: Path = Field(default_factory=_default_checkpoint_db)
 
