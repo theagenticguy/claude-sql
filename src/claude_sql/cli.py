@@ -408,8 +408,46 @@ def shell(*, common: Common | None = None) -> None:
         sys.exit(EXIT_CODES["duckdb_missing"])
 
 
+def _profile_path_for(label: str) -> Path:
+    """Build the destination path used by ``--profile-json``.
+
+    Splits filename composition out of the writer so callers can configure
+    DuckDB's ``profiling_output`` PRAGMA before the profiled query runs
+    (DuckDB writes the JSON itself; we just read it back to confirm the
+    file landed and surface its location to the user).
+    """
+    profiling_dir = Path(os.path.expanduser("~/.claude/profiling/"))
+    profiling_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "profile"
+    return profiling_dir / f"{safe_label}-{int(time.time() * 1000)}.json"
+
+
+def _capture_profile(con: duckdb.DuckDBPyConnection, label: str) -> Path:
+    """Run a profiled query and return where DuckDB persisted the JSON output.
+
+    Caller must have set ``enable_profiling = 'json'`` and pointed
+    ``profiling_output`` at a file *before* executing the query of
+    interest. We synthesize the output path here, set the PRAGMAs, and
+    return the path the next query will populate. The caller is
+    responsible for executing exactly one statement after this returns.
+    """
+    out_path = _profile_path_for(label)
+    # Escape single-quotes in the path for the SQL literal; tmp paths can
+    # contain unusual characters under pytest.
+    safe_path = str(out_path).replace("'", "''")
+    con.execute("SET enable_profiling = 'json'")
+    con.execute(f"SET profiling_output = '{safe_path}'")
+    return out_path
+
+
 @app.command
-def query(sql: str, /, *, common: Common | None = None) -> None:
+def query(
+    sql: str,
+    /,
+    *,
+    profile_json: bool = False,
+    common: Common | None = None,
+) -> None:
     """Run one SQL query against the claude-sql catalog and emit results.
 
     When to use
@@ -466,8 +504,13 @@ def query(sql: str, /, *, common: Common | None = None) -> None:
     fmt = _fmt(common)
     con = _open_connection(settings)
     try:
+        profile_path: Path | None = None
+        if profile_json:
+            profile_path = _capture_profile(con, label="query")
         df = run_or_die(lambda: con.execute(sql).pl(), fmt=fmt)
         emit_dataframe(df, fmt)
+        if profile_path is not None:
+            logger.info("Wrote profile JSON: {}", profile_path)
     finally:
         con.close()
 
@@ -478,6 +521,7 @@ def explain(
     /,
     *,
     analyze: bool = False,
+    profile_json: bool = False,
     common: Common | None = None,
 ) -> None:
     """Show the DuckDB query plan and highlight pushdown / noteworthy operators.
@@ -506,6 +550,9 @@ def explain(
     fmt = resolve_format(_fmt(common))
     con = _open_connection(settings)
     try:
+        profile_path: Path | None = None
+        if profile_json:
+            profile_path = _capture_profile(con, label="explain")
         prefix = "EXPLAIN ANALYZE " if analyze else "EXPLAIN "
         rows = run_or_die(lambda: con.execute(prefix + sql).fetchall(), fmt=fmt)
         # EXPLAIN rows are (type, plan_text) tuples; the plan sits in the last
@@ -519,6 +566,8 @@ def explain(
                     print(line)
         else:
             emit_json({"plan": text}, fmt)
+        if profile_path is not None:
+            logger.info("Wrote profile JSON: {}", profile_path)
     finally:
         con.close()
 
