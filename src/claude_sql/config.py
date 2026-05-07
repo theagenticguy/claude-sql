@@ -31,19 +31,24 @@ def _default_subagent_meta_glob() -> str:
 
 
 def _default_embeddings_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/embeddings.parquet"))
+    # Sharded cache directory (see ``claude_sql.parquet_shards``).  Writers
+    # drop ``part-<ts_ns>.parquet`` files into it; readers glob the directory.
+    # The field name keeps the ``_parquet_path`` suffix so existing call sites
+    # stay stable — only the *semantics* of the path moved from "single file"
+    # to "directory of parts".
+    return Path(os.path.expanduser("~/.claude/embeddings/"))
 
 
 def _default_classifications_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_classifications.parquet"))
+    return Path(os.path.expanduser("~/.claude/session_classifications/"))
 
 
 def _default_trajectory_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/message_trajectory.parquet"))
+    return Path(os.path.expanduser("~/.claude/message_trajectory/"))
 
 
 def _default_conflicts_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_conflicts.parquet"))
+    return Path(os.path.expanduser("~/.claude/session_conflicts/"))
 
 
 def _default_clusters_parquet() -> Path:
@@ -59,7 +64,7 @@ def _default_communities_parquet() -> Path:
 
 
 def _default_user_friction_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/user_friction.parquet"))
+    return Path(os.path.expanduser("~/.claude/user_friction/"))
 
 
 def _default_skills_catalog_parquet() -> Path:

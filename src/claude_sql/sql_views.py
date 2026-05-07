@@ -40,6 +40,7 @@ import duckdb
 from loguru import logger
 
 from claude_sql.config import DEFAULT_PRICING, Settings
+from claude_sql.parquet_shards import iter_part_files
 
 # ---------------------------------------------------------------------------
 # Glob constants
@@ -1070,6 +1071,12 @@ def register_macros(
 def _hnsw_rebuild_needed(parquet: Path, hnsw_db: Path) -> bool:
     """Decide from filesystem state alone whether the parquet has shifted.
 
+    Handles both legacy single-file caches and sharded directories: for a
+    sharded directory we compare against the *latest* part file's mtime so
+    a brand-new shard invalidates the persisted HNSW even when the
+    directory's own mtime hasn't moved (some filesystems update dir mtime
+    only on add/remove, not on touch of children).
+
     This is a *necessary* but not sufficient signal — even when the
     parquet hasn't moved, the attached store might be empty (for instance,
     DuckDB's ATTACH on a missing path creates a ~12 KB header-only file
@@ -1078,9 +1085,13 @@ def _hnsw_rebuild_needed(parquet: Path, hnsw_db: Path) -> bool:
     """
     if not hnsw_db.exists():
         return True
-    if not parquet.exists():
+    parts = iter_part_files(parquet)
+    if not parts:
+        # No source-of-truth on disk yet. The attached store is whatever
+        # was previously persisted; nothing to rebuild from.
         return False
-    return parquet.stat().st_mtime_ns > hnsw_db.stat().st_mtime_ns
+    latest_ns = max(p.stat().st_mtime_ns for p in parts)
+    return latest_ns > hnsw_db.stat().st_mtime_ns
 
 
 def _attached_embeddings_table_present(con: duckdb.DuckDBPyConnection) -> bool:
@@ -1187,7 +1198,8 @@ def register_vss(
         # (cli.py, the ``semantic_search`` macro) keep working unchanged.
         schema_qualifier = "hnsw_store.main."
 
-    if not embeddings_parquet.exists():
+    parts = iter_part_files(embeddings_parquet)
+    if not parts:
         logger.warning(
             "No embeddings parquet at {}; skipping HNSW index build. "
             "Run `claude-sql embed` to backfill.",
@@ -1224,6 +1236,9 @@ def register_vss(
         # CREATE TABLE doesn't trip on an existing index. DROP TABLE
         # cascades to dependent indexes.
         con.execute(f"DROP TABLE IF EXISTS {schema_qualifier}message_embeddings;")
+        # ``parts`` may be a single legacy file or a list of shard files.
+        # Inline-escape each path because DDL doesn't accept prepared params.
+        path_literals = ", ".join(_sql_str(str(p)) for p in parts)
         con.execute(
             f"""
             CREATE TABLE {schema_qualifier}message_embeddings AS
@@ -1232,9 +1247,8 @@ def register_vss(
                 model,
                 dim,
                 CAST(embedding AS FLOAT[{dim_i}]) AS embedding
-            FROM read_parquet(?);
-            """,
-            [str(embeddings_parquet)],
+            FROM read_parquet([{path_literals}]);
+            """
         )
         con.execute(
             f"""
@@ -1279,10 +1293,18 @@ def register_vss(
 
 
 def _parquet_is_populated(path: Path | None) -> bool:
-    """Return True when ``path`` exists on disk with more than header-only bytes."""
+    """Return True when ``path`` has at least one usable parquet under it.
+
+    Handles both legacy single-file caches (``<name>.parquet``) and the
+    sharded directory layout (``<name>/part-<ts>.parquet``).  An empty
+    directory or a single zero-byte file both count as "not populated"
+    so an aborted run can't trick view registration into pointing at
+    rubbish.
+    """
     if path is None:
         return False
-    return path.exists() and path.stat().st_size > 16
+    parts = iter_part_files(path)
+    return any(p.stat().st_size > 16 for p in parts)
 
 
 def register_analytics(
@@ -1386,10 +1408,14 @@ def register_analytics(
             )
             continue
         projection = view_projections.get(view_name) or "*"
+        # Sharded directories list every part file; legacy single-file paths
+        # become a one-element list. ``read_parquet`` accepts both.
+        parts = [p for p in iter_part_files(path) if p.stat().st_size > 16]
+        path_literals = ", ".join(_sql_str(str(p)) for p in parts)
         try:
             con.execute(
                 f"CREATE OR REPLACE VIEW {view_name} AS "
-                f"SELECT {projection} FROM read_parquet({_sql_str(str(path))});"
+                f"SELECT {projection} FROM read_parquet([{path_literals}]);"
             )
             logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)

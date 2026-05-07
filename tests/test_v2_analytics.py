@@ -310,6 +310,42 @@ def test_register_analytics_count_classifications(analytics_settings: Settings) 
     assert count == 10
 
 
+def test_register_analytics_handles_sharded_directory(tmp_path: Path) -> None:
+    """``register_analytics`` must read the union of every ``part-*.parquet``
+    in a sharded cache directory, not just the most recent one.
+
+    This is the critical seam between PR3's directory-of-parts pattern and
+    the SQL view layer: a worker that writes two chunks lands two part
+    files, and the analytics view must surface the rows from both.
+    """
+    # Two shards under one cache directory — exercises the iter_part_files
+    # path inside ``_parquet_is_populated`` and the read_parquet([...]) call.
+    cls_dir = tmp_path / "session_classifications"
+    cls_dir.mkdir()
+    _make_classifications_parquet(cls_dir / "part-1000000000000000000.parquet", n=4)
+    _make_classifications_parquet(cls_dir / "part-2000000000000000000.parquet", n=3)
+
+    settings = Settings(
+        classifications_parquet_path=cls_dir,
+        # Other caches stay missing — register_analytics must still skip
+        # them cleanly when they aren't on disk.
+        trajectory_parquet_path=tmp_path / "missing_traj",
+        conflicts_parquet_path=tmp_path / "missing_conf",
+        clusters_parquet_path=tmp_path / "missing_clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "missing_ter.parquet",
+        communities_parquet_path=tmp_path / "missing_comm.parquet",
+        user_friction_parquet_path=tmp_path / "missing_friction",
+    )
+
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=settings)
+    count = con.execute("SELECT count(*) FROM session_classifications").fetchone()[0]
+    # Union over the two shards: 4 + 3.  Different runs of
+    # ``_make_classifications_parquet`` reuse the same session_id range so
+    # the count is intentionally larger than the per-shard ``n``.
+    assert count == 7
+
+
 def test_analytics_macros_register_safely(analytics_settings: Settings, tmp_path: Path) -> None:
     """register_macros should succeed even when trajectory/conflicts/communities
     parquets are missing (those macros are wrapped in _safe_macro).  v1 macros

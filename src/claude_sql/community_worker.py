@@ -48,6 +48,7 @@ import polars as pl
 from loguru import logger
 
 from claude_sql.config import Settings
+from claude_sql.parquet_shards import iter_part_files
 
 if TYPE_CHECKING:
     import duckdb
@@ -68,14 +69,23 @@ def _load_session_centroids(
     unit L2 length so dot products equal cosine similarity.
     """
     logger.info("Loading message embeddings and joining to sessions...")
-    sql = """
+    # Sharded directory or legacy single file — ``iter_part_files`` returns
+    # one or more parquets that we hand to ``read_parquet`` as a list. DDL
+    # doesn't accept prepared params for the file list, so escape inline.
+    parts = iter_part_files(embeddings_parquet_path)
+    if not parts:
+        raise RuntimeError(
+            f"No embeddings parquet at {embeddings_parquet_path} - run `claude-sql embed`."
+        )
+    path_literals = ", ".join("'{}'".format(str(p).replace("'", "''")) for p in parts)
+    sql = f"""
         SELECT CAST(m.session_id AS VARCHAR) AS session_id,
                e.embedding
-          FROM read_parquet(?) e
+          FROM read_parquet([{path_literals}]) e
           JOIN messages m
             ON CAST(m.uuid AS VARCHAR) = e.uuid
     """
-    df = con.execute(sql, [str(embeddings_parquet_path)]).pl()
+    df = con.execute(sql).pl()
     logger.info("Joined {} rows (messages x embeddings)", len(df))
 
     if len(df) == 0:
