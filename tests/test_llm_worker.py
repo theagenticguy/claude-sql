@@ -84,6 +84,77 @@ def test_invoke_body_drops_thinking_when_disabled() -> None:
     assert "thinking" not in body
 
 
+def test_invoke_body_omits_system_when_not_supplied() -> None:
+    """No system block on the wire when caller passes ``system=None``."""
+    client = _make_mock_client({"output": {"k": "v"}})
+    _invoke_classifier_sync(
+        client,
+        "m",
+        {},
+        "x",
+        max_tokens=128,
+        thinking_mode="disabled",
+    )
+    body = _captured_body(client)
+    assert "system" not in body
+
+
+def test_invoke_body_carries_system_block_with_cache_control() -> None:
+    """A supplied system prompt is sent as a content-block list with
+    ``cache_control: ephemeral`` so Anthropic prompt caching kicks in
+    once the prompt crosses the per-model cacheable minimum."""
+    client = _make_mock_client({"output": {"k": "v"}})
+    sys_prompt = "You are a unit-test classifier. Be terse."
+    _invoke_classifier_sync(
+        client,
+        "m",
+        {},
+        "x",
+        max_tokens=128,
+        thinking_mode="disabled",
+        system=sys_prompt,
+    )
+    body = _captured_body(client)
+    assert isinstance(body["system"], list)
+    assert len(body["system"]) == 1
+    block = body["system"][0]
+    assert block["type"] == "text"
+    assert block["text"] == sys_prompt
+    assert block["cache_control"] == {"type": "ephemeral"}
+
+
+def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
+    """All four pipeline system prompts must cross ~1024 tokens so the
+    ``cache_control`` marker actually triggers a prompt-cache discount.
+    Below the threshold Bedrock silently ignores the header.
+
+    We approximate token count via len(text) // 4 (Anthropic averages
+    around 3.5–4 chars/token for English prose). The constant ``900`` is
+    a conservative guard — real tokenization tends to land 5–10% higher
+    than this lower bound, so 900 here means ~990+ Anthropic tokens.
+    """
+    from claude_sql.llm_worker import (
+        CLASSIFY_SYSTEM_PROMPT,
+        CONFLICTS_SYSTEM_PROMPT,
+        TRAJECTORY_SYSTEM_PROMPT,
+        USER_FRICTION_SYSTEM_PROMPT,
+    )
+
+    for name, prompt in (
+        ("CLASSIFY", CLASSIFY_SYSTEM_PROMPT),
+        ("TRAJECTORY", TRAJECTORY_SYSTEM_PROMPT),
+        ("CONFLICTS", CONFLICTS_SYSTEM_PROMPT),
+        ("FRICTION", USER_FRICTION_SYSTEM_PROMPT),
+    ):
+        approx_tokens = len(prompt) // 4
+        assert approx_tokens >= 900, (
+            f"{name} system prompt ~{approx_tokens} tokens — below the "
+            "1024-token Anthropic cache minimum. Pad with stable content "
+            "(label exemplars, calibration anchors) so cache_control "
+            "actually discounts the call."
+        )
+
+
 def test_invoke_parses_output_field() -> None:
     payload = {"output": {"autonomy_tier": "manual"}}
     client = _make_mock_client(payload)
