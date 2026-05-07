@@ -78,6 +78,10 @@ def _default_checkpoint_db() -> Path:
     return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
 
 
+def _default_hnsw_db() -> Path:
+    return Path(os.path.expanduser("~/.claude/hnsw.duckdb"))
+
+
 def _default_duckdb_temp_dir() -> Path:
     return Path(os.path.expanduser("~/.claude/duckdb_tmp"))
 
@@ -151,6 +155,14 @@ class Settings(BaseSettings):
     hnsw_ef_search: int = 64
     hnsw_m: int = 16
     hnsw_m0: int = 32
+    #: Persistent DuckDB file backing the HNSW index. ``register_vss``
+    #: ATTACHes this file (separate from ``checkpoint_db_path`` so a
+    #: corruption in either store recovers in isolation — ``rm
+    #: ~/.claude/hnsw.duckdb`` is the documented HNSW recovery path) and
+    #: rebuilds from the embeddings parquet only when the parquet's mtime
+    #: is newer than the file's. Persistence rides on DuckDB's
+    #: ``hnsw_enable_experimental_persistence`` flag.
+    hnsw_db_path: Path = Field(default_factory=_default_hnsw_db)
 
     # ------------------------------------------------------------------
     # Pricing

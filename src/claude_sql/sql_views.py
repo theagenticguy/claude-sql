@@ -32,6 +32,7 @@ Design notes
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -1066,10 +1067,41 @@ def register_macros(
 # ---------------------------------------------------------------------------
 
 
+def _hnsw_rebuild_needed(parquet: Path, hnsw_db: Path) -> bool:
+    """Decide from filesystem state alone whether the parquet has shifted.
+
+    This is a *necessary* but not sufficient signal — even when the
+    parquet hasn't moved, the attached store might be empty (for instance,
+    DuckDB's ATTACH on a missing path creates a ~12 KB header-only file
+    before any tables exist). Catalog existence is checked separately
+    inside ``register_vss`` after the ATTACH.
+    """
+    if not hnsw_db.exists():
+        return True
+    if not parquet.exists():
+        return False
+    return parquet.stat().st_mtime_ns > hnsw_db.stat().st_mtime_ns
+
+
+def _attached_embeddings_table_present(con: duckdb.DuckDBPyConnection) -> bool:
+    """Return True when ``hnsw_store.main.message_embeddings`` exists in the catalog."""
+    row = con.execute(
+        """
+        SELECT count(*)
+        FROM duckdb_tables()
+        WHERE database_name = 'hnsw_store'
+          AND schema_name = 'main'
+          AND table_name = 'message_embeddings';
+        """
+    ).fetchone()
+    return bool(row and row[0])
+
+
 def register_vss(
     con: duckdb.DuckDBPyConnection,
     *,
     embeddings_parquet: Path,
+    hnsw_db_path: Path | None = None,
     dim: int = 1024,
     metric: str = "cosine",
     ef_construction: int = 128,
@@ -1077,13 +1109,18 @@ def register_vss(
     m: int = 16,
     m0: int = 32,
 ) -> bool:
-    """Install + load VSS and build the HNSW index over ``message_embeddings``.
+    """Install + load VSS and bind ``message_embeddings`` over a persisted HNSW store.
 
-    Creates ``message_embeddings`` from ``embeddings_parquet`` (when present)
-    and builds the HNSW index over the ``embedding`` column. When the parquet
-    file is missing, an empty, schema-correct table is created so macros that
-    reference ``message_embeddings`` still resolve -- ``semantic_search`` will
-    simply return no rows until the parquet is populated.
+    When ``hnsw_db_path`` is provided the embeddings table and its HNSW
+    index live inside that DuckDB file (ATTACHed under the alias
+    ``hnsw_store``) so reopening a CLI command reuses the index instead of
+    rebuilding it from parquet. The store is rebuilt only when missing,
+    suspiciously small, or older than the embeddings parquet on disk; an
+    ``IOException`` during attach unlinks the store and rebuilds.
+
+    When ``hnsw_db_path`` is ``None`` (legacy / tests) the table and index
+    stay in the connection's main database, matching the original
+    in-memory behavior.
 
     Parameters
     ----------
@@ -1091,6 +1128,9 @@ def register_vss(
         Open DuckDB connection.
     embeddings_parquet
         Path to the embeddings parquet produced by ``claude-sql embed``.
+    hnsw_db_path
+        Persistent DuckDB file that backs the HNSW index, or ``None`` to
+        keep everything in the connection's main database.
     dim
         Fixed-length embedding dimension. Must match the parquet's
         ``embedding`` column. Defaults to 1024 (Cohere Embed v4 mid-tier).
@@ -1103,13 +1143,16 @@ def register_vss(
     Returns
     -------
     bool
-        ``True`` if the table was populated from parquet and the HNSW index
-        built; ``False`` if the parquet file does not exist yet.
+        ``True`` if the table was populated and the HNSW index is usable;
+        ``False`` if the parquet file does not exist yet.
 
     Notes
     -----
     VSS only supports ``FLOAT`` element type. Embeddings persisted as
     ``DOUBLE[]`` are cast via ``CAST(embedding AS FLOAT[<dim>])``.
+    Persistence rides on the experimental
+    ``hnsw_enable_experimental_persistence`` flag — when corruption
+    surfaces, ``rm`` the file and the next call rebuilds from parquet.
     """
     dim_i = int(dim)
     ef_c_i = int(ef_construction)
@@ -1121,6 +1164,28 @@ def register_vss(
 
     con.execute("INSTALL vss;")
     con.execute("LOAD vss;")
+    con.execute("SET hnsw_enable_experimental_persistence = true;")
+
+    use_persistence = hnsw_db_path is not None
+    schema_qualifier = ""
+    persisted_path: Path | None = hnsw_db_path
+    if use_persistence and persisted_path is not None:
+        persisted_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            con.execute(f"ATTACH '{persisted_path}' AS hnsw_store;")
+        except duckdb.IOException as exc:
+            logger.warning(
+                "ATTACH on {} failed ({}); unlinking and rebuilding the HNSW store.",
+                persisted_path,
+                exc,
+            )
+            with contextlib.suppress(FileNotFoundError):
+                persisted_path.unlink()
+            con.execute(f"ATTACH '{persisted_path}' AS hnsw_store;")
+        # ``message_embeddings`` lives inside the attached store. Macros and
+        # readers reference it via a top-level VIEW so existing call sites
+        # (cli.py, the ``semantic_search`` macro) keep working unchanged.
+        schema_qualifier = "hnsw_store.main."
 
     if not embeddings_parquet.exists():
         logger.warning(
@@ -1130,7 +1195,7 @@ def register_vss(
         )
         con.execute(
             f"""
-            CREATE OR REPLACE TABLE message_embeddings (
+            CREATE OR REPLACE TABLE {schema_qualifier}message_embeddings (
                 uuid      VARCHAR PRIMARY KEY,
                 model     VARCHAR,
                 dim       USMALLINT,
@@ -1138,42 +1203,72 @@ def register_vss(
             );
             """
         )
+        if use_persistence:
+            con.execute(
+                "CREATE OR REPLACE VIEW message_embeddings AS "
+                "SELECT * FROM hnsw_store.main.message_embeddings;"
+            )
         return False
 
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE message_embeddings AS
-        SELECT
-            uuid,
-            model,
-            dim,
-            CAST(embedding AS FLOAT[{dim_i}]) AS embedding
-        FROM read_parquet(?);
-        """,
-        [str(embeddings_parquet)],
-    )
-    con.execute(
-        f"""
-        CREATE INDEX IF NOT EXISTS idx_msg_hnsw
-        ON message_embeddings
-        USING HNSW (embedding)
-        WITH (
-            metric='{metric}',
-            ef_construction={ef_c_i},
-            ef_search={ef_s_i},
-            M={m_i},
-            M0={m0_i}
-        );
-        """
-    )
-    row = con.execute("SELECT count(*) FROM message_embeddings;").fetchone()
+    rebuild = not use_persistence
+    if use_persistence and persisted_path is not None:
+        # Two reasons to rebuild: parquet is newer than the on-disk store,
+        # or the attached store is empty (newly created header-only file
+        # from ``ATTACH`` on a missing path).
+        rebuild = _hnsw_rebuild_needed(
+            embeddings_parquet, persisted_path
+        ) or not _attached_embeddings_table_present(con)
+
+    if rebuild:
+        # Drop any stale table+index in the target schema first so
+        # CREATE TABLE doesn't trip on an existing index. DROP TABLE
+        # cascades to dependent indexes.
+        con.execute(f"DROP TABLE IF EXISTS {schema_qualifier}message_embeddings;")
+        con.execute(
+            f"""
+            CREATE TABLE {schema_qualifier}message_embeddings AS
+            SELECT
+                uuid,
+                model,
+                dim,
+                CAST(embedding AS FLOAT[{dim_i}]) AS embedding
+            FROM read_parquet(?);
+            """,
+            [str(embeddings_parquet)],
+        )
+        con.execute(
+            f"""
+            CREATE INDEX idx_msg_hnsw
+            ON {schema_qualifier}message_embeddings
+            USING HNSW (embedding)
+            WITH (
+                metric='{metric}',
+                ef_construction={ef_c_i},
+                ef_search={ef_s_i},
+                M={m_i},
+                M0={m0_i}
+            );
+            """
+        )
+        if use_persistence:
+            con.execute("CHECKPOINT hnsw_store;")
+
+    if use_persistence:
+        con.execute(
+            "CREATE OR REPLACE VIEW message_embeddings AS "
+            "SELECT * FROM hnsw_store.main.message_embeddings;"
+        )
+
+    row = con.execute(f"SELECT count(*) FROM {schema_qualifier}message_embeddings;").fetchone()
     count = int(row[0]) if row else 0
     logger.debug(
-        "Loaded {} embeddings and built HNSW index (metric={}, M={}, ef_search={})",
+        "{} {} embeddings (metric={}, M={}, ef_search={}, persistent={})",
+        "Built" if rebuild else "Reused persisted",
         count,
         metric,
         m_i,
         ef_s_i,
+        use_persistence,
     )
     return True
 
@@ -1415,6 +1510,7 @@ def register_all(
     register_vss(
         con,
         embeddings_parquet=settings.embeddings_parquet_path,
+        hnsw_db_path=settings.hnsw_db_path,
         dim=int(settings.output_dimension),
         metric=settings.hnsw_metric,
         ef_construction=settings.hnsw_ef_construction,
