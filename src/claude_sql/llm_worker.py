@@ -23,9 +23,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import boto3
@@ -71,6 +73,47 @@ _RETRY_CODES: set[str] = {
     "ModelErrorException",
 }
 _retry_logger = logging.getLogger("claude_sql.llm_worker")
+
+
+#: When set, every classifier call appends a JSONL trace row to this path
+#: capturing model id, input/output token counts, prompt-cache hits, and
+#: wall-clock ms. Used to verify that ``cache_control`` on the system block
+#: actually triggers Anthropic prompt caching and to compare the real
+#: token mix against the static dry-run estimates. No-op in normal use.
+_BEDROCK_TRACE_PATH = os.environ.get("CLAUDE_SQL_BEDROCK_TRACE")
+
+
+def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
+    """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set.
+
+    Anthropic returns prompt-cache stats under ``payload["usage"]`` as
+    ``cache_creation_input_tokens`` and ``cache_read_input_tokens``;
+    pulling them is the only way to confirm the cache_control marker
+    actually fired. Failures are swallowed (this is observability,
+    not a correctness path).
+    """
+    if not _BEDROCK_TRACE_PATH:
+        return
+    try:
+        usage = payload.get("usage") or {}
+        row = {
+            "ts": datetime.now(UTC).isoformat(),
+            "pipeline": pipeline,
+            "model": model_id,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            "stop_reason": payload.get("stop_reason"),
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+        path = Path(_BEDROCK_TRACE_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError:
+        # Tracing must never break a real run.
+        pass
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -167,13 +210,21 @@ def _invoke_classifier_sync(
         body["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
     if thinking_mode == "adaptive":
         body["thinking"] = {"type": "adaptive"}
+    t0 = time.monotonic()
     resp = client.invoke_model(
         modelId=model_id,
         body=json.dumps(body),
         contentType="application/json",
         accept="application/json",
     )
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
     payload = json.loads(resp["body"].read())
+    _maybe_log_bedrock_call(
+        pipeline=schema.get("title", "classifier") if isinstance(schema, dict) else "classifier",
+        model_id=model_id,
+        payload=payload,
+        elapsed_ms=elapsed_ms,
+    )
     return _parse_structured_payload(payload)
 
 
@@ -363,6 +414,49 @@ Anti-patterns
    the user to step back and let the agent run. A session where the agent
    produces lots of code but the user reviews each diff is ``assisted``.
 
+4. ``goal`` is the user's goal, not the session's outcome. If the user asked
+   to refactor X but the agent ended up debugging an unrelated test failure,
+   the ``goal`` is still "refactor X". The detour shows up in ``success``.
+
+5. Confidence is per-row, not per-field. If you're sure of three of the four
+   fields and uncertain about ``work_category``, you can pick the most likely
+   category and reflect the uncertainty in the overall confidence.
+
+Worked examples
+
+A 4-hour session where the user opens with "implement Phase 2 of the auth
+migration", the agent runs ~80 tool calls, the user replies "ok", "good",
+"ship it" between long agent runs, ends with green tests + successful merge:
+  → autonomy_tier=autonomous, work_category=sde, success=success, conf=0.9.
+
+A 30-minute session where the user pastes a stack trace, the agent reads
+the offending file and proposes a fix, the user says "actually I think the
+bug is in module Y, can you check there", the agent verifies, fixes Y,
+tests pass, the user thanks the agent and ends:
+  → autonomy_tier=assisted (user redirected), work_category=sde,
+    success=success, conf=0.85.
+
+A 2-hour session of strategic memo work — user dictates section outlines,
+agent drafts, user rewrites paragraphs heavily, three rounds of revision,
+ends with a published draft:
+  → autonomy_tier=assisted, work_category=strategy_business,
+    success=success, conf=0.85.
+
+A session that opens with "schedule a 1:1 with X", the agent calls calendar,
+finds slots, user picks one, agent books, user confirms:
+  → autonomy_tier=manual, work_category=admin, success=success, conf=0.95.
+
+A 5-minute session where the user asks "how should I structure the test
+fixture?", the agent explains, the user says "got it" and ends without
+writing code:
+  → autonomy_tier=manual, work_category=sde, success=success
+    (the goal was advice, which was given), conf=0.7.
+
+A session where the user pastes a 500-line markdown plan and says "let's
+start", the agent runs through the first three sections, but the session
+ends mid-flight with five sections still unaddressed:
+  → autonomy_tier=assisted, work_category=sde, success=partial, conf=0.85.
+
 Output format
 
 Emit ONLY the JSON object specified by the schema. No surrounding prose,
@@ -443,6 +537,72 @@ Anti-patterns to avoid
 5. Tool-use narration ("calling X", "reading Y", "checking Z") is overwhelmingly
    neutral. Don't score the agent's procedural play-by-play as positive momentum
    unless the wording itself is enthusiastic.
+
+6. Length is not affect. A 50-word careful explanation can be neutral. A
+   3-word reply ("ship it!") can be positive. Polarity is in the words, not
+   the size of the message.
+
+Worked examples
+
+Each example below is one isolated message — the kind of input you'll see —
+followed by the correct label and a short why. Patterns to internalize:
+
+"Tests pass."
+  → neutral / is_transition=true / conf=0.9.
+  Pure procedural close-out. Even a "pass" could read as positive but the
+  default for a status report is neutral.
+
+"All 240 passed, 4 warnings in 53s."
+  → neutral / is_transition=false / conf=0.9.
+  Information-dense report. Not transition (carries data), not affect.
+
+"shipping it 🚀"
+  → positive / is_transition=false / conf=0.95.
+  Explicit excitement + emoji + decision verb. Unambiguous positive.
+
+"ok let me check that"
+  → neutral / is_transition=true / conf=0.9.
+  Acknowledgement filler. The "ok" doesn't carry affect; it's pacing.
+
+"this entire approach is wrong because the cache key is per-tenant"
+  → negative / is_transition=false / conf=0.9.
+  Substantive disagreement with reasoning. Negative even though articulate.
+
+"running pytest now"
+  → neutral / is_transition=true / conf=0.85.
+  Procedural narration. Tool-use play-by-play.
+
+"that's not what I meant — I want X to be derived, not stored"
+  → negative / is_transition=false / conf=0.85.
+  Correction with a substantive counter-proposal. Friction is real here.
+
+"perfect, this is exactly what I wanted"
+  → positive / is_transition=false / conf=0.95.
+  Direct praise + specificity ("exactly what I wanted"). Strong positive.
+
+"hmm, that doesn't seem right"
+  → negative / is_transition=false / conf=0.65.
+  Mild pushback. Conf below 0.7 because "hmm" is genuinely ambiguous —
+  could be deliberation. Negative is the right read but uncertain.
+
+"thanks"
+  → neutral / is_transition=true / conf=0.7.
+  Bare politeness. Not positive (no specificity), not transition (it's a
+  social close), but the schema treats short acknowledgements as transitions
+  for downstream filtering. Conf reflects the close call.
+
+"Done."
+  → neutral / is_transition=true / conf=0.9.
+  Single-word close-out. Filler.
+
+"no don't do that"
+  → negative / is_transition=false / conf=0.9.
+  Hard correction. Even bare imperative — the "no" + "don't" is the cue.
+
+"I think we should go with the simple version for now"
+  → neutral / is_transition=false / conf=0.85.
+  Substantive opinion without affect. Could read mildly positive ("for now"
+  signals pragmatism) but the default is neutral.
 
 Output format
 
@@ -528,6 +688,51 @@ points, and noise drowns signal.
 A typical coding session has 0 conflicts. A typical strategy / planning
 session has 0–2. Sessions with 3+ conflicts exist but are rare; double-check
 your output if you're emitting that many.
+
+Worked examples
+
+Pattern A — a real conflict, resolved:
+  Session: user wants to optimize a slow query. Agent proposes denormalizing
+  the table. User counters: "no, let's add a covering index instead — I don't
+  want to touch the schema". Agent accepts the index approach and ships it.
+  → [{stance_a: "Denormalize the table to make the query faster.",
+      stance_b: "Keep the schema; add a covering index instead.",
+      resolution: "resolved"}]
+
+Pattern B — collaboration that LOOKS like conflict but isn't:
+  Session: user proposes a 3-step plan. Agent says "I think step 2 is risky
+  because of X — should we add a rollback first?" User agrees, plan becomes
+  4 steps. Both proceed.
+  → conflicts: []
+  Why: agent flagged a risk, user incorporated it. No counter-stance held.
+
+Pattern C — agent deliberation, also not a conflict:
+  Session: agent's reasoning shows "I could use approach A or approach B,
+  but A is simpler so I'll go with A". User says "ok".
+  → conflicts: []
+  Why: agent considered alternatives in its own thinking. User didn't hold
+  a counter-stance.
+
+Pattern D — surface pushback that retracts:
+  Session: user says "wait, isn't that going to break X?" Agent explains why
+  not. User: "oh you're right, never mind."
+  → conflicts: []
+  Why: question surfaced, answered, retracted. No sustained position.
+
+Pattern E — unresolved conflict:
+  Session: user leans toward "ship simple version now", agent leans toward
+  "wait for architectural cleanup". Session ends without a decision; user
+  says "let me think about it".
+  → [{stance_a: "Ship the simple version now to unblock users.",
+      stance_b: "Wait for the architectural cleanup so we don't ship debt.",
+      resolution: "unresolved"}]
+
+Pattern F — abandoned conflict:
+  Session: brief disagreement about which CI config to use. User pivots to
+  a different topic. Never returns to the CI question.
+  → [{stance_a: "Use GitHub Actions for the new pipeline.",
+      stance_b: "Stick with the existing CodeBuild setup.",
+      resolution: "abandoned"}]
 
 Output format
 
