@@ -8,10 +8,11 @@ Defaults are picked for a single-user devbox install pointing at
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,6 +78,14 @@ def _default_checkpoint_db() -> Path:
     return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
 
 
+def _default_duckdb_temp_dir() -> Path:
+    return Path(os.path.expanduser("~/.claude/duckdb_tmp"))
+
+
+def _default_duckdb_threads() -> int:
+    return os.cpu_count() or 4
+
+
 # Model pricing per 1M tokens (in_rate, out_rate).  Mirrors claude-mine/transform.py.
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-7": (15.0, 75.0),
@@ -118,9 +127,18 @@ class Settings(BaseSettings):
 
     output_dimension: Literal[256, 512, 1024, 1536] = 1024
     embedding_type: Literal["int8", "float", "uint8", "binary", "ubinary"] = "int8"
-    #: Parallel Bedrock calls. Tuned for global CRIS TPM ceiling with the
-    #: aggregated-text messages_text view (avg ~470 chars/msg).
-    concurrency: int = 2
+    #: Parallel Bedrock calls for Cohere Embed v4 on global CRIS. Sustained
+    #: 8 × batch_size 96 in testing without throttling — Cohere's TPM bucket
+    #: is the binding constraint and embed v4 is generous on global CRIS.
+    embed_concurrency: int = 8
+    #: Parallel Bedrock calls for Sonnet 4.6 on global CRIS. Conservative
+    #: because Sonnet's per-model TPM bucket is smaller and adaptive
+    #: thinking burns output tokens unpredictably.
+    llm_concurrency: int = 2
+    #: DEPRECATED: use ``embed_concurrency`` / ``llm_concurrency``. Kept for
+    #: one release as a back-compat alias — when set explicitly (env or
+    #: kwarg), it overrides both. Removed once downstream callers migrate.
+    concurrency: int | None = None
     batch_size: int = 96
 
     embeddings_parquet_path: Path = Field(default_factory=_default_embeddings_parquet)
@@ -232,6 +250,46 @@ class Settings(BaseSettings):
     tfidf_ngram_min: int = 1
     tfidf_ngram_max: int = 2
     tfidf_top_n_terms: int = 10
+
+    # ------------------------------------------------------------------
+    # DuckDB engine tuning — applied as PRAGMAs in cli._open_connection.
+    # ------------------------------------------------------------------
+    #: Worker threads. Defaults to ``os.cpu_count()`` so DuckDB uses every
+    #: core; agents and CI runners with limited parallelism can override.
+    duckdb_threads: int = Field(default_factory=_default_duckdb_threads)
+    #: Memory ceiling. ``"70%"`` is permissive for a single-user devbox;
+    #: drop on shared hosts via the env var if it pressures other workloads.
+    duckdb_memory_limit: str = "70%"
+    #: Spill directory. Amazon devboxes ship ``/tmp`` as a 4 GB tmpfs that
+    #: thrashes the host once a clustering run starts spilling — point at
+    #: ``~/.claude/duckdb_tmp`` (real disk) instead.
+    duckdb_temp_dir: Path = Field(default_factory=_default_duckdb_temp_dir)
+
+    @model_validator(mode="after")
+    def _resolve_concurrency_alias(self) -> Settings:
+        """Honor the deprecated ``concurrency`` field as an alias for both pipelines.
+
+        When ``concurrency`` is set explicitly (env or kwarg) and the modern
+        per-pipeline fields are at their defaults, mirror it onto both. We
+        only override when the user clearly didn't set the new fields, so
+        ``embed_concurrency=8, concurrency=4`` keeps the explicit 8.
+        """
+        if self.concurrency is None:
+            return self
+        warnings.warn(
+            "CLAUDE_SQL_CONCURRENCY / Settings.concurrency is deprecated. "
+            "Use CLAUDE_SQL_EMBED_CONCURRENCY (default 8) and "
+            "CLAUDE_SQL_LLM_CONCURRENCY (default 2) instead. The single "
+            "knob will be removed in the next release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Only apply the alias to fields still at their default value.
+        if self.embed_concurrency == 8:
+            object.__setattr__(self, "embed_concurrency", self.concurrency)
+        if self.llm_concurrency == 2:
+            object.__setattr__(self, "llm_concurrency", self.concurrency)
+        return self
 
     @property
     def active_model_id(self) -> str:

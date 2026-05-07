@@ -22,6 +22,8 @@ drag extra modules into startup.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -199,9 +201,50 @@ def _resolve_settings(common: Common | None) -> Settings:
     return settings.model_copy(update=updates)
 
 
+_PERCENT_LIMIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*$")
+
+
+def _resolve_memory_limit(limit: str) -> str:
+    """Translate ``"<n>%"`` into an absolute size DuckDB accepts.
+
+    DuckDB's ``memory_limit`` parser only knows ``KB / MB / GB / TB`` and the
+    binary variants. Percentage strings are rejected, so we resolve them
+    against the host's reported total memory before the PRAGMA fires. Any
+    other form passes through unchanged so the env var can still pin an
+    absolute size like ``"4GB"`` directly.
+    """
+    match = _PERCENT_LIMIT_RE.match(limit)
+    if match is None:
+        return limit.strip()
+    fraction = float(match.group(1)) / 100.0
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        # Non-POSIX or restricted host — fall back to a conservative 4 GiB.
+        total_bytes = 4 * 1024**3
+    else:
+        total_bytes = page_size * phys_pages
+    target_mib = max(1, int((total_bytes * fraction) // (1024 * 1024)))
+    return f"{target_mib}MiB"
+
+
 def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
-    """Open an in-memory DuckDB connection with every claude-sql object wired."""
+    """Open an in-memory DuckDB connection with every claude-sql object wired.
+
+    Tuning PRAGMAs are set before view registration so the registration
+    queries themselves benefit from the higher thread count and the spill
+    directory pointed at real disk (Amazon devboxes ship ``/tmp`` as a
+    4 GB tmpfs that thrashes once a clustering run starts spilling).
+    """
     con = duckdb.connect(":memory:")
+    settings.duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+    memory_limit = _resolve_memory_limit(settings.duckdb_memory_limit)
+    con.execute(f"SET threads = {int(settings.duckdb_threads)}")
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET temp_directory = '{settings.duckdb_temp_dir}'")
+    con.execute("SET enable_object_cache = true")
+    con.execute("SET preserve_insertion_order = false")
     register_all(con, settings=settings)
     return con
 

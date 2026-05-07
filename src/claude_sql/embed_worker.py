@@ -276,14 +276,14 @@ async def embed_documents_async(
     client = _build_bedrock_client(settings)
     batch_size = settings.batch_size
     batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.embed_concurrency)
 
     logger.info(
         "Embedding {} texts in {} batches (batch_size={}, concurrency={}, model={})",
         len(texts),
         len(batches),
         batch_size,
-        settings.concurrency,
+        settings.embed_concurrency,
         settings.active_model_id,
     )
 
@@ -391,7 +391,7 @@ async def run_backfill(
                 "candidates": 0,
                 "batches": 0,
                 "batch_size": settings.batch_size,
-                "concurrency": settings.concurrency,
+                "concurrency": settings.embed_concurrency,
                 "model": settings.active_model_id,
                 "since_days": since_days,
                 "limit": limit,
@@ -404,7 +404,7 @@ async def run_backfill(
         "Backfill plan: {} messages, {} batches, concurrency={}, model={}",
         len(pending),
         n_batches,
-        settings.concurrency,
+        settings.embed_concurrency,
         settings.active_model_id,
     )
     if dry_run:
@@ -414,7 +414,7 @@ async def run_backfill(
             "candidates": len(pending),
             "batches": n_batches,
             "batch_size": settings.batch_size,
-            "concurrency": settings.concurrency,
+            "concurrency": settings.embed_concurrency,
             "model": settings.active_model_id,
             "since_days": since_days,
             "limit": limit,

@@ -333,14 +333,14 @@ async def _classify_sessions_async(
         logger.info("classify: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info(
         "classify: {} pending, model={}, thinking={}, concurrency={}, chunks of {}",
         len(pending),
         settings.sonnet_model_id,
         thinking_mode,
-        settings.concurrency,
+        settings.llm_concurrency,
         chunk_size,
     )
 
@@ -676,7 +676,7 @@ async def _trajectory_async(
         return len(heuristic_rows)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(heuristic_rows)
 
@@ -903,7 +903,7 @@ async def _conflicts_async(
         logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info("conflicts: {} pending sessions", len(pending))
 

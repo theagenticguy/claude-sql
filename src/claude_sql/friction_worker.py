@@ -349,7 +349,7 @@ async def _classify_async(
 
     # 2. LLM path.
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(fast_rows)
 
