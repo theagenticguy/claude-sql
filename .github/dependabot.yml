@@ -1,0 +1,48 @@
+# Dependabot config for claude-sql.
+#
+# Two ecosystems matter here:
+#   * pip — covers PyPI deps declared in pyproject.toml (uv-compatible).
+#     Dependabot reads pyproject directly; it does not yet parse uv.lock,
+#     so security updates show up as pyproject bumps that uv lock picks up.
+#   * github-actions — pins like actions/checkout@v6 are tag-pinned in
+#     this repo (deliberate; see docs/adr/0016-ci-hardening.md) and
+#     Dependabot will propose version-range bumps weekly.
+#
+# All PRs land as conventional commits so commit-msg + commitlint workflow
+# stay happy.
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+      prefix-development: "build"
+      include: scope
+    labels: ["dependencies", "python"]
+    groups:
+      # Group patch-level bumps so PR count stays sane.
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: scope
+    labels: ["dependencies", "github-actions"]
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
