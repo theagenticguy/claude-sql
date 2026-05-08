@@ -2,7 +2,7 @@
 # activated by ``uv run lefthook install`` once per clone.
 #
 # Invariants:
-#   * Every hook runs inside the project's uv venv via ``uv run`` so
+#   * Every hook runs inside the project's uv venv via ``{uv}`` so
 #     contributors don't need system-wide ruff / ty / cz installs.
 #   * Pre-commit jobs run in parallel and are scoped to staged files via
 #     ``{staged_files}`` so partial commits stay fast.
@@ -14,48 +14,49 @@
 #
 # Uninstall: ``uv run lefthook uninstall``.
 
-min_version: 2.0.0
+min_version: 2.1.6
+assert_lefthook_installed: true
+glob_matcher: doublestar
+
+# Keep stderr clean for the green path; preserve failure detail.
+output:
+  - meta
+  - summary
+  - failure
+  - execution_info
+
+templates:
+  uv: uv run
 
 pre-commit:
   parallel: true
   jobs:
     - name: ruff-lint
-      run: uv run ruff check --fix {staged_files}
-      glob: "*.py"
+      run: "{uv} ruff check --fix {staged_files}"
+      glob: "**/*.py"
       stage_fixed: true
+      priority: 1
+      fail_text: "ruff check failed — fix the lint errors above, then re-stage."
 
     - name: ruff-format
-      run: uv run ruff format {staged_files}
-      glob: "*.py"
+      run: "{uv} ruff format {staged_files}"
+      glob: "**/*.py"
       stage_fixed: true
+      priority: 2
+      fail_text: "ruff format failed — check the error above."
 
-    # ``ty`` runs over the whole ``src/`` tree because Python type-checking
-    # is semantic — changing one file can break imports elsewhere.  Still
-    # fast (~2s on this repo) because ty caches aggressively.
+    # ``ty`` runs over the whole ``src/`` + ``tests/`` tree because Python
+    # type-checking is semantic — changing one file can break imports
+    # elsewhere.  Still fast (~2s on this repo) because ty caches
+    # aggressively.
     - name: ty
-      run: uv run ty check src/
-      glob: "*.py"
-      # Only run when Python files actually changed — avoids the ty boot
-      # cost on pure-doc / config commits.
+      run: "{uv} ty check src/ tests/"
+      glob: "**/*.py"
+      priority: 3
       skip:
         - merge
         - rebase
-
-pre-push:
-  jobs:
-    # Full test suite on push is a safety net: pre-commit only runs the
-    # linters, not pytest.  Pushing without a green test pass is almost
-    # always a mistake on this project.  ``files: git diff ... HEAD``
-    # makes lefthook always consider this job runnable (it stops looking
-    # for staged_files / push_files matches) so the pytest command fires
-    # on every push that touches Python.
-    - name: pytest
-      run: uv run pytest tests/ --no-header -q
-      files: "git diff --name-only @{push} HEAD || git diff --name-only HEAD~"
-      glob: "*.py"
-      skip:
-        - merge
-        - rebase
+      fail_text: "ty typecheck failed — run `mise run typecheck` locally to reproduce."
 
 commit-msg:
   jobs:
@@ -63,4 +64,23 @@ commit-msg:
     # configured rule (conventional commits).  ``--allow-abort`` lets an
     # empty message (e.g. when aborting a commit) pass through.
     - name: commitizen
-      run: uv run cz check --allow-abort --commit-msg-file {1}
+      run: "{uv} cz check --allow-abort --commit-msg-file {1}"
+      interactive: false
+      fail_text: "Commit message is not conventional — run `mise run commit` for the wizard."
+
+pre-push:
+  jobs:
+    # Full test suite on push is a safety net: pre-commit only runs the
+    # linters, not pytest.  Pushing without a green test pass is almost
+    # always a mistake on this project.  ``files:`` gates whether the glob
+    # matches — on first push of a branch ``@{push}`` resolves to the
+    # configured remote default; if that fails, lefthook skips cleanly
+    # rather than fabricating a diff.
+    - name: pytest
+      run: "{uv} pytest tests/ --no-header -q"
+      glob: "**/*.py"
+      files: "git diff --name-only @{push} HEAD"
+      skip:
+        - merge
+        - rebase
+      fail_text: "pytest failed — run `mise run test` locally before pushing."
