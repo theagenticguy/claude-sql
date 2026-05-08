@@ -24,7 +24,7 @@ from claude_sql.config import Settings
 def test_default_per_pipeline_concurrency() -> None:
     s = Settings()
     assert s.embed_concurrency == 8
-    assert s.llm_concurrency == 2
+    assert s.llm_concurrency == 16
     assert s.concurrency is None
 
 
@@ -32,7 +32,7 @@ def test_env_override_embed_concurrency(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("CLAUDE_SQL_EMBED_CONCURRENCY", "16")
     s = Settings()
     assert s.embed_concurrency == 16
-    assert s.llm_concurrency == 2
+    assert s.llm_concurrency == 16
 
 
 def test_env_override_llm_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,7 +63,7 @@ def test_explicit_pipeline_field_wins_over_deprecated_alias(
         warnings.simplefilter("ignore", DeprecationWarning)
         s = Settings()
     # Explicit modern field stays; the alias only fills llm_concurrency,
-    # which was at its default 2.
+    # which was at its default 16.
     assert s.embed_concurrency == 12
     assert s.llm_concurrency == 5
 

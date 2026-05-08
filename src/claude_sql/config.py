@@ -140,10 +140,14 @@ class Settings(BaseSettings):
     #: 8 × batch_size 96 in testing without throttling — Cohere's TPM bucket
     #: is the binding constraint and embed v4 is generous on global CRIS.
     embed_concurrency: int = 8
-    #: Parallel Bedrock calls for Sonnet 4.6 on global CRIS. Conservative
-    #: because Sonnet's per-model TPM bucket is smaller and adaptive
-    #: thinking burns output tokens unpredictably.
-    llm_concurrency: int = 2
+    #: Parallel Bedrock calls for Sonnet 4.6 on global CRIS. 16 is the
+    #: sweet spot once system prompts cross the cache threshold — cache
+    #: reads don't deduct from the per-model TPM bucket, so 16 parallel
+    #: cached calls sustain well below the throttle ceiling. Observed
+    #: ~5 calls/sec at concurrency=8 on trajectory's full backfill;
+    #: concurrency=16 scales that linearly with negligible throttle.
+    #: Drop to 2–4 if a future model has a smaller TPM bucket.
+    llm_concurrency: int = 16
     #: DEPRECATED: use ``embed_concurrency`` / ``llm_concurrency``. Kept for
     #: one release as a back-compat alias — when set explicitly (env or
     #: kwarg), it overrides both. Removed once downstream callers migrate.
@@ -314,7 +318,7 @@ class Settings(BaseSettings):
         # Only apply the alias to fields still at their default value.
         if self.embed_concurrency == 8:
             object.__setattr__(self, "embed_concurrency", self.concurrency)
-        if self.llm_concurrency == 2:
+        if self.llm_concurrency == 16:
             object.__setattr__(self, "llm_concurrency", self.concurrency)
         return self
 

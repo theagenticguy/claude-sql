@@ -25,11 +25,14 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import anyio
+import anyio.to_thread
 import boto3
 import polars as pl
 from botocore.config import Config as BotoConfig
@@ -67,10 +70,19 @@ if TYPE_CHECKING:
 
 
 _RETRY_CODES: set[str] = {
+    # Standard Bedrock throttle + transient-service errors.
     "ThrottlingException",
     "ServiceUnavailableException",
     "ModelTimeoutException",
     "ModelErrorException",
+    # Bedrock-specific on-demand capacity errors (per AWS re:Post
+    # "Troubleshoot Bedrock on-demand 429 Throttling", 2026-05-08).
+    "ProvisionedThroughputExceededException",
+    "TooManyRequestsException",
+    # 5xx spikes on CRIS routing during global region failover — these
+    # are idempotent for structured-output invocations so retry is safe.
+    "InternalServerException",
+    "InternalFailure",
 }
 _retry_logger = logging.getLogger("claude_sql.llm_worker")
 
@@ -86,16 +98,19 @@ _BEDROCK_TRACE_PATH = os.environ.get("CLAUDE_SQL_BEDROCK_TRACE")
 def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
     """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set.
 
-    Anthropic returns prompt-cache stats under ``payload["usage"]`` as
-    ``cache_creation_input_tokens`` and ``cache_read_input_tokens``;
-    pulling them is the only way to confirm the cache_control marker
-    actually fired. Failures are swallowed (this is observability,
-    not a correctness path).
+    Anthropic returns prompt-cache stats under ``payload["usage"]``; we
+    capture the full shape so downstream cost accounting can split
+    5-minute-TTL writes (1.25× input rate) from 1-hour-TTL writes
+    (2× input rate) and cache reads (0.1× input rate). See Anthropic's
+    prompt-caching docs for the schema, and AWS's prompt-caching page
+    for the per-model cache minimums. Failures are swallowed — tracing
+    must never break a real run.
     """
     if not _BEDROCK_TRACE_PATH:
         return
     try:
         usage = payload.get("usage") or {}
+        cache_creation = usage.get("cache_creation") or {}
         row = {
             "ts": datetime.now(UTC).isoformat(),
             "pipeline": pipeline,
@@ -104,6 +119,10 @@ def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed
             "output_tokens": usage.get("output_tokens"),
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            # New-shape fields (present when the model returns the
+            # ``cache_creation`` sub-object; older responses omit them).
+            "ephemeral_5m_input_tokens": cache_creation.get("ephemeral_5m_input_tokens"),
+            "ephemeral_1h_input_tokens": cache_creation.get("ephemeral_1h_input_tokens"),
             "stop_reason": payload.get("stop_reason"),
             "elapsed_ms": round(elapsed_ms, 1),
         }
@@ -130,20 +149,57 @@ def _is_retryable(exc: BaseException) -> bool:
     return code in _RETRY_CODES
 
 
-def _build_bedrock_client(settings: Settings) -> Any:
-    """Construct a ``bedrock-runtime`` client tuned for classification.
+_CLIENT_LOCK = threading.Lock()
+_CLIENT_CACHE: dict[tuple[str, int], Any] = {}
 
-    ``retries={"max_attempts": 0}`` disables botocore's internal retry layer so
-    tenacity sees throttling immediately.  ``read_timeout=300`` accommodates
-    Sonnet 4.6 thinking which can hold the connection longer than the default.
+
+def _build_bedrock_client(settings: Settings) -> Any:
+    """Return a process-wide ``bedrock-runtime`` client keyed on region + pool size.
+
+    Per boto3's "Multithreading with clients" guide (2026-05-08) a single
+    ``client`` instance is thread-safe and intended to be shared across
+    workers; creating one per request wastes the TCP pool. We cache by
+    ``(region, pool_size)`` so changes to ``llm_concurrency`` at runtime
+    still produce a fresh client with the right ``max_pool_connections``.
+
+    Config choices (sources in docstrings of the retry decorator and
+    ``_maybe_log_bedrock_call``):
+
+    * ``max_pool_connections`` — botocore default is 10, which starves any
+      concurrency >10. AWS's Bedrock scale guide recommends 50 for high
+      throughput; we size to at least ``2 × llm_concurrency`` with a
+      floor of 32 so embed + friction + trajectory can share without
+      contention.
+    * ``connect_timeout=10`` — aggressive enough to fail fast on network
+      hiccups without swamping short backfills.
+    * ``read_timeout=600`` — Sonnet 4.6 with adaptive thinking + 1M
+      context can hold the connection past the 60-second botocore
+      default. 10 minutes is a safe upper bound for any single call.
+    * ``retries.mode='adaptive'`` + ``max_attempts=0`` — botocore's
+      adaptive client-side token bucket absorbs short throttle bursts
+      at the SDK layer while this module's tenacity decorator owns the
+      semantic retry policy (refusal short-circuit, error
+      classification). ``max_attempts=0`` disables botocore's own
+      retry loop so tenacity sees errors immediately.
     """
-    boto_cfg = BotoConfig(
-        region_name=settings.region,
-        retries={"max_attempts": 0, "mode": "standard"},
-        read_timeout=300,
-        connect_timeout=10,
+    pool_size = max(
+        32,
+        max(settings.embed_concurrency, settings.llm_concurrency) * 2,
     )
-    return boto3.client("bedrock-runtime", config=boto_cfg)
+    key = (settings.region, pool_size)
+    with _CLIENT_LOCK:
+        client = _CLIENT_CACHE.get(key)
+        if client is None:
+            boto_cfg = BotoConfig(
+                region_name=settings.region,
+                retries={"max_attempts": 0, "mode": "adaptive"},
+                max_pool_connections=pool_size,
+                connect_timeout=10,
+                read_timeout=600,
+            )
+            client = boto3.client("bedrock-runtime", config=boto_cfg)
+            _CLIENT_CACHE[key] = client
+        return client
 
 
 @retry(
@@ -305,20 +361,29 @@ async def _classify_one(
     *,
     max_tokens: int,
     thinking_mode: str,
-    sem: asyncio.Semaphore,
+    sem: asyncio.Semaphore | anyio.CapacityLimiter,
     system: str | None = None,
 ) -> dict:
-    """Run one classification call under the concurrency semaphore."""
+    """Run one classification call under the concurrency limiter.
+
+    ``sem`` accepts either an ``asyncio.Semaphore`` (legacy) or an
+    ``anyio.CapacityLimiter`` (new default) — both support
+    ``async with``. The boto3 ``invoke_model`` call is blocking, so we
+    hand it to ``anyio.to_thread.run_sync`` which honors the enclosing
+    structured-concurrency cancellation scope (if any) instead of
+    silently detaching on ``asyncio.to_thread`` cancellation.
+    """
     async with sem:
-        return await asyncio.to_thread(
-            _invoke_classifier_sync,
-            client,
-            model_id,
-            schema,
-            text,
-            max_tokens=max_tokens,
-            thinking_mode=thinking_mode,
-            system=system,
+        return await anyio.to_thread.run_sync(
+            lambda: _invoke_classifier_sync(
+                client,
+                model_id,
+                schema,
+                text,
+                max_tokens=max_tokens,
+                thinking_mode=thinking_mode,
+                system=system,
+            )
         )
 
 
@@ -334,159 +399,164 @@ async def _classify_one(
 # degrades on smaller models and the model has no anchor for ambiguous
 # cases. These constants give every classifier the same anchor.
 
+
 CLASSIFY_SYSTEM_PROMPT = """\
-You are an offline post-hoc analyst classifying complete Claude Code coding sessions.
-The user message contains the full session transcript (user turns, assistant turns,
-tool calls, and tool results), already concatenated for you.
+<instructions>
+You are an offline post-hoc analyst classifying complete Claude Code coding
+sessions. The user message contains the full session transcript (user turns,
+assistant turns, tool calls, and tool results) already concatenated.
 
-Your job: emit ONE row of structured JSON describing the session as a whole.
+Emit exactly one JSON object matching the schema. Four label fields plus a
+self-assessed confidence, no surrounding prose, no markdown fences.
+</instructions>
 
-Output schema (4 fields + confidence)
+<context>
+How to read the transcript:
 
-- ``autonomy_tier``: how much the agent drove the work.
-- ``work_category``: dominant activity for this session.
-- ``success``: did the session reach its stated goal?
-- ``goal``: ONE sentence summarizing what the user wanted.
-- ``confidence``: your self-assessed certainty 0.0–1.0.
+- The opening user message states or implies the goal.
+- Closing exchanges show whether the goal was met.
+- Tool calls plus tool results are the strongest evidence of what actually
+  happened — read past chitchat to the actions.
 
-How to read the transcript
+Pacing patterns:
 
-The opening user message states (or implies) the goal. The closing exchanges show
-whether the goal was met. Tool calls + results are the strongest evidence of what
-actually happened — read past chitchat to the actions.
+- Confirmation pattern (user replies "ok", "thanks", "looks good", short
+  turns separated by long agent runs) → autonomous.
+- Course correction (user re-instructs, names files the agent missed,
+  rewrites the plan mid-flight) → assisted.
+- Step-by-step (user types every instruction, confirms each step, rejects
+  more than they accept) → manual.
 
-Pacing pattern signals
-- "Confirmation" patterns: user replies "ok", "thanks", "looks good", short turns
-  separated by long agent runs → ``autonomous``.
-- "Course correction" patterns: user re-instructs ("no, do X"), names files the
-  agent missed, or rewrites the plan mid-flight → ``assisted``.
-- "Step-by-step" patterns: user types every instruction, confirms each step,
-  rejects more than they accept → ``manual``.
+Work category cues:
 
-Work category cues
-
-- ``sde``: code, tests, refactors, CI failures, debugging, package management,
-  type errors, lint output, anything in src/ or tests/. The default for a
+- sde: code, tests, refactors, CI failures, debugging, package management,
+  type errors, lint output, anything in src/ or tests/. Default for any
   coding-tool session.
-- ``admin``: scheduling, calendar, expense reports, low-signal email triage,
+- admin: scheduling, calendar, expense reports, low-signal email triage,
   routine ops with no code changes.
-- ``strategy_business``: business analysis, competitive landscape, strategic
+- strategy_business: business analysis, competitive landscape, strategic
   memos, proposals, market sizing. Reading and writing strategy documents.
-- ``events``: speaker prep, agenda building, event logistics.
-- ``thought_leadership``: writing for external audiences (blog posts,
+- events: speaker prep, agenda building, event logistics.
+- thought_leadership: writing for external audiences (blog posts,
   conference abstracts, LinkedIn). Polished prose, not internal docs.
-- ``other``: only when nothing else fits. Don't reach for this — most sessions
-  fit one of the above. Sessions that mix sde + a second category should pick
-  the one with more turns / tool calls.
+- other: only when nothing else fits. Sessions that mix sde plus a second
+  category should pick the one with more turns / tool calls.
 
-Success semantics
+Success semantics:
 
-- ``success``: the goal as stated was clearly met. Tests pass, feature works,
+- success: goal as stated was clearly met. Tests pass, feature works,
   document is done, decision is made.
-- ``partial``: the work landed but with explicit caveats or leftover TODOs the
+- partial: the work landed with explicit caveats or leftover TODOs the
   user acknowledged.
-- ``failure``: session ended without reaching the goal — agent gave up,
+- failure: session ended without reaching the goal — agent gave up,
   blocked indefinitely, or wrong path landed.
-- ``unknown``: insufficient signal — session ends mid-task, no clear close,
+- unknown: insufficient signal. Session ends mid-task, no clear close,
   too short to judge.
+</context>
 
-Calibration
+<calibration>
+- Use unknown plus confidence < 0.5 when the evidence is genuinely mixed.
+  Do not manufacture certainty to fill the schema.
+- goal must be one sentence in present tense, paraphrasing the user — not
+  a literal quote, not two goals concatenated with "and".
+- A session that explores three options and doesn't pick one is partial,
+  with unknown only if the user never confirmed the session was over.
+- Confidence is per-row, not per-field. If you're sure of three fields
+  and uncertain about work_category, pick the most likely and reflect
+  the uncertainty in the overall confidence.
+</calibration>
 
-- Use ``unknown`` and ``confidence < 0.5`` when the evidence is genuinely
-  mixed. Do not manufacture certainty to fill the schema.
-- ``goal`` must be a single sentence in present tense, paraphrasing the
-  user — not a literal quote, not two goals concatenated with " and ", not
-  the agent's interpretation of what happened.
-- A session that explores three options and doesn't pick one is ``partial``
-  with ``unknown`` only if the user never even confirmed it was over.
+<examples>
+<example>
+<input>A 4-hour session where the user opens with "implement Phase 2 of the
+auth migration", the agent runs ~80 tool calls, the user replies "ok",
+"good", "ship it" between long agent runs, ends with green tests plus a
+successful merge.</input>
+<output>autonomy_tier=autonomous, work_category=sde, success=success,
+confidence=0.9</output>
+</example>
+<example>
+<input>A 30-minute session where the user pastes a stack trace, the agent
+reads the offending file and proposes a fix, the user says "actually I
+think the bug is in module Y, can you check there", the agent verifies,
+fixes Y, tests pass, the user thanks the agent and ends.</input>
+<output>autonomy_tier=assisted (user redirected), work_category=sde,
+success=success, confidence=0.85</output>
+</example>
+<example>
+<input>A 2-hour session of strategic memo work — user dictates section
+outlines, agent drafts, user rewrites paragraphs heavily, three rounds
+of revision, ends with a published draft.</input>
+<output>autonomy_tier=assisted, work_category=strategy_business,
+success=success, confidence=0.85</output>
+</example>
+<example>
+<input>A session that opens with "schedule a 1:1 with X", the agent calls
+calendar, finds slots, user picks one, agent books, user confirms.</input>
+<output>autonomy_tier=manual, work_category=admin, success=success,
+confidence=0.95</output>
+</example>
+<example>
+<input>A 5-minute session where the user asks "how should I structure the
+test fixture?", the agent explains, the user says "got it" and ends
+without writing code.</input>
+<output>autonomy_tier=manual, work_category=sde, success=success (goal was
+advice, which was given), confidence=0.7</output>
+</example>
+<example>
+<input>A session where the user pastes a 500-line markdown plan and says
+"let's start", the agent runs through the first three sections, but the
+session ends mid-flight with five sections still unaddressed.</input>
+<output>autonomy_tier=assisted, work_category=sde, success=partial,
+confidence=0.85</output>
+</example>
+</examples>
 
-Anti-patterns
-
-1. Don't grade on agent skill. "Success" means the goal was met, even if the
-   path was meandering. "Failure" doesn't mean the agent was bad, it means
-   the goal wasn't met.
-
-2. Don't infer goals from agent actions. The user's opening message is the
-   ground truth for ``goal``. If the agent went on a tangent, the goal is
-   still what the user asked for.
-
-3. Don't confuse "autonomous" with "agent did a lot". Autonomous requires
-   the user to step back and let the agent run. A session where the agent
-   produces lots of code but the user reviews each diff is ``assisted``.
-
-4. ``goal`` is the user's goal, not the session's outcome. If the user asked
-   to refactor X but the agent ended up debugging an unrelated test failure,
-   the ``goal`` is still "refactor X". The detour shows up in ``success``.
-
-5. Confidence is per-row, not per-field. If you're sure of three of the four
-   fields and uncertain about ``work_category``, you can pick the most likely
-   category and reflect the uncertainty in the overall confidence.
-
-Worked examples
-
-A 4-hour session where the user opens with "implement Phase 2 of the auth
-migration", the agent runs ~80 tool calls, the user replies "ok", "good",
-"ship it" between long agent runs, ends with green tests + successful merge:
-  → autonomy_tier=autonomous, work_category=sde, success=success, conf=0.9.
-
-A 30-minute session where the user pastes a stack trace, the agent reads
-the offending file and proposes a fix, the user says "actually I think the
-bug is in module Y, can you check there", the agent verifies, fixes Y,
-tests pass, the user thanks the agent and ends:
-  → autonomy_tier=assisted (user redirected), work_category=sde,
-    success=success, conf=0.85.
-
-A 2-hour session of strategic memo work — user dictates section outlines,
-agent drafts, user rewrites paragraphs heavily, three rounds of revision,
-ends with a published draft:
-  → autonomy_tier=assisted, work_category=strategy_business,
-    success=success, conf=0.85.
-
-A session that opens with "schedule a 1:1 with X", the agent calls calendar,
-finds slots, user picks one, agent books, user confirms:
-  → autonomy_tier=manual, work_category=admin, success=success, conf=0.95.
-
-A 5-minute session where the user asks "how should I structure the test
-fixture?", the agent explains, the user says "got it" and ends without
-writing code:
-  → autonomy_tier=manual, work_category=sde, success=success
-    (the goal was advice, which was given), conf=0.7.
-
-A session where the user pastes a 500-line markdown plan and says "let's
-start", the agent runs through the first three sections, but the session
-ends mid-flight with five sections still unaddressed:
-  → autonomy_tier=assisted, work_category=sde, success=partial, conf=0.85.
-
-Output format
-
-Emit ONLY the JSON object specified by the schema. No surrounding prose,
-no markdown fences, no explanations. The downstream parser is strict.
+<anti_patterns>
+- Don't grade on agent skill. success means the goal was met, even if
+  the path was meandering. failure doesn't mean the agent was bad; it
+  means the goal wasn't met.
+- Don't infer goals from agent actions. The user's opening message is
+  the ground truth for goal. If the agent went on a tangent, the goal is
+  still what the user asked for.
+- Don't confuse autonomous with "agent did a lot". Autonomous requires
+  the user to step back and let the agent run. A session where the
+  agent produces lots of code but the user reviews each diff is assisted.
+- goal is the user's goal, not the session's outcome. If the user asked
+  to refactor X but the agent ended up debugging an unrelated test
+  failure, goal is still "refactor X". The detour shows up in success.
+</anti_patterns>
 """
 
+
 TRAJECTORY_SYSTEM_PROMPT = """\
-You score the emotional polarity of ONE message inside a Claude Code coding session.
+<instructions>
+You score the emotional polarity of ONE message inside a Claude Code coding
+session. The user input is the message text in isolation — you will not
+see the prior turn, by design.
 
-You will see the message text in isolation. You don't get to know whether it was
-written by the user or the assistant — that's intentional. Score what the text
-itself signals.
+Emit exactly one JSON object matching the schema:
 
-Output a single JSON object matching the schema:
-- ``sentiment_delta``: one of ``positive`` / ``neutral`` / ``negative`` (the field
-  name is historical; semantics are absolute polarity, not "vs prior").
-- ``is_transition``: true when the message is pure filler / acknowledgement, false
-  otherwise.
-- ``confidence``: your self-assessed certainty 0.0–1.0.
+- sentiment_delta: one of positive / neutral / negative. The field name
+  is historical; semantics are absolute polarity, not "vs prior".
+- is_transition: true when the message is pure filler / acknowledgement,
+  false otherwise.
+- confidence: self-assessed certainty 0.0-1.0.
 
-Calibration anchors
+Output JSON only. No surrounding prose, no markdown fences.
+</instructions>
 
-For a coding session, the prior on label distribution is roughly:
+<calibration>
+Prior on label distribution for a coding session is roughly:
   neutral 70%, positive 25%, negative 5%.
-If your output drifts away from this distribution on a sustained run, you are
-manufacturing affect. ``neutral`` is the default; deviations need explicit cues.
+If your output drifts away from this distribution on a sustained run, you
+are manufacturing affect. neutral is the default; deviations need explicit
+cues.
 
 NEUTRAL — the majority class. Pick this for:
 - Factual statements: "The function returns a list.", "Tests pass."
-- Procedural turns: "Running the linter.", "Here is the diff.", "Updated foo.py."
+- Procedural turns: "Running the linter.", "Here is the diff.",
+  "Updated foo.py."
 - Plain instructions: "Add a test for the empty case.", "Refactor module X."
 - Plain questions: "Where does the config live?", "Why is this private?"
 - Tool-use narration: "Calling the search API now.", "Reading file Y."
@@ -495,379 +565,410 @@ NEUTRAL — the majority class. Pick this for:
 POSITIVE — visible excitement, approval, or momentum:
 - Direct praise: "nice!", "love this", "perfect", "this is great"
 - Energetic agreement: "yes exactly", "shipping it", "do it"
-- Celebration: "🎉", "finally working", "huge win"
-- Explicit thanks that goes beyond "thanks": "thanks, this is exactly what I needed"
-NOT positive: a polite "thanks", a procedural "ok", a "sounds good" that's just
-pacing the conversation.
+- Celebration: "finally working", "huge win"
+- Explicit thanks that goes beyond "thanks": "thanks, this is exactly
+  what I needed"
+NOT positive: polite "thanks", procedural "ok", a "sounds good" that's
+just pacing the conversation.
 
 NEGATIVE — friction, frustration, blocked:
 - Frustration: "ugh", "seriously?", "are you kidding", "this is broken"
-- Pushback: "no, that's wrong", "I don't think that works", "not what I asked for"
+- Pushback: "no, that's wrong", "I don't think that works", "not what
+  I asked for"
 - Blocked: "this is failing", "I'm stuck", "can't get past X"
 - Sharp correction: "stop doing that", "you keep messing this up"
-NOT negative: a calm correction ("actually let me clarify"), a flagged bug
-report ("noticed an off-by-one"), a curt instruction.
+NOT negative: a calm correction ("actually let me clarify"), a flagged
+bug report ("noticed an off-by-one"), a curt instruction.
 
-is_transition
+is_transition:
 
-Set this true when the message has no substantive content — it's filler:
-- "Ok let me check that.", "Running...", "Done.", "Clean.", "Right.", "Cool."
-- "Got it, moving on.", "Yep.", "Sure."
+Set true when the message has no substantive content — it's filler:
+- "Ok let me check that.", "Running...", "Done.", "Clean.", "Right.",
+  "Cool.", "Got it, moving on.", "Yep.", "Sure."
 
-Set false when the message carries information, instruction, question, or affect,
-even if it's short. "tests pass" is neutral but NOT a transition. "ugh" is negative
-and not a transition either.
+Set false when the message carries information, instruction, question,
+or affect, even if it's short. "tests pass" is neutral but NOT a
+transition. "ugh" is negative and not a transition either.
+</calibration>
 
-Anti-patterns to avoid
+<examples>
+<example>
+<input>Tests pass.</input>
+<output>sentiment_delta=neutral, is_transition=true, confidence=0.9</output>
+</example>
+<example>
+<input>All 240 passed, 4 warnings in 53s.</input>
+<output>sentiment_delta=neutral, is_transition=false, confidence=0.9.
+Information-dense report.</output>
+</example>
+<example>
+<input>shipping it</input>
+<output>sentiment_delta=positive, is_transition=false, confidence=0.95.
+Explicit decision verb plus momentum.</output>
+</example>
+<example>
+<input>ok let me check that</input>
+<output>sentiment_delta=neutral, is_transition=true, confidence=0.9.
+Acknowledgement filler. The "ok" doesn't carry affect; it's pacing.</output>
+</example>
+<example>
+<input>this entire approach is wrong because the cache key is per-tenant</input>
+<output>sentiment_delta=negative, is_transition=false, confidence=0.9.
+Substantive disagreement with reasoning. Negative even though articulate.</output>
+</example>
+<example>
+<input>running pytest now</input>
+<output>sentiment_delta=neutral, is_transition=true, confidence=0.85.
+Procedural narration.</output>
+</example>
+<example>
+<input>that's not what I meant — I want X to be derived, not stored</input>
+<output>sentiment_delta=negative, is_transition=false, confidence=0.85.
+Correction with a substantive counter-proposal.</output>
+</example>
+<example>
+<input>perfect, this is exactly what I wanted</input>
+<output>sentiment_delta=positive, is_transition=false, confidence=0.95.
+Direct praise plus specificity.</output>
+</example>
+<example>
+<input>hmm, that doesn't seem right</input>
+<output>sentiment_delta=negative, is_transition=false, confidence=0.65.
+Mild pushback. Confidence below 0.7 because "hmm" is genuinely ambiguous
+— could be deliberation.</output>
+</example>
+<example>
+<input>thanks</input>
+<output>sentiment_delta=neutral, is_transition=true, confidence=0.7.
+Bare politeness. Not positive (no specificity), a social close.</output>
+</example>
+<example>
+<input>Done.</input>
+<output>sentiment_delta=neutral, is_transition=true, confidence=0.9.
+Single-word close-out. Filler.</output>
+</example>
+<example>
+<input>no don't do that</input>
+<output>sentiment_delta=negative, is_transition=false, confidence=0.9.
+Hard correction. The "no" plus "don't" is the cue.</output>
+</example>
+<example>
+<input>I think we should go with the simple version for now</input>
+<output>sentiment_delta=neutral, is_transition=false, confidence=0.85.
+Substantive opinion without affect. "For now" signals pragmatism, not
+positivity.</output>
+</example>
+</examples>
 
-1. Don't manufacture certainty. Confidence < 0.7 is appropriate when the message
-   is short, single-word, or context-dependent. The downstream pipeline weights
-   by confidence — don't hand-wave.
-
-2. Don't conflate length with neutrality. A long technical message can still be
-   negative ("This entire approach is wrong because…"). A short message can still
-   be positive ("ship it!").
-
-3. Don't read intent into procedural text. A bare "Done." is a transition, not
-   triumphant positive. A bare "Running tests" is neutral, not anxious negative.
-
-4. Avoid the "slightly positive" / "mildly negative" trap. The schema has three
-   labels for a reason. If you're tempted to pick a side, the answer is neutral.
-
-5. Tool-use narration ("calling X", "reading Y", "checking Z") is overwhelmingly
-   neutral. Don't score the agent's procedural play-by-play as positive momentum
-   unless the wording itself is enthusiastic.
-
-6. Length is not affect. A 50-word careful explanation can be neutral. A
-   3-word reply ("ship it!") can be positive. Polarity is in the words, not
-   the size of the message.
-
-Worked examples
-
-Each example below is one isolated message — the kind of input you'll see —
-followed by the correct label and a short why. Patterns to internalize:
-
-"Tests pass."
-  → neutral / is_transition=true / conf=0.9.
-  Pure procedural close-out. Even a "pass" could read as positive but the
-  default for a status report is neutral.
-
-"All 240 passed, 4 warnings in 53s."
-  → neutral / is_transition=false / conf=0.9.
-  Information-dense report. Not transition (carries data), not affect.
-
-"shipping it 🚀"
-  → positive / is_transition=false / conf=0.95.
-  Explicit excitement + emoji + decision verb. Unambiguous positive.
-
-"ok let me check that"
-  → neutral / is_transition=true / conf=0.9.
-  Acknowledgement filler. The "ok" doesn't carry affect; it's pacing.
-
-"this entire approach is wrong because the cache key is per-tenant"
-  → negative / is_transition=false / conf=0.9.
-  Substantive disagreement with reasoning. Negative even though articulate.
-
-"running pytest now"
-  → neutral / is_transition=true / conf=0.85.
-  Procedural narration. Tool-use play-by-play.
-
-"that's not what I meant — I want X to be derived, not stored"
-  → negative / is_transition=false / conf=0.85.
-  Correction with a substantive counter-proposal. Friction is real here.
-
-"perfect, this is exactly what I wanted"
-  → positive / is_transition=false / conf=0.95.
-  Direct praise + specificity ("exactly what I wanted"). Strong positive.
-
-"hmm, that doesn't seem right"
-  → negative / is_transition=false / conf=0.65.
-  Mild pushback. Conf below 0.7 because "hmm" is genuinely ambiguous —
-  could be deliberation. Negative is the right read but uncertain.
-
-"thanks"
-  → neutral / is_transition=true / conf=0.7.
-  Bare politeness. Not positive (no specificity), not transition (it's a
-  social close), but the schema treats short acknowledgements as transitions
-  for downstream filtering. Conf reflects the close call.
-
-"Done."
-  → neutral / is_transition=true / conf=0.9.
-  Single-word close-out. Filler.
-
-"no don't do that"
-  → negative / is_transition=false / conf=0.9.
-  Hard correction. Even bare imperative — the "no" + "don't" is the cue.
-
-"I think we should go with the simple version for now"
-  → neutral / is_transition=false / conf=0.85.
-  Substantive opinion without affect. Could read mildly positive ("for now"
-  signals pragmatism) but the default is neutral.
-
-Output format
-
-Emit ONLY the JSON object specified by the schema. No surrounding prose, no
-markdown fences, no explanations. The downstream parser is strict.
+<anti_patterns>
+- Don't manufacture certainty. Confidence < 0.7 is appropriate when the
+  message is short, single-word, or context-dependent. The downstream
+  pipeline weights by confidence — don't hand-wave.
+- Don't conflate length with neutrality. A long technical message can
+  still be negative ("This entire approach is wrong because..."). A
+  short message can still be positive ("ship it!").
+- Don't read intent into procedural text. A bare "Done." is a
+  transition, not triumphant positive. A bare "Running tests" is
+  neutral, not anxious negative.
+- Avoid the "slightly positive" / "mildly negative" trap. The schema
+  has three labels for a reason. If tempted to pick a side, the answer
+  is neutral.
+- Tool-use narration ("calling X", "reading Y", "checking Z") is
+  overwhelmingly neutral. Don't score the agent's procedural play-by-
+  play as positive momentum unless the wording itself is enthusiastic.
+- Length is not affect. A 50-word careful explanation can be neutral.
+  A 3-word reply ("ship it!") can be positive. Polarity is in the words,
+  not the size of the message.
+</anti_patterns>
 """
 
+
 CONFLICTS_SYSTEM_PROMPT = """\
-You analyze a complete Claude Code coding session for STANCE CONFLICTS — moments
-where the user and the agent (or the agent's own reasoning) hold mutually-exclusive
-positions on the same substantive question.
+<instructions>
+You analyze a complete Claude Code coding session for STANCE CONFLICTS —
+moments where the user and the agent (or the agent's own reasoning) hold
+mutually-exclusive positions on the same substantive question.
 
-Output an array of conflicts (or an empty array if none). Most sessions have ZERO
-real conflicts — that's the expected default.
+Emit exactly one JSON object with a conflicts array. Each conflict has
+three fields: stance_a, stance_b (one-sentence summaries) and resolution
+(resolved / unresolved / abandoned). An empty list is valid and common.
 
-Output schema
+Output JSON only. No surrounding prose, no markdown fences.
+</instructions>
 
-A conflict is a JSON object with three fields:
-- ``stance_a``: one-sentence summary of the first position.
-- ``stance_b``: one-sentence summary of the conflicting position.
-- ``resolution``: ``resolved`` / ``unresolved`` / ``abandoned``.
+<context>
+What counts as a conflict:
 
-You output a list. An empty list ``[]`` is valid and common.
-
-What counts as a conflict
-
-- Two stances on the same technical decision held by different parties (or by
-  the same party at different points). "Use Sonnet" vs. "use Opus". "Ship
-  the simple version now" vs. "wait for the architectural cleanup". "Cache
-  the embeddings" vs. "rebuild from parquet every run".
-- Two stances on a strategic / scope decision: "rename the field" vs. "keep
-  the field name and shift semantics". "One bundled PR" vs. "split into
-  three". "Fix it on this branch" vs. "open a follow-up".
+- Two stances on the same technical decision held by different parties,
+  or by the same party at different points. "Use Sonnet" vs "use Opus".
+  "Ship the simple version now" vs "wait for the architectural cleanup".
+  "Cache the embeddings" vs "rebuild from parquet every run".
+- Two stances on a strategic / scope decision: "rename the field" vs
+  "keep the field name and shift semantics". "One bundled PR" vs
+  "split into three". "Fix it on this branch" vs "open a follow-up".
 - The conflict must be SUBSTANTIVE — measurable consequences, not style.
 
-What does NOT count
+Resolution semantics:
 
-- The agent proposes a plan, the user agrees with caveats and the agent
-  adapts. That's collaboration, not conflict.
-- The agent considers two approaches in its reasoning, then picks one with
-  the user's blessing. That's deliberation.
-- Surface-level pushback that the user immediately retracts ("wait — never
-  mind, you're right").
-- Style or formatting disagreements ("I'd phrase that differently",
-  "use semicolons not commas").
-- The agent flags risk and the user accepts it. That's a noted caveat,
-  not a conflict.
-- Two failed attempts at the same task (the agent tried X, then Y). That's
-  iteration, not conflict.
-- Tooling preferences without consequence ("I'd use jq here" vs. "I'd use
-  python -c").
-
-Resolution semantics
-
-- ``resolved``: the session converged on one stance with explicit agreement.
+- resolved: the session converged on one stance with explicit agreement.
   Look for "ok let's do that", "you're right", "going with X".
-- ``unresolved``: both stances were still live at session end. The user
-  punted, the agent didn't pick, or the session ran out of time.
-- ``abandoned``: the topic was dropped without a decision. Different from
+- unresolved: both stances were still live at session end. User punted,
+  agent didn't pick, or session ran out of time.
+- abandoned: topic was dropped without a decision. Different from
   unresolved — abandoned means the conversation moved on, not that they
   failed to decide.
 
-Conflict identification heuristics
+Identification heuristics:
 
-1. The strongest signal is a structural pattern: stance A is proposed,
-   counter-stance B is raised explicitly, then a decision is made (or not).
-   Without an explicit counter-stance, you don't have a conflict.
-
-2. Look for verbal markers: "but I think", "actually I'd argue", "I disagree",
+1. Strongest signal is structural: stance A proposed, counter-stance B
+   raised explicitly, then a decision made (or not). Without an explicit
+   counter-stance, you don't have a conflict.
+2. Verbal markers: "but I think", "actually I'd argue", "I disagree",
    "the other side of that is", "alternatively", "or we could".
+3. Skip agent's internal monologue ("on one hand X, on the other Y") when
+   the agent immediately picks one — that's deliberation. Only count when
+   the user (or another party) holds the other stance.
+</context>
 
-3. Skip the agent's internal monologue ("on one hand X, on the other Y")
-   when the agent immediately picks one — that's deliberation. Only count
-   when the user (or another party) holds the other stance.
-
-Calibration
-
+<calibration>
 When in doubt, return an empty conflicts array. False positives pollute
-the corpus more than missed conflicts hurt — the downstream views
-(``session_conflicts``) are used by humans to find interesting decision
+the corpus more than missed conflicts hurt — downstream views
+(session_conflicts) are used by humans to find interesting decision
 points, and noise drowns signal.
 
-A typical coding session has 0 conflicts. A typical strategy / planning
-session has 0–2. Sessions with 3+ conflicts exist but are rare; double-check
-your output if you're emitting that many.
+Typical coding session has 0 conflicts. Typical strategy / planning
+session has 0-2. Sessions with 3+ conflicts exist but are rare;
+double-check your output if you're emitting that many.
+</calibration>
 
-Worked examples
+<examples>
+<example>
+<input>User wants to optimize a slow query. Agent proposes denormalizing
+the table. User counters: "no, let's add a covering index instead — I
+don't want to touch the schema". Agent accepts the index approach and
+ships it.</input>
+<output>conflicts=[{stance_a: "Denormalize the table to make the query
+faster.", stance_b: "Keep the schema; add a covering index instead.",
+resolution: "resolved"}]</output>
+</example>
+<example>
+<input>User proposes a 3-step plan. Agent says "I think step 2 is risky
+because of X — should we add a rollback first?" User agrees, plan
+becomes 4 steps. Both proceed.</input>
+<output>conflicts=[]. Agent flagged a risk, user incorporated it. No
+counter-stance held.</output>
+</example>
+<example>
+<input>Agent's reasoning shows "I could use approach A or approach B,
+but A is simpler so I'll go with A". User says "ok".</input>
+<output>conflicts=[]. Agent considered alternatives in its own
+thinking. User didn't hold a counter-stance.</output>
+</example>
+<example>
+<input>User says "wait, isn't that going to break X?" Agent explains
+why not. User: "oh you're right, never mind."</input>
+<output>conflicts=[]. Question surfaced, answered, retracted. No
+sustained position.</output>
+</example>
+<example>
+<input>User leans toward "ship simple version now", agent leans toward
+"wait for architectural cleanup". Session ends without a decision; user
+says "let me think about it".</input>
+<output>conflicts=[{stance_a: "Ship the simple version now to unblock
+users.", stance_b: "Wait for the architectural cleanup so we don't ship
+debt.", resolution: "unresolved"}]</output>
+</example>
+<example>
+<input>Brief disagreement about which CI config to use. User pivots to
+a different topic. Never returns to the CI question.</input>
+<output>conflicts=[{stance_a: "Use GitHub Actions for the new pipeline.",
+stance_b: "Stick with the existing CodeBuild setup.",
+resolution: "abandoned"}]</output>
+</example>
+</examples>
 
-Pattern A — a real conflict, resolved:
-  Session: user wants to optimize a slow query. Agent proposes denormalizing
-  the table. User counters: "no, let's add a covering index instead — I don't
-  want to touch the schema". Agent accepts the index approach and ships it.
-  → [{stance_a: "Denormalize the table to make the query faster.",
-      stance_b: "Keep the schema; add a covering index instead.",
-      resolution: "resolved"}]
-
-Pattern B — collaboration that LOOKS like conflict but isn't:
-  Session: user proposes a 3-step plan. Agent says "I think step 2 is risky
-  because of X — should we add a rollback first?" User agrees, plan becomes
-  4 steps. Both proceed.
-  → conflicts: []
-  Why: agent flagged a risk, user incorporated it. No counter-stance held.
-
-Pattern C — agent deliberation, also not a conflict:
-  Session: agent's reasoning shows "I could use approach A or approach B,
-  but A is simpler so I'll go with A". User says "ok".
-  → conflicts: []
-  Why: agent considered alternatives in its own thinking. User didn't hold
-  a counter-stance.
-
-Pattern D — surface pushback that retracts:
-  Session: user says "wait, isn't that going to break X?" Agent explains why
-  not. User: "oh you're right, never mind."
-  → conflicts: []
-  Why: question surfaced, answered, retracted. No sustained position.
-
-Pattern E — unresolved conflict:
-  Session: user leans toward "ship simple version now", agent leans toward
-  "wait for architectural cleanup". Session ends without a decision; user
-  says "let me think about it".
-  → [{stance_a: "Ship the simple version now to unblock users.",
-      stance_b: "Wait for the architectural cleanup so we don't ship debt.",
-      resolution: "unresolved"}]
-
-Pattern F — abandoned conflict:
-  Session: brief disagreement about which CI config to use. User pivots to
-  a different topic. Never returns to the CI question.
-  → [{stance_a: "Use GitHub Actions for the new pipeline.",
-      stance_b: "Stick with the existing CodeBuild setup.",
-      resolution: "abandoned"}]
-
-Output format
-
-Emit ONLY the JSON object specified by the schema (a top-level object with
-a ``conflicts`` array). No surrounding prose, no markdown fences, no
-explanations. The downstream parser is strict.
+<anti_patterns>
+- Don't count collaboration as conflict. Agent proposes a plan, user
+  agrees with caveats and the agent adapts. That's collaboration.
+- Don't count agent deliberation. Agent considers two approaches in its
+  own reasoning, then picks one with the user's blessing. That's
+  deliberation, not conflict.
+- Don't count surface-level pushback that the user immediately retracts.
+- Don't count style / formatting disagreements ("I'd phrase that
+  differently", "use semicolons not commas").
+- Don't count accepted risk. Agent flags risk, user accepts it. That's
+  a noted caveat, not a conflict.
+- Don't count iteration. Two failed attempts at the same task (agent
+  tried X, then Y). That's iteration, not conflict.
+- Don't count tooling preferences without consequence ("I'd use jq here"
+  vs "I'd use python -c").
+</anti_patterns>
 """
 
+
 USER_FRICTION_SYSTEM_PROMPT = """\
-You classify ONE short user message from a Claude Code coding session for friction
-signals — cues that the human is impatient, confused, interrupting the agent,
-correcting it, or asking for something the agent should have provided proactively
-but didn't.
+<instructions>
+You classify ONE short user message from a Claude Code coding session for
+friction signals — cues that the human is impatient, confused,
+interrupting the agent, correcting it, or asking for something the agent
+should have provided proactively but didn't.
 
-The message is presented in isolation. You will not see the prior turns or the
-agent response that preceded it. Make the call from the message text alone.
+The message is presented in isolation. You will not see prior turns or
+the agent response that preceded it. Make the call from the message
+text alone.
 
-Output a single JSON object with three fields: ``label`` (one of the seven
-enum values below), ``rationale`` (one short sentence naming the cue), and
-``confidence`` (0.0–1.0).
+Emit exactly one JSON object with three fields: label (one of the seven
+values below), rationale (one short sentence naming the cue), and
+confidence (0.0-1.0). Output JSON only. No surrounding prose, no
+markdown fences.
+</instructions>
 
-Label semantics
+<context>
+Label semantics:
 
-- ``status_ping``: progress / ETA query.
-  Triggers: "how's it going?", "any update?", "where are we?", "still working?",
-  "what's your eta?", "are you alive?"
-  NOT triggers: "where does the config live?" (technical question), "where are
-  we in the migration plan?" (substantive scope question).
+- status_ping: progress / ETA query.
+  Triggers: "how's it going?", "any update?", "where are we?",
+  "still working?", "what's your eta?", "are you alive?"
+  NOT triggers: "where does the config live?" (technical question),
+  "where are we in the migration plan?" (substantive scope question).
 
-- ``unmet_expectation``: short question pointing at something the agent should
-  have produced.
-  Triggers: bare one-word questions ending in ``?``: "screenshot?", "tests?",
-  "diff?", "link?", "logs?", "stacktrace?".
-  NOT triggers: "what's the type of X?" (substantive), "tests for which file?"
-  (clarification, not friction).
+- unmet_expectation: short question pointing at something the agent
+  should have produced.
+  Triggers: bare one-word questions ending in "?": "screenshot?",
+  "tests?", "diff?", "link?", "logs?", "stacktrace?".
+  NOT triggers: "what's the type of X?" (substantive),
+  "tests for which file?" (clarification, not friction).
 
-- ``confusion``: the user signals they don't follow the output or state.
-  Triggers: "what does that mean?", "I don't get it", "huh?", "why did you
-  do X?" (when X already happened), "wait, what?"
-  NOT triggers: a calm question about a future action, a request for explanation
-  ("explain that step please" — neutral instruction).
+- confusion: user signals they don't follow the output or state.
+  Triggers: "what does that mean?", "I don't get it", "huh?",
+  "why did you do X?" (when X already happened), "wait, what?"
+  NOT triggers: a calm question about a future action, a request for
+  explanation ("explain that step please" — neutral instruction).
 
-- ``interruption``: the user cuts the agent off or pivots mid-task.
-  Triggers: "wait", "stop", "hold on", "pause", "actually...", "before you do
-  that", "nvm", "never mind".
-  NOT triggers: "wait until tests pass" (instruction, not interrupt), "stop the
-  server" (action request).
+- interruption: user cuts the agent off or pivots mid-task.
+  Triggers: "wait", "stop", "hold on", "pause", "actually...",
+  "before you do that", "nvm", "never mind".
+  NOT triggers: "wait until tests pass" (instruction, not interrupt),
+  "stop the server" (action request).
 
-- ``correction``: explicit "you got it wrong".
-  Triggers: "no, not that", "that's wrong", "nope", "try again", "you're doing
-  it wrong", "incorrect".
+- correction: explicit "you got it wrong".
+  Triggers: "no, not that", "that's wrong", "nope", "try again",
+  "you're doing it wrong", "incorrect".
   NOT triggers: "actually let me clarify" (re-framing, not correcting),
   technical bug reports ("X returns None instead of []" — substantive).
 
-- ``frustration``: terse annoyance or sarcasm.
-  Triggers: "ugh", "seriously?", "are you kidding", "really?", "come on".
+- frustration: terse annoyance or sarcasm.
+  Triggers: "ugh", "seriously?", "are you kidding", "really?",
+  "come on".
   NOT triggers: a curt but neutral instruction.
 
-- ``none``: ordinary task turn. THIS IS THE MAJORITY CLASS — use it aggressively.
-  Anything that's a substantive instruction, a plain technical question, an
-  acknowledgement, a routing decision, or text the user typed to advance the
-  task is ``none``. The threshold for friction is high.
+- none: ordinary task turn. THIS IS THE MAJORITY CLASS — use it
+  aggressively. Anything that's a substantive instruction, a plain
+  technical question, an acknowledgement, a routing decision, or text
+  the user typed to advance the task is none. The threshold for
+  friction is high.
+</context>
 
-Anti-patterns
-
-1. A bare instruction is ``none``, even if it sounds curt. "delete that file" is
-   not correction. "add a test for X" is not unmet_expectation.
-
-2. A short technical question is ``none``. "what's the type?" / "where is X?"
-   are not friction signals. Friction requires affect or implicit complaint.
-
-3. Don't flag based on tone alone. "ok" is ``none``, even if you imagine it's
-   sarcastic — without surrounding context you can't tell, so default to none.
-
-4. Claude Code injects two strings as user-role messages that look like friction
-   but are CLI bookkeeping: "Continue from where you left off." and "[Request
-   interrupted by user for tool use]". Both should be ``none``. (They're
-   filtered upstream so you'll rarely see them, but be safe.)
-
-Calibration
-
-- ``confidence < 0.5`` is correct when the message is genuinely ambiguous
-  between ``none`` and a friction label. Don't manufacture certainty.
-- ``confidence > 0.8`` requires an unambiguous cue you can name in the
-  ``rationale`` field.
+<calibration>
+- confidence < 0.5 is correct when the message is genuinely ambiguous
+  between none and a friction label. Don't manufacture certainty.
+- confidence > 0.8 requires an unambiguous cue you can name in the
+  rationale field.
 - For obvious cases ("ugh"), 0.95 is fine.
+</calibration>
 
-Output format
+<examples>
+<example>
+<input>screenshot?</input>
+<output>label=unmet_expectation, confidence=0.7. Bare one-word
+question pointing at a missed artifact.</output>
+</example>
+<example>
+<input>stop</input>
+<output>label=interruption, confidence=0.95. Hard interruption keyword
+as the entire message.</output>
+</example>
+<example>
+<input>delete that file</input>
+<output>label=none, confidence=0.9. Bare instruction, not friction.</output>
+</example>
+<example>
+<input>ugh</input>
+<output>label=frustration, confidence=0.95. Unambiguous annoyance.</output>
+</example>
+<example>
+<input>why did you do that?</input>
+<output>label=confusion, confidence=0.85. Questioning a completed
+action.</output>
+</example>
+<example>
+<input>where does the config live?</input>
+<output>label=none, confidence=0.9. Substantive technical question.</output>
+</example>
+<example>
+<input>nope, try again</input>
+<output>label=correction, confidence=0.95. Explicit rejection plus
+redo.</output>
+</example>
+<example>
+<input>tests for the auth module</input>
+<output>label=none, confidence=0.9. Substantive instruction — what
+tests, not a bare "tests?".</output>
+</example>
+</examples>
 
-Emit ONLY the JSON object. No surrounding prose, no markdown fences, no
-explanations. The downstream parser is strict.
+<anti_patterns>
+- A bare instruction is none, even if it sounds curt. "delete that file"
+  is not correction. "add a test for X" is not unmet_expectation.
+- A short technical question is none. "what's the type?" /
+  "where is X?" are not friction signals. Friction requires affect or
+  implicit complaint.
+- Don't flag based on tone alone. "ok" is none, even if you imagine
+  it's sarcastic — without surrounding context you can't tell, so
+  default to none.
+- Claude Code injects two strings as user-role messages that look like
+  friction but are CLI bookkeeping: "Continue from where you left off."
+  and "[Request interrupted by user for tool use]". Both should be
+  none. (They're filtered upstream so you'll rarely see them, but be
+  safe.)
+</anti_patterns>
 """
 
 
-# A shared appendix concatenated onto every classifier system prompt. Two
-# jobs: (1) document offline-analyst conventions in one place rather than
-# copy-pasting them four ways; (2) push every system prompt above
-# Sonnet's ~1024-token cache minimum so ``cache_control: ephemeral`` on
-# the system block actually triggers a discount instead of being silently
-# ignored. The appendix is intentionally identical across pipelines so
-# any future Bedrock prefix-matching cache (beyond explicit cache_control)
-# can hash-match on the trailing chunk.
 _CLASSIFIER_APPENDIX = """\
 
-Operating context
+<operating_context>
+You are running offline against a snapshot of Claude Code transcripts
+already on disk. There is no live user to clarify with — you must commit
+to one output for each call. The downstream pipeline writes your output
+to a parquet file used by SQL views and analytics macros; future you (or
+a human auditor) will read these rows in aggregate, not in isolation.
+</operating_context>
 
-You are running offline against a snapshot of Claude Code transcripts already
-on disk. There is no live user to clarify with — you must commit to one
-output for each call. The downstream pipeline writes your output to a
-parquet file used by SQL views and analytics macros; future you (or a
-human auditor) will read these rows in aggregate, not in isolation.
-
-Quality bar
-
+<quality_bar>
 - Idempotence: the same input must produce the same output across runs.
   Don't introduce randomness or invent details that aren't in the input.
 - Calibration over confidence: a low confidence with the correct label
   is more useful than a high confidence with the wrong one. Confidence
   is downstream-weighted; honesty pays.
 - Failure mode: if the input is genuinely undecidable, pick the most
-  conservative / abstaining label the schema allows (``unknown``,
-  ``none``, empty list) and set confidence below 0.5. Do not guess.
+  conservative / abstaining label the schema allows (unknown, none,
+  empty list) and set confidence below 0.5. Do not guess.
 - The schema is the contract: every field is required, no field may be
   null unless the schema marks it optional, and string fields have
   practical length budgets stated in their descriptions — respect them.
+</quality_bar>
 
-Format reminders
-
-- Output is parsed as JSON. Bedrock's ``output_config.format`` enforces
-  the schema, but you should still produce valid JSON without surrounding
-  text or fences. The parser ignores prose; you waste tokens by emitting it.
+<output_rules>
+- Output is parsed as JSON. Bedrock's output_config.format enforces the
+  schema, but you should still produce valid JSON without surrounding
+  text or fences. The parser ignores prose; you waste tokens by emitting
+  it.
 - Do not echo the schema, the system prompt, or the user message back.
   Just the structured object.
 - Field order in your output should match the order in the schema. This
   is conventional, not enforced, but it makes the parquet rows readable.
+</output_rules>
 """
 
 
@@ -938,7 +1039,7 @@ async def _classify_sessions_async(
         logger.info("classify: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.llm_concurrency)
+    sem = anyio.CapacityLimiter(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info(
         "classify: {} pending, model={}, thinking={}, concurrency={}, chunks of {}",
@@ -1276,7 +1377,7 @@ async def _trajectory_async(
         return len(heuristic_rows)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.llm_concurrency)
+    sem = anyio.CapacityLimiter(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(heuristic_rows)
 
@@ -1502,7 +1603,7 @@ async def _conflicts_async(
         logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.llm_concurrency)
+    sem = anyio.CapacityLimiter(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info("conflicts: {} pending sessions", len(pending))
 
