@@ -477,3 +477,63 @@ Session-pinned queries still scan every file because `sessionId` is a
 *field* inside each JSONL, not a partition key. Add
 `AND source_file LIKE '%<session_id>.jsonl'` to let the filename filter
 prune the scan to a single file.
+
+## Performance tuning
+
+claude-sql ships sensible defaults for a single-user devbox; the env
+vars below override them for hosts with different shape. All are read
+through pydantic-settings with the `CLAUDE_SQL_` prefix.
+
+| Variable | Default | When to change |
+|---|---|---|
+| `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | Pin lower on a shared host or in CI. |
+| `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | Use an absolute size like `'4GB'` on shared hosts; percentage strings are resolved against host RAM at apply time. |
+| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | Point at faster / bigger storage if clustering spills. Avoid `/tmp` on Amazon devboxes — it's a 4 GB tmpfs. |
+| `CLAUDE_SQL_HNSW_DB_PATH` | `~/.claude/hnsw.duckdb` | Move the persistent HNSW store off `~/.claude/` if disk space is tight. |
+| `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Drop to 2-4 if Bedrock starts throttling Cohere Embed v4 (rare on global CRIS). |
+| `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Bump to 4 cautiously for Sonnet 4.6; tenacity catches transient throttles. |
+| `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Higher captures more friction signals at higher Bedrock cost. |
+
+### Profiling a slow query
+
+Add `--profile-json` to `query` or `explain` to drop a JSON timing tree
+under `~/.claude/profiling/`:
+
+```bash
+claude-sql query --profile-json "SELECT count(*) FROM messages_text"
+ls ~/.claude/profiling/
+# query-1738234567890.json
+```
+
+The file contains DuckDB's operator tree with cardinality + cpu_time per
+node — feed it back to an LLM or `jq` to find the dominant operator.
+
+### Cache layout
+
+Five caches use the **sharded directory** layout (one
+`part-<ts_ns>.parquet` per worker chunk):
+
+- `~/.claude/embeddings/`
+- `~/.claude/session_classifications/`
+- `~/.claude/message_trajectory/`
+- `~/.claude/session_conflicts/`
+- `~/.claude/user_friction/`
+
+Three remain single-file (written once per worker run, no sharding
+payoff): `clusters.parquet`, `cluster_terms.parquet`,
+`session_communities.parquet`.
+
+Consolidate accumulated parts back into one file:
+
+```bash
+claude-sql cache compact --no-dry-run
+```
+
+Migrate a legacy single-file cache from a previous version into the new
+directory layout:
+
+```bash
+claude-sql cache migrate --no-dry-run
+```
+
+Both default to `--dry-run` so you preview the moves before committing.

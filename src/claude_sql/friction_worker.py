@@ -50,12 +50,11 @@ from claude_sql.llm_worker import (
     _classify_one,
     _estimate_cost,
 )
+from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import USER_FRICTION_SCHEMA
 from claude_sql.session_text import session_bounds
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import duckdb
 
     from claude_sql.config import Settings
@@ -175,15 +174,6 @@ _SCHEMA: dict[str, Any] = {
 }
 
 
-def _append_parquet(path: Path, df: pl.DataFrame) -> None:
-    """Append-by-rewrite: load existing parquet, concat, write."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 16:
-        existing = pl.read_parquet(path)
-        df = pl.concat([existing, df], how="diagonal_relaxed")
-    df.write_parquet(path)
-
-
 # ---------------------------------------------------------------------------
 # Candidate SQL
 # ---------------------------------------------------------------------------
@@ -263,8 +253,9 @@ async def _classify_async(
     """Async body behind :func:`detect_user_friction`."""
     out_path = settings.user_friction_parquet_path
     already: set[str] = set()
-    if out_path.exists() and out_path.stat().st_size > 16:
-        already = set(pl.read_parquet(out_path)["uuid"].to_list())
+    done_df = read_all(out_path)
+    if done_df is not None and done_df.height > 0:
+        already = set(done_df["uuid"].to_list())
 
     # Session-level checkpoint: skip sessions unchanged since last run.
     bounds = session_bounds(con, since_days=since_days, limit=limit)
@@ -333,7 +324,7 @@ async def _classify_async(
     )
 
     if fast_rows:
-        _append_parquet(out_path, pl.DataFrame(fast_rows, schema=_SCHEMA))
+        write_part(out_path, pl.DataFrame(fast_rows, schema=_SCHEMA))
 
     processed_sessions: set[str] = {r["session_id"] for r in fast_rows}
 
@@ -349,7 +340,7 @@ async def _classify_async(
 
     # 2. LLM path.
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(fast_rows)
 
@@ -422,7 +413,7 @@ async def _classify_async(
             processed_sessions.add(session_id)
 
         if ok_rows:
-            _append_parquet(out_path, pl.DataFrame(ok_rows, schema=_SCHEMA))
+            write_part(out_path, pl.DataFrame(ok_rows, schema=_SCHEMA))
             done_uuids = ok_uuids + refused_uuids
             if done_uuids:
                 retry_queue.mark_done(

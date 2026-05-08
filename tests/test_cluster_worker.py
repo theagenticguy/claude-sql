@@ -93,3 +93,58 @@ def test_clustering_errors_when_input_missing(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         run_clustering(s, force=True)
+
+
+def test_clustering_skips_via_mtime_sidecar(synthetic_settings: Settings) -> None:
+    """Second run with the same embeddings mtime returns from the sidecar cache.
+
+    The sidecar fast path skips the ~40 s UMAP+HDBSCAN refit when the
+    embeddings haven't moved. The check is sub-second (just a stat + a
+    file read), well under the 500 ms target the plan calls out.
+    """
+    import time as _t
+
+    run_clustering(synthetic_settings, force=True)
+    sidecar = synthetic_settings.clusters_parquet_path.with_suffix(
+        synthetic_settings.clusters_parquet_path.suffix + ".embeddings_mtime"
+    )
+    assert sidecar.exists()
+    first_sidecar = sidecar.read_text()
+
+    # Second call must complete fast (no UMAP reduction) and return the
+    # cached stats unchanged.
+    t0 = _t.monotonic()
+    stats = run_clustering(synthetic_settings, force=False)
+    elapsed = _t.monotonic() - t0
+    assert stats["total"] == 250
+    assert elapsed < 1.0, f"sidecar fast path took {elapsed:.3f}s, expected <1.0s"
+    assert sidecar.read_text() == first_sidecar
+
+
+def test_clustering_rebuilds_when_embeddings_mtime_changes(
+    synthetic_settings: Settings,
+) -> None:
+    """A bumped embeddings mtime invalidates the sidecar and forces a rebuild."""
+    import os as _os
+
+    run_clustering(synthetic_settings, force=True)
+    sidecar = synthetic_settings.clusters_parquet_path.with_suffix(
+        synthetic_settings.clusters_parquet_path.suffix + ".embeddings_mtime"
+    )
+    pre = sidecar.read_text()
+
+    # Bump every part-file (or the legacy single file) past the sidecar's mtime.
+    embeddings_path = synthetic_settings.embeddings_parquet_path
+    targets = (
+        list(embeddings_path.glob("part-*.parquet"))
+        if embeddings_path.is_dir()
+        else [embeddings_path]
+    )
+    bumped_ns = max(p.stat().st_mtime_ns for p in targets) + 5_000_000_000
+    for p in targets:
+        _os.utime(p, ns=(bumped_ns, bumped_ns))
+
+    run_clustering(synthetic_settings, force=False)
+    post = sidecar.read_text()
+    assert pre != post, "sidecar should refresh when embeddings move"
+    assert post == str(bumped_ns)

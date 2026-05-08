@@ -190,6 +190,36 @@ math (per-class TF, IDF, L1 norm, ngram (1,2), min_df=2). Do not pull in
 - `BedrockRefusalError` is terminal: the LLM pipelines stamp a neutral
   placeholder row and clear the retry queue so refused messages don't
   cycle forever.
+- **Persistent HNSW (`~/.claude/hnsw.duckdb`).** Built lazily on first
+  command and reused across runs via DuckDB's
+  `hnsw_enable_experimental_persistence` flag. `register_vss` ATTACHes
+  it as `hnsw_store`, mtime-checks against the embeddings parquet, and
+  rebuilds when the parquet is newer or the catalog comes back empty.
+  ATTACH on a corrupt file is caught and the store is unlinked +
+  rebuilt from parquet automatically. Recovery for the user:
+  `rm ~/.claude/hnsw.duckdb`. Do NOT couple this with
+  `claude_sql.duckdb` — separate file per state surface.
+- **Sharded parquet caches.** Workers (`embed`, `classify`, `trajectory`,
+  `conflicts`, `friction`) write each chunk as a fresh
+  `<cache>/part-<ts_ns>.parquet` instead of read-concat-rewrite. Readers
+  glob the directory via `claude_sql.parquet_shards.iter_part_files`.
+  The legacy single-file path still works (Settings field is unchanged
+  shape) for back-compat; new installs default to a directory. Recovery
+  / consolidation is `claude-sql cache compact`. One-time migration of
+  an old single-file cache is `claude-sql cache migrate` (defaults to
+  `--dry-run`).
+- **DuckDB tuning PRAGMAs.** Set inside `cli._open_connection` from
+  `Settings.duckdb_threads / duckdb_memory_limit / duckdb_temp_dir`.
+  `memory_limit` accepts percentage strings (`'70%'`); we resolve to
+  MiB at apply time because DuckDB rejects `%` as a unit.
+  `temp_directory` is `~/.claude/duckdb_tmp` instead of `/tmp` —
+  Amazon devboxes ship `/tmp` as a 4 GB tmpfs and a clustering spill
+  there thrashes the host.
+- **Cluster mtime sidecar.** `cluster_worker.run_clustering` skips the
+  ~40 s UMAP+HDBSCAN refit when the embeddings haven't moved by
+  comparing the latest part-file mtime against
+  `clusters.parquet.embeddings_mtime`. Older installs without a sidecar
+  get one stamped on the next call. `force=True` always rebuilds.
 
 ## Agent-friendly CLI surface (load-bearing — do not regress)
 
@@ -218,9 +248,50 @@ for the full table. The common overrides:
 
 - `CLAUDE_SQL_DEFAULT_GLOB` — override the main transcript glob
 - `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` — move the embeddings cache
+  (path now points at a directory by default; legacy single-file path
+  still works)
 - `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` — move the friction cache
 - `CLAUDE_SQL_FRICTION_MAX_CHARS` — short-message cutoff (default 300)
-- `CLAUDE_SQL_CONCURRENCY` — bump parallel Bedrock calls (default 2)
+- `CLAUDE_SQL_EMBED_CONCURRENCY` — parallel Cohere Embed v4 calls
+  (default 8 — sustained on global CRIS without throttling)
+- `CLAUDE_SQL_LLM_CONCURRENCY` — parallel Sonnet 4.6 calls (default 2)
+- `CLAUDE_SQL_CONCURRENCY` — DEPRECATED: aliases onto both pipelines
+  with a `DeprecationWarning`. Removed in the next release.
+- `CLAUDE_SQL_DUCKDB_THREADS` — override worker threads (default
+  `os.cpu_count()`)
+- `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` — `'70%'` of host RAM by default;
+  also accepts absolute units like `'4GB'`
+- `CLAUDE_SQL_DUCKDB_TEMP_DIR` — spill directory; default
+  `~/.claude/duckdb_tmp`
+- `CLAUDE_SQL_HNSW_DB_PATH` — persistent HNSW store; default
+  `~/.claude/hnsw.duckdb`
+
+## Operational rollback paths
+
+- HNSW corruption / version mismatch — `rm ~/.claude/hnsw.duckdb`. Next
+  command rebuilds the index from `embeddings/`.
+- Sharded parquet directory grows large — `claude-sql cache compact
+  --no-dry-run` consolidates `<cache>/part-*.parquet` into a single
+  consolidated file.
+- Memory pressure on a shared host — set
+  `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT='4GB'` (or any absolute size) to
+  bound DuckDB.
+- Bedrock throttling on a new model — drop
+  `CLAUDE_SQL_EMBED_CONCURRENCY` or `CLAUDE_SQL_LLM_CONCURRENCY` to 2.
+  Tenacity already absorbs short bursts.
+- Slow query investigation — `claude-sql query "..." --profile-json`
+  drops a JSON timing tree under `~/.claude/profiling/`.
+
+## Deferred decisions (named so they don't get re-derived)
+
+- **Snapshot tier / `CacheNode` DAG.** Considered and deferred — the
+  2 GB / 15K-JSONL corpus doesn't justify the abstraction yet. Reopen
+  when `EXPLAIN ANALYZE` shows JSONL re-scan dominating wall clock, or
+  the corpus crosses ~10 GB.
+- **`CreateModelInvocationJob` batch path / vector quantization.**
+  Async-on-asyncio at concurrency 8 saturates global CRIS without
+  throttling; VSS doesn't natively support FLOAT16/INT8. Reopen when
+  embeddings parquet crosses ~10 GB.
 
 ## Commits & pushes
 

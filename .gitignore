@@ -11,3 +11,5 @@ build/
 .env
 .env.local
 claude-sql.duckdb
+.gitnexus
+.erpaval/sessions/

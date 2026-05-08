@@ -22,9 +22,12 @@ drag extra modules into startup.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +65,11 @@ from claude_sql.output import (
     resolve_format,
     run_or_die,
     validate_glob,
+)
+from claude_sql.parquet_shards import (
+    count_rows,
+    is_sharded_dir,
+    iter_part_files,
 )
 from claude_sql.sql_views import (
     describe_all,
@@ -199,9 +207,50 @@ def _resolve_settings(common: Common | None) -> Settings:
     return settings.model_copy(update=updates)
 
 
+_PERCENT_LIMIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*$")
+
+
+def _resolve_memory_limit(limit: str) -> str:
+    """Translate ``"<n>%"`` into an absolute size DuckDB accepts.
+
+    DuckDB's ``memory_limit`` parser only knows ``KB / MB / GB / TB`` and the
+    binary variants. Percentage strings are rejected, so we resolve them
+    against the host's reported total memory before the PRAGMA fires. Any
+    other form passes through unchanged so the env var can still pin an
+    absolute size like ``"4GB"`` directly.
+    """
+    match = _PERCENT_LIMIT_RE.match(limit)
+    if match is None:
+        return limit.strip()
+    fraction = float(match.group(1)) / 100.0
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        # Non-POSIX or restricted host — fall back to a conservative 4 GiB.
+        total_bytes = 4 * 1024**3
+    else:
+        total_bytes = page_size * phys_pages
+    target_mib = max(1, int((total_bytes * fraction) // (1024 * 1024)))
+    return f"{target_mib}MiB"
+
+
 def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
-    """Open an in-memory DuckDB connection with every claude-sql object wired."""
+    """Open an in-memory DuckDB connection with every claude-sql object wired.
+
+    Tuning PRAGMAs are set before view registration so the registration
+    queries themselves benefit from the higher thread count and the spill
+    directory pointed at real disk (Amazon devboxes ship ``/tmp`` as a
+    4 GB tmpfs that thrashes once a clustering run starts spilling).
+    """
     con = duckdb.connect(":memory:")
+    settings.duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+    memory_limit = _resolve_memory_limit(settings.duckdb_memory_limit)
+    con.execute(f"SET threads = {int(settings.duckdb_threads)}")
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET temp_directory = '{settings.duckdb_temp_dir}'")
+    con.execute("SET enable_object_cache = true")
+    con.execute("SET preserve_insertion_order = false")
     register_all(con, settings=settings)
     return con
 
@@ -257,32 +306,48 @@ def _describe_checkpoint_entry(path: Path) -> dict[str, object]:
 def _describe_cache_entry(name: str, path: Path) -> dict[str, object]:
     """Collect filesystem metadata about one parquet cache entry.
 
-    The row count is only read when the parquet looks healthy (>16 bytes --
-    same sentinel used by :func:`register_analytics`).  Reading row counts is
-    cheap (``read_parquet`` reads the footer only), but we still gate it
-    because a zero-byte file is a sign of an aborted run we should not touch.
+    Handles both legacy single-file caches and the sharded directory layout
+    (``<dir>/part-*.parquet``).  For a sharded directory, ``bytes`` is the
+    sum across parts, ``mtime`` is the latest part's modification time,
+    and ``rows`` is the union row count.
+
+    Row counts are read via :func:`count_rows` (footer-only ``scan_parquet``)
+    so the call is cheap even on very large caches.  A zero-byte / corrupt
+    part surfaces ``rows=None`` rather than aborting the whole listing.
     """
-    exists = path.exists() and path.is_file()
+    parts = iter_part_files(path)
+    exists = bool(parts) or path.exists()
     entry: dict[str, object] = {"name": name, "path": str(path), "exists": exists}
     if not exists:
         return entry
-    stat = path.stat()
-    entry["bytes"] = stat.st_size
-    entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
-    if stat.st_size > 16:
-        con = duckdb.connect(":memory:")
-        try:
-            row = con.execute(
-                "SELECT count(*) FROM read_parquet(?)",
-                [str(path)],
-            ).fetchone()
-            entry["rows"] = int(row[0]) if row else 0
-        except duckdb.Error:
-            # Do not let a corrupt parquet abort the whole list -- surface it
-            # with rows=None so the caller still sees the metadata.
-            entry["rows"] = None
-        finally:
-            con.close()
+    if not parts:
+        # Path exists (e.g. an empty directory) but has no part files; surface
+        # the bare directory mtime so users can still see "we made the dir".
+        stat = path.stat()
+        entry["bytes"] = 0
+        entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
+        entry["rows"] = 0
+        return entry
+    total_bytes = 0
+    latest_mtime = 0.0
+    healthy = True
+    for p in parts:
+        st = p.stat()
+        total_bytes += st.st_size
+        if st.st_mtime > latest_mtime:
+            latest_mtime = st.st_mtime
+        if st.st_size <= 16:
+            healthy = False
+    entry["bytes"] = total_bytes
+    entry["mtime"] = datetime.fromtimestamp(latest_mtime, tz=UTC).isoformat()
+    if not healthy:
+        entry["rows"] = None
+        return entry
+    try:
+        entry["rows"] = count_rows(path)
+    except (OSError, ValueError):
+        # ``count_rows`` is a polars scan; an unreadable footer surfaces here.
+        entry["rows"] = None
     return entry
 
 
@@ -343,8 +408,46 @@ def shell(*, common: Common | None = None) -> None:
         sys.exit(EXIT_CODES["duckdb_missing"])
 
 
+def _profile_path_for(label: str) -> Path:
+    """Build the destination path used by ``--profile-json``.
+
+    Splits filename composition out of the writer so callers can configure
+    DuckDB's ``profiling_output`` PRAGMA before the profiled query runs
+    (DuckDB writes the JSON itself; we just read it back to confirm the
+    file landed and surface its location to the user).
+    """
+    profiling_dir = Path(os.path.expanduser("~/.claude/profiling/"))
+    profiling_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "profile"
+    return profiling_dir / f"{safe_label}-{int(time.time() * 1000)}.json"
+
+
+def _capture_profile(con: duckdb.DuckDBPyConnection, label: str) -> Path:
+    """Run a profiled query and return where DuckDB persisted the JSON output.
+
+    Caller must have set ``enable_profiling = 'json'`` and pointed
+    ``profiling_output`` at a file *before* executing the query of
+    interest. We synthesize the output path here, set the PRAGMAs, and
+    return the path the next query will populate. The caller is
+    responsible for executing exactly one statement after this returns.
+    """
+    out_path = _profile_path_for(label)
+    # Escape single-quotes in the path for the SQL literal; tmp paths can
+    # contain unusual characters under pytest.
+    safe_path = str(out_path).replace("'", "''")
+    con.execute("SET enable_profiling = 'json'")
+    con.execute(f"SET profiling_output = '{safe_path}'")
+    return out_path
+
+
 @app.command
-def query(sql: str, /, *, common: Common | None = None) -> None:
+def query(
+    sql: str,
+    /,
+    *,
+    profile_json: bool = False,
+    common: Common | None = None,
+) -> None:
     """Run one SQL query against the claude-sql catalog and emit results.
 
     When to use
@@ -401,8 +504,13 @@ def query(sql: str, /, *, common: Common | None = None) -> None:
     fmt = _fmt(common)
     con = _open_connection(settings)
     try:
+        profile_path: Path | None = None
+        if profile_json:
+            profile_path = _capture_profile(con, label="query")
         df = run_or_die(lambda: con.execute(sql).pl(), fmt=fmt)
         emit_dataframe(df, fmt)
+        if profile_path is not None:
+            logger.info("Wrote profile JSON: {}", profile_path)
     finally:
         con.close()
 
@@ -413,6 +521,7 @@ def explain(
     /,
     *,
     analyze: bool = False,
+    profile_json: bool = False,
     common: Common | None = None,
 ) -> None:
     """Show the DuckDB query plan and highlight pushdown / noteworthy operators.
@@ -441,6 +550,9 @@ def explain(
     fmt = resolve_format(_fmt(common))
     con = _open_connection(settings)
     try:
+        profile_path: Path | None = None
+        if profile_json:
+            profile_path = _capture_profile(con, label="explain")
         prefix = "EXPLAIN ANALYZE " if analyze else "EXPLAIN "
         rows = run_or_die(lambda: con.execute(prefix + sql).fetchall(), fmt=fmt)
         # EXPLAIN rows are (type, plan_text) tuples; the plan sits in the last
@@ -454,6 +566,8 @@ def explain(
                     print(line)
         else:
             emit_json({"plan": text}, fmt)
+        if profile_path is not None:
+            logger.info("Wrote profile JSON: {}", profile_path)
     finally:
         con.close()
 
@@ -575,6 +689,237 @@ def list_cache(*, common: Common | None = None) -> None:
         emit_dataframe(pl.DataFrame(entries), OutputFormat.CSV)
         return
     emit_json(entries, fmt)
+
+
+# ---------------------------------------------------------------------------
+# ``cache`` sub-app — compact / migrate the sharded worker-output parquets.
+# ---------------------------------------------------------------------------
+#
+# Workers (embed, classify, trajectory, conflicts, friction) write each
+# chunk as a fresh ``part-<ts_ns>.parquet`` under their cache directory.
+# Over time many small parts accumulate; ``cache compact`` consolidates
+# them into a single ``part-compacted-<ts>.parquet`` and removes the
+# originals.  ``cache migrate`` walks legacy single-file caches that
+# pre-date this layout and moves each one into a sibling directory with
+# its existing mtime preserved so the HNSW persistence and cluster-mtime
+# sidecar logic stay valid.
+#
+# Both commands honour ``--dry-run`` (default ``True``) the same way every
+# Bedrock-bearing command does in this codebase: nothing happens until you
+# pass ``--no-dry-run``.
+
+cache_app = App(
+    name="cache",
+    help=(
+        "Manage the sharded worker-output parquet caches.\n\n"
+        "  cache compact  consolidates many ``part-*.parquet`` shards into one.\n"
+        "  cache migrate  moves a legacy single-file cache into the new dir layout.\n\n"
+        "Both commands default to --dry-run; pass --no-dry-run to act."
+    ),
+)
+app.command(cache_app)
+
+
+def _resolve_cache_paths(settings: Settings) -> dict[str, Path]:
+    """Return ``{cache_name: path}`` for every worker-append cache.
+
+    These are the five caches with sharded-write semantics: writers append
+    by dropping fresh parts, so they accumulate and benefit from ``compact``.
+    The four single-write caches (``clusters``, ``cluster_terms``,
+    ``communities``, ``skills_catalog``) and the checkpoint DB don't fit
+    the same pattern and are intentionally excluded.
+    """
+    return {
+        "embeddings": settings.embeddings_parquet_path,
+        "session_classifications": settings.classifications_parquet_path,
+        "message_trajectory": settings.trajectory_parquet_path,
+        "session_conflicts": settings.conflicts_parquet_path,
+        "user_friction": settings.user_friction_parquet_path,
+    }
+
+
+@cache_app.command(name="compact")
+def cache_compact(
+    *,
+    name: str | None = None,
+    dry_run: bool = True,
+    common: Common | None = None,
+) -> None:
+    """Consolidate ``part-*.parquet`` shards into a single compacted part file.
+
+    Walks each sharded cache directory, reads every part, writes a fresh
+    ``part-compacted-<ts_ns>.parquet`` containing the union, and only after
+    that succeeds removes the originals.  Legacy single-file caches and
+    caches with zero or one parts are left alone — there is nothing to
+    consolidate.
+
+    Flags
+    -----
+    --name <cache>    Restrict to one of: embeddings, session_classifications,
+                      message_trajectory, session_conflicts, user_friction.
+                      Default is "all five".
+    --dry-run         Default True. Pass ``--no-dry-run`` to actually rewrite.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
+
+    targets = _resolve_cache_paths(settings)
+    if name is not None:
+        if name not in targets:
+            err = ClassifiedError(
+                kind="invalid_input",
+                exit_code=EXIT_CODES["invalid_input"],
+                message=f"Unknown cache name: {name!r}",
+                hint=f"Pick one of: {', '.join(sorted(targets))}",
+            )
+            emit_error(err, _fmt(common))
+            sys.exit(err.exit_code)
+        targets = {name: targets[name]}
+
+    summaries: list[dict[str, object]] = []
+    for cache_name, path in targets.items():
+        parts = iter_part_files(path)
+        if len(parts) <= 1 or not is_sharded_dir(path):
+            summaries.append(
+                {
+                    "name": cache_name,
+                    "path": str(path),
+                    "parts": len(parts),
+                    "action": "skip",
+                    "reason": "no_compaction_needed",
+                }
+            )
+            continue
+        if dry_run:
+            total_bytes = sum(p.stat().st_size for p in parts)
+            summaries.append(
+                {
+                    "name": cache_name,
+                    "path": str(path),
+                    "parts": len(parts),
+                    "bytes": total_bytes,
+                    "action": "would_compact",
+                }
+            )
+            continue
+        # Read the union via polars, write a fresh compacted shard, delete
+        # the originals only after the write succeeds.  Any IO error here
+        # leaves the directory intact so a retry does not lose data.
+        df = pl.read_parquet([str(p) for p in parts])
+        compacted = path / f"part-compacted-{time.time_ns()}.parquet"
+        df.write_parquet(compacted)
+        for p in parts:
+            p.unlink()
+        summaries.append(
+            {
+                "name": cache_name,
+                "path": str(path),
+                "parts": len(parts),
+                "rows": int(df.height),
+                "compacted_to": str(compacted),
+                "action": "compacted",
+            }
+        )
+
+    if fmt is OutputFormat.TABLE:
+        emit_dataframe(pl.DataFrame(summaries), OutputFormat.TABLE)
+        return
+    if fmt is OutputFormat.NDJSON:
+        for s in summaries:
+            sys.stdout.write(json.dumps(s, default=str))
+            sys.stdout.write("\n")
+        return
+    if fmt is OutputFormat.CSV:
+        emit_dataframe(pl.DataFrame(summaries), OutputFormat.CSV)
+        return
+    emit_json(summaries, fmt)
+
+
+@cache_app.command(name="migrate")
+def cache_migrate(
+    *,
+    dry_run: bool = True,
+    common: Common | None = None,
+) -> None:
+    """Move legacy single-file caches into the sharded directory layout.
+
+    For each of the five worker-append caches, looks for the historical
+    ``~/.claude/<name>.parquet`` file alongside the new
+    ``~/.claude/<name>/`` directory. When a single-file cache exists, the
+    file is moved (not copied) into the directory as
+    ``part-<original_mtime_ns>.parquet`` so subsequent runs treat it as
+    just another shard. The original mtime is preserved on the new file so
+    HNSW-persistence freshness checks behave identically.
+
+    Flags
+    -----
+    --dry-run    Default True. Pass ``--no-dry-run`` to actually move files.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
+
+    targets = _resolve_cache_paths(settings)
+    summaries: list[dict[str, object]] = []
+    for cache_name, dir_path in targets.items():
+        # Legacy single-file path is the same parent directory + the cache
+        # name + ".parquet" — that's what ``_default_*_parquet`` returned
+        # before this PR.
+        legacy = dir_path.with_suffix(".parquet")
+        # Some users may have customised the cache path explicitly; we only
+        # touch the canonical sibling, never an arbitrary user file.
+        if not legacy.is_file():
+            summaries.append(
+                {
+                    "name": cache_name,
+                    "from": str(legacy),
+                    "to": str(dir_path),
+                    "action": "skip",
+                    "reason": "no_legacy_file",
+                }
+            )
+            continue
+        original_ns = legacy.stat().st_mtime_ns
+        target = dir_path / f"part-{original_ns}.parquet"
+        if dry_run:
+            summaries.append(
+                {
+                    "name": cache_name,
+                    "from": str(legacy),
+                    "to": str(target),
+                    "bytes": legacy.stat().st_size,
+                    "action": "would_move",
+                }
+            )
+            continue
+        dir_path.mkdir(parents=True, exist_ok=True)
+        # ``rename`` preserves contents and mtime when both paths live on
+        # the same filesystem — for the canonical ``~/.claude/`` layout
+        # they always do. ``os.utime`` is a defensive belt+suspenders.
+        legacy.rename(target)
+        os.utime(target, ns=(original_ns, original_ns))
+        summaries.append(
+            {
+                "name": cache_name,
+                "from": str(legacy),
+                "to": str(target),
+                "action": "migrated",
+            }
+        )
+
+    if fmt is OutputFormat.TABLE:
+        emit_dataframe(pl.DataFrame(summaries), OutputFormat.TABLE)
+        return
+    if fmt is OutputFormat.NDJSON:
+        for s in summaries:
+            sys.stdout.write(json.dumps(s, default=str))
+            sys.stdout.write("\n")
+        return
+    if fmt is OutputFormat.CSV:
+        emit_dataframe(pl.DataFrame(summaries), OutputFormat.CSV)
+        return
+    emit_json(summaries, fmt)
 
 
 # ---------------------------------------------------------------------------

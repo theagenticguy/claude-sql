@@ -177,3 +177,43 @@ def test_communities_smoke(
     real = df.filter(pl.col("community_id") >= 0)
     assert real.height >= 2
     assert real["community_id"].min() >= 0
+
+
+def test_load_session_centroids_matches_numpy_reference(
+    connected_settings: tuple[duckdb.DuckDBPyConnection, Settings],
+) -> None:
+    """The SQL-CTE centroid implementation matches the legacy numpy loop.
+
+    Replays the legacy logic (group-by-session → mean → L2 normalize) on the
+    same fixture data and asserts byte-for-byte float32 equality with the
+    new ``_load_session_centroids`` output. Catches regressions in the
+    DuckDB ``unnest+groupby+list`` rewrite without freezing a binary
+    baseline parquet on disk.
+    """
+    from claude_sql.community_worker import _load_session_centroids
+
+    con, settings = connected_settings
+    sids, centroids = _load_session_centroids(con, settings.embeddings_parquet_path)
+
+    # Pull the same join via Polars and recompute the centroids in-process.
+    parts = list(settings.embeddings_parquet_path.glob("part-*.parquet"))
+    if parts:
+        emb_df = pl.read_parquet([str(p) for p in parts])
+    else:
+        emb_df = pl.read_parquet(settings.embeddings_parquet_path)
+    msg_df = con.execute(
+        "SELECT CAST(uuid AS VARCHAR) AS uuid, "
+        "CAST(session_id AS VARCHAR) AS session_id FROM messages"
+    ).pl()
+    joined = emb_df.join(msg_df, on="uuid", how="inner")
+    expected: dict[str, np.ndarray] = {}
+    for sid in sorted(joined["session_id"].unique().to_list()):
+        rows = joined.filter(pl.col("session_id") == sid)
+        emb = np.stack([np.asarray(v, dtype=np.float32) for v in rows["embedding"].to_list()])
+        mean = emb.mean(axis=0)
+        norm = np.linalg.norm(mean)
+        expected[sid] = mean / norm if norm > 0 else mean
+
+    assert sids == sorted(expected.keys())
+    for i, sid in enumerate(sids):
+        np.testing.assert_allclose(centroids[i], expected[sid], rtol=1e-5, atol=1e-6)

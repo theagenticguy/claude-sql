@@ -23,11 +23,18 @@ import polars as pl
 from loguru import logger
 
 from claude_sql.config import Settings
+from claude_sql.parquet_shards import iter_part_files
 
 
 def _load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
-    """Read parquet → (uuid_list, embedding_matrix[float32]).  Matrix shape (N, dim)."""
-    df = pl.read_parquet(path)
+    """Read parquet → (uuid_list, embedding_matrix[float32]).  Matrix shape (N, dim).
+
+    Accepts either a legacy single-file ``embeddings.parquet`` or a sharded
+    directory containing ``part-*.parquet`` files; the union of all parts is
+    materialized in scan order.
+    """
+    parts = iter_part_files(path)
+    df = pl.read_parquet([str(p) for p in parts]) if parts else pl.read_parquet(path)
     uuids = df["uuid"].to_list()
     # polars Array[Float32, dim] → 2D numpy (N, dim).  to_numpy() on an Array column
     # returns 2D when the element type is fixed-size Array; fall back to vstack if not.
@@ -59,13 +66,46 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
     out_path = settings.clusters_parquet_path
     in_path = settings.embeddings_parquet_path
 
-    if not in_path.exists() or in_path.stat().st_size < 16:
+    # Sharded directory or legacy single file: insist on at least one part
+    # whose footer is plausibly populated (>16 bytes).
+    in_parts = [p for p in iter_part_files(in_path) if p.stat().st_size > 16]
+    if not in_parts:
         raise FileNotFoundError(
             f"Embeddings parquet missing at {in_path}.  Run `claude-sql embed` first."
         )
 
-    if out_path.exists() and out_path.stat().st_size > 16 and not force:
-        logger.info("Clusters parquet already exists at {}.  Pass force=True to rebuild.", out_path)
+    # Mtime-sidecar fast path: if the embeddings haven't moved since the
+    # last successful clustering, skip the ~40 s UMAP+HDBSCAN refit. The
+    # sidecar lives next to the output parquet and stores the latest
+    # part-file's nanosecond mtime; coarse hand-edits of clusters.parquet
+    # alone won't bust the cache (use ``force=True`` for that).
+    sidecar = out_path.with_suffix(out_path.suffix + ".embeddings_mtime")
+    in_mtime_ns = max(p.stat().st_mtime_ns for p in in_parts)
+    if (
+        not force
+        and out_path.exists()
+        and out_path.stat().st_size > 16
+        and sidecar.exists()
+        and sidecar.read_text().strip() == str(in_mtime_ns)
+    ):
+        logger.info("Embeddings unchanged since last cluster run; reusing {}.", out_path)
+        df = pl.read_parquet(out_path)
+        return {
+            "total": len(df),
+            "clusters": int((df["cluster_id"] >= 0).sum()),
+            "noise": int((df["cluster_id"] < 0).sum()),
+        }
+
+    # Legacy short-circuit: a clusters parquet exists but no sidecar (older
+    # install before the mtime-skip landed). Trust the parquet and stamp
+    # a sidecar so the next call hits the fast path. Forces a rebuild only
+    # when ``force=True`` is set explicitly.
+    if not force and out_path.exists() and out_path.stat().st_size > 16 and not sidecar.exists():
+        logger.info(
+            "Clusters parquet at {} predates sidecar; reusing and stamping mtime.",
+            out_path,
+        )
+        sidecar.write_text(str(in_mtime_ns))
         df = pl.read_parquet(out_path)
         return {
             "total": len(df),
@@ -157,6 +197,7 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path)
+    sidecar.write_text(str(in_mtime_ns))
     logger.info(
         "Wrote {} rows to {} (total elapsed: {:.1f}s)",
         len(df),

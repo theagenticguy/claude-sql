@@ -173,14 +173,18 @@ WITH (
 );
 ```
 
-**Persistence clarification.** The HNSW index is **rebuilt at connection
-open** from `~/.claude/embeddings.parquet`;
-`hnsw_enable_experimental_persistence` is **not** used. DuckDB still
-flags HNSW persistence as experimental (WAL recovery isn't fully
-implemented for custom indexes), so we treat the parquet as the source
-of truth and the in-memory HNSW as a rebuildable cache. Rebuild is
-minutes-scale for modest corpora; acceptable for an interactive CLI
-because `register_all` runs only once per command.
+**Persistence (current).** The HNSW index is **persisted to
+`~/.claude/hnsw.duckdb`** via DuckDB's
+`hnsw_enable_experimental_persistence` flag. `register_vss` ATTACHes
+the file as `hnsw_store`, mtime-checks it against the embeddings
+parquet, and rebuilds only when the parquet is newer or the catalog
+comes back empty. The embeddings parquet remains the source of truth;
+the persisted file is a rebuildable cache, so `rm ~/.claude/hnsw.duckdb`
+is the recovery story (next command rebuilds in minutes). The flag is
+still labeled experimental upstream — corruption falls back to a
+parquet-driven rebuild automatically. Earlier versions (≤0.2.4) rebuilt
+on every CLI invocation; that path remains available by setting
+`hnsw_db_path=None` in `register_vss` for tests.
 
 `semantic_search` triggers the index rewrite by issuing
 `ORDER BY array_distance(embedding, query_vec) LIMIT k` — the VSS

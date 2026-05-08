@@ -48,6 +48,7 @@ import polars as pl
 from loguru import logger
 
 from claude_sql.config import Settings
+from claude_sql.parquet_shards import iter_part_files
 
 if TYPE_CHECKING:
     import duckdb
@@ -63,46 +64,59 @@ def _load_session_centroids(
 ) -> tuple[list[str], np.ndarray]:
     """Return ``(session_ids, centroids)`` where centroids is ``(N_sessions, dim)`` float32.
 
-    Joins the embeddings parquet to the v1 ``messages`` view on uuid, groups
-    by session_id, and averages the embedding.  Normalizes each centroid to
-    unit L2 length so dot products equal cosine similarity.
+    Joins the embeddings parquet to the v1 ``messages`` view on uuid, then
+    aggregates inside DuckDB (unnest with position → ``avg`` per (session,
+    dim_index) → ordered ``list``). The L2-normalize step stays in numpy
+    where ``np.linalg.norm`` is faster on a contiguous (N, dim) matrix than
+    a per-row SQL norm. The previous Python double-loop over ~50K rows is
+    replaced with a single vectorized DuckDB query.
     """
     logger.info("Loading message embeddings and joining to sessions...")
-    sql = """
-        SELECT CAST(m.session_id AS VARCHAR) AS session_id,
-               e.embedding
-          FROM read_parquet(?) e
-          JOIN messages m
-            ON CAST(m.uuid AS VARCHAR) = e.uuid
+    parts = iter_part_files(embeddings_parquet_path)
+    if not parts:
+        raise RuntimeError(
+            f"No embeddings parquet at {embeddings_parquet_path} - run `claude-sql embed`."
+        )
+    # DDL doesn't accept prepared params for read_parquet's file list, so
+    # escape inline. Single-quotes inside paths get doubled per SQL rules.
+    path_literals = ", ".join("'{}'".format(str(p).replace("'", "''")) for p in parts)
+    sql = f"""
+        WITH joined AS (
+            SELECT CAST(m.session_id AS VARCHAR) AS session_id,
+                   e.embedding::FLOAT[] AS emb
+              FROM read_parquet([{path_literals}]) e
+              JOIN messages m
+                ON CAST(m.uuid AS VARCHAR) = e.uuid
+        ),
+        unrolled AS (
+            SELECT session_id,
+                   generate_subscripts(emb, 1) AS pos,
+                   unnest(emb) AS v
+              FROM joined
+        ),
+        agg AS (
+            SELECT session_id, pos, avg(v) AS m
+              FROM unrolled
+             GROUP BY 1, 2
+        )
+        SELECT session_id, list(m ORDER BY pos) AS centroid
+          FROM agg
+         GROUP BY 1
+         ORDER BY 1
     """
-    df = con.execute(sql, [str(embeddings_parquet_path)]).pl()
-    logger.info("Joined {} rows (messages x embeddings)", len(df))
-
+    df = con.execute(sql).pl()
     if len(df) == 0:
         raise RuntimeError(
             "No rows returned joining embeddings to messages - check that the "
             "embeddings parquet exists and the messages view is registered."
         )
 
-    emb = df["embedding"].to_numpy()
-    if emb.ndim == 1:
-        emb = np.vstack(list(emb))
-    emb = np.ascontiguousarray(emb, dtype=np.float32)
-
-    session_ids_col = df["session_id"].to_numpy()
-    unique = sorted(set(session_ids_col.tolist()))
-    sid_to_idx = {sid: i for i, sid in enumerate(unique)}
-    sums = np.zeros((len(unique), emb.shape[1]), dtype=np.float32)
-    counts = np.zeros(len(unique), dtype=np.int32)
-    for i, sid in enumerate(session_ids_col):
-        idx = sid_to_idx[sid]
-        sums[idx] += emb[i]
-        counts[idx] += 1
-    centroids = sums / counts[:, None]
+    sids = df["session_id"].to_list()
+    centroids = np.stack([np.asarray(c, dtype=np.float32) for c in df["centroid"].to_list()])
     norms = np.linalg.norm(centroids, axis=1, keepdims=True)
     centroids = centroids / np.where(norms == 0, 1.0, norms)
-    logger.info("Computed {} session centroids (dim={})", len(unique), centroids.shape[1])
-    return unique, centroids
+    logger.info("Computed {} session centroids (dim={})", len(sids), centroids.shape[1])
+    return sids, centroids
 
 
 def _pick_adaptive_threshold(

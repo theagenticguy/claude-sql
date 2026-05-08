@@ -46,6 +46,7 @@ from tenacity import (
 )
 
 from claude_sql.config import Settings
+from claude_sql.parquet_shards import iter_part_files, write_part
 
 #: Conservative per-text character cap before sending to Bedrock.  The real
 #: model limit is 128K tokens per text; this cap keeps total payload below
@@ -107,15 +108,20 @@ def discover_unembedded(
     list of (uuid, text) tuples
         Messages needing embedding, in DuckDB's scan order.
     """
-    # Treat zero-byte / truncated parquet files as absent so an aborted
-    # previous run doesn't lock discovery into "skip all" via a corrupt index.
-    has_parquet = embeddings_parquet.exists() and embeddings_parquet.stat().st_size > 16
-    if has_parquet:
-        # CREATE VIEW doesn't accept prepared parameters in DuckDB; escape inline.
-        parquet_literal = str(embeddings_parquet).replace("'", "''")
+    # Treat missing / truncated parquet files (or empty shard directories) as
+    # "no embeddings yet" so an aborted previous run doesn't lock discovery
+    # into "skip all" via a corrupt index.  Sharded directories are scanned
+    # via the part-file glob; legacy single files keep their original path.
+    parts = iter_part_files(embeddings_parquet)
+    parts = [p for p in parts if p.stat().st_size > 16]
+    if parts:
+        # CREATE VIEW doesn't accept prepared parameters in DuckDB; escape
+        # each part path inline as a SQL string literal and pass them all
+        # to ``read_parquet`` as a list.
+        path_literals = ", ".join(f"'{str(p).replace(chr(39), chr(39) * 2)}'" for p in parts)
         con.execute(
             "CREATE OR REPLACE TEMP VIEW _embedded AS "
-            f"SELECT uuid FROM read_parquet('{parquet_literal}');"
+            f"SELECT uuid FROM read_parquet([{path_literals}]);"
         )
         # mt.uuid is typed UUID; parquet uuid column is VARCHAR. Cast to match.
         anti = "AND CAST(mt.uuid AS VARCHAR) NOT IN (SELECT uuid FROM _embedded)"
@@ -276,14 +282,14 @@ async def embed_documents_async(
     client = _build_bedrock_client(settings)
     batch_size = settings.batch_size
     batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.embed_concurrency)
 
     logger.info(
         "Embedding {} texts in {} batches (batch_size={}, concurrency={}, model={})",
         len(texts),
         len(batches),
         batch_size,
-        settings.concurrency,
+        settings.embed_concurrency,
         settings.active_model_id,
     )
 
@@ -391,7 +397,7 @@ async def run_backfill(
                 "candidates": 0,
                 "batches": 0,
                 "batch_size": settings.batch_size,
-                "concurrency": settings.concurrency,
+                "concurrency": settings.embed_concurrency,
                 "model": settings.active_model_id,
                 "since_days": since_days,
                 "limit": limit,
@@ -404,7 +410,7 @@ async def run_backfill(
         "Backfill plan: {} messages, {} batches, concurrency={}, model={}",
         len(pending),
         n_batches,
-        settings.concurrency,
+        settings.embed_concurrency,
         settings.active_model_id,
     )
     if dry_run:
@@ -414,7 +420,7 @@ async def run_backfill(
             "candidates": len(pending),
             "batches": n_batches,
             "batch_size": settings.batch_size,
-            "concurrency": settings.concurrency,
+            "concurrency": settings.embed_concurrency,
             "model": settings.active_model_id,
             "since_days": since_days,
             "limit": limit,
@@ -425,7 +431,6 @@ async def run_backfill(
     # discard work already embedded.  chunk must be a multiple of batch_size.
     chunk_size = max(settings.batch_size * 4, 256)
     path = settings.embeddings_parquet_path
-    path.parent.mkdir(parents=True, exist_ok=True)
     total_t0 = time.monotonic()
     written = 0
     for i in range(0, len(pending), chunk_size):
@@ -466,14 +471,13 @@ async def run_backfill(
                 "embedded_at": pl.Datetime("us", "UTC"),
             },
         )
-        # Append by rewriting the whole file — cheap at ~35k rows × 4KB each
-        # and avoids a parquet-append dependency.
-        if path.exists() and path.stat().st_size > 16:
-            existing = pl.read_parquet(path)
-            df = pl.concat([existing, df], how="diagonal_relaxed")
-        df.write_parquet(path)
+        # Sharded write: drop a fresh ``part-<ts_ns>.parquet`` into the
+        # embeddings directory.  Legacy single-file caches still rewrite the
+        # whole file (handled inside ``write_part``) so existing installs
+        # keep working until they're migrated.
+        written_path = write_part(path, df)
         written += len(slice_)
-        logger.info("Checkpoint: {} rows in {}", len(df), path)
+        logger.info("Checkpoint: {} rows -> {}", len(df), written_path)
 
     total_elapsed = time.monotonic() - total_t0
     logger.info(

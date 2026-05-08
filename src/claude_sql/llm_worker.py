@@ -50,6 +50,7 @@ from tenacity import (
 )
 
 from claude_sql import checkpointer, retry_queue
+from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
@@ -58,8 +59,6 @@ from claude_sql.schemas import (
 from claude_sql.session_text import iter_session_texts, session_bounds
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import duckdb
 
     from claude_sql.config import Settings
@@ -267,19 +266,6 @@ def _estimate_cost(
     return (n_items * avg_in_tokens * in_rate + n_items * avg_out_tokens * out_rate) / 1_000_000
 
 
-def _append_parquet(path: Path, df: pl.DataFrame) -> None:
-    """Append-by-rewrite: load existing parquet, concat, write.
-
-    Treats zero-byte / truncated files as absent so aborted runs don't lock
-    the output into a corrupt state.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 16:
-        existing = pl.read_parquet(path)
-        df = pl.concat([existing, df], how="diagonal_relaxed")
-    df.write_parquet(path)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline 1: session classification
 # ---------------------------------------------------------------------------
@@ -295,11 +281,8 @@ async def _classify_sessions_async(
 ) -> int:
     """Async implementation behind :func:`classify_sessions`."""
     already: set[str] = set()
-    if (
-        settings.classifications_parquet_path.exists()
-        and settings.classifications_parquet_path.stat().st_size > 16
-    ):
-        done_df = pl.read_parquet(settings.classifications_parquet_path)
+    done_df = read_all(settings.classifications_parquet_path)
+    if done_df is not None and done_df.height > 0:
         already = set(done_df["session_id"].to_list())
 
     # Checkpoint skip: compare current (last_ts, mtime) against the last run.
@@ -333,14 +316,14 @@ async def _classify_sessions_async(
         logger.info("classify: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info(
         "classify: {} pending, model={}, thinking={}, concurrency={}, chunks of {}",
         len(pending),
         settings.sonnet_model_id,
         thinking_mode,
-        settings.concurrency,
+        settings.llm_concurrency,
         chunk_size,
     )
 
@@ -403,7 +386,7 @@ async def _classify_sessions_async(
                     "classified_at": pl.Datetime("us", "UTC"),
                 },
             )
-            _append_parquet(settings.classifications_parquet_path, df)
+            write_part(settings.classifications_parquet_path, df)
 
         # Checkpoint the sessions we just classified — at their CURRENT bounds,
         # so a later re-run with no new messages is a no-op. Also clear those
@@ -498,13 +481,9 @@ def classify_sessions(
 
     if dry_run:
         already: set[str] = set()
-        if (
-            settings.classifications_parquet_path.exists()
-            and settings.classifications_parquet_path.stat().st_size > 16
-        ):
-            already = set(
-                pl.read_parquet(settings.classifications_parquet_path)["session_id"].to_list()
-            )
+        done_df = read_all(settings.classifications_parquet_path)
+        if done_df is not None and done_df.height > 0:
+            already = set(done_df["session_id"].to_list())
         pending_count = _count_pending_sessions(
             con, already=already, since_days=since_days, limit=limit
         )
@@ -573,11 +552,9 @@ async def _trajectory_async(
 ) -> int:
     """Async implementation behind :func:`trajectory_messages`."""
     already: set[str] = set()
-    if (
-        settings.trajectory_parquet_path.exists()
-        and settings.trajectory_parquet_path.stat().st_size > 16
-    ):
-        already = set(pl.read_parquet(settings.trajectory_parquet_path)["uuid"].to_list())
+    done_df = read_all(settings.trajectory_parquet_path)
+    if done_df is not None and done_df.height > 0:
+        already = set(done_df["uuid"].to_list())
 
     # Session-level checkpoint: drop messages whose host session has not advanced
     # since the last trajectory run. This cuts the per-message SQL down before
@@ -657,7 +634,7 @@ async def _trajectory_async(
                 "classified_at": pl.Datetime("us", "UTC"),
             },
         )
-        _append_parquet(settings.trajectory_parquet_path, df)
+        write_part(settings.trajectory_parquet_path, df)
 
     processed_sessions: set[str] = set()
     for row in heuristic_rows:
@@ -676,7 +653,7 @@ async def _trajectory_async(
         return len(heuristic_rows)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(heuristic_rows)
 
@@ -755,7 +732,7 @@ async def _trajectory_async(
                     "classified_at": pl.Datetime("us", "UTC"),
                 },
             )
-            _append_parquet(settings.trajectory_parquet_path, df)
+            write_part(settings.trajectory_parquet_path, df)
             # Clear retry queue for both successful uuids AND refusals we just
             # neutralised — the refusal placeholder lives in the parquet now,
             # so these uuids must not loop back through the queue.
@@ -869,11 +846,9 @@ async def _conflicts_async(
 ) -> int:
     """Async implementation behind :func:`detect_conflicts`."""
     already: set[str] = set()
-    if (
-        settings.conflicts_parquet_path.exists()
-        and settings.conflicts_parquet_path.stat().st_size > 16
-    ):
-        already = set(pl.read_parquet(settings.conflicts_parquet_path)["session_id"].to_list())
+    done_df = read_all(settings.conflicts_parquet_path)
+    if done_df is not None and done_df.height > 0:
+        already = set(done_df["session_id"].to_list())
 
     bounds = session_bounds(con, since_days=since_days, limit=limit)
     unchanged_pending, skipped = checkpointer.filter_unchanged(
@@ -903,7 +878,7 @@ async def _conflicts_async(
         logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
 
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.concurrency)
+    sem = asyncio.Semaphore(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     logger.info("conflicts: {} pending sessions", len(pending))
 
@@ -980,7 +955,7 @@ async def _conflicts_async(
                     "empty": pl.Boolean,
                 },
             )
-            _append_parquet(settings.conflicts_parquet_path, df)
+            write_part(settings.conflicts_parquet_path, df)
         ok_sids = {
             sid
             for (sid, _t), r in zip(chunk, results, strict=True)
@@ -1027,11 +1002,9 @@ def detect_conflicts(
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
     if dry_run:
         already: set[str] = set()
-        if (
-            settings.conflicts_parquet_path.exists()
-            and settings.conflicts_parquet_path.stat().st_size > 16
-        ):
-            already = set(pl.read_parquet(settings.conflicts_parquet_path)["session_id"].to_list())
+        done_df = read_all(settings.conflicts_parquet_path)
+        if done_df is not None and done_df.height > 0:
+            already = set(done_df["session_id"].to_list())
         pending_count = _count_pending_sessions(
             con, already=already, since_days=since_days, limit=limit
         )

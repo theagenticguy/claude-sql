@@ -62,11 +62,11 @@ flowchart LR
     R --> V[business views]
     V --> Q[["claude-sql query<br/>claude-sql explain<br/>claude-sql schema"]]
     V --> E["claude-sql embed<br/>(Cohere Embed v4 on Bedrock)"]
-    E --> P["embeddings.parquet"]
-    P --> H["HNSW index<br/>(DuckDB VSS)"]
+    E --> P["embeddings/<br/>part-*.parquet (sharded)"]
+    P --> H["HNSW index<br/>(persisted to<br/>~/.claude/hnsw.duckdb)"]
     H --> S[["claude-sql search"]]
     V --> L["claude-sql classify / trajectory /<br/>conflicts / friction (Sonnet 4.6 +<br/>output_config.format)"]
-    L --> PA["classifications / trajectory /<br/>conflicts / user_friction parquets"]
+    L --> PA["session_classifications/, message_trajectory/,<br/>session_conflicts/, user_friction/<br/>(sharded part-*.parquet)"]
     P --> C["claude-sql cluster<br/>(UMAP + HDBSCAN)"]
     C --> PC["clusters + cluster_terms<br/>(c-TF-IDF)"]
     P --> CM["claude-sql community<br/>(Louvain over centroids)"]
@@ -308,11 +308,17 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Embedding model |
 | `CLAUDE_SQL_SONNET_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Classification model |
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension |
-| `CLAUDE_SQL_CONCURRENCY` | `2` | Parallel Bedrock calls |
+| `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Parallel Cohere Embed v4 calls (global CRIS) |
+| `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Parallel Sonnet 4.6 calls (global CRIS) |
+| `CLAUDE_SQL_CONCURRENCY` | `None` | DEPRECATED single knob — aliases onto both pipelines with a warning |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Cohere batch size |
-| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings.parquet` | Embeddings cache |
-| `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction.parquet` | Friction cache |
+| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings/` | Embeddings cache (sharded directory of `part-*.parquet`) |
+| `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction/` | Friction cache (sharded) |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Short-message cutoff for the friction classifier |
+| `CLAUDE_SQL_HNSW_DB_PATH` | `~/.claude/hnsw.duckdb` | Persistent HNSW store (rebuilt automatically when stale) |
+| `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | DuckDB worker threads |
+| `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | DuckDB memory ceiling (percentage or absolute size) |
+| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | DuckDB spill directory (avoids `/tmp` tmpfs thrash) |
 | `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `~/.claude/skills_catalog.parquet` | Skills catalog parquet |
 | `CLAUDE_SQL_USER_SKILLS_DIR` | `~/.claude/skills` | Root scanned for user-installed skills |
 | `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `~/.claude/plugins/cache` | Root scanned for plugin skills + commands |
