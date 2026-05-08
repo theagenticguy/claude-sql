@@ -151,6 +151,54 @@ line-ending = "lf"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
 
+# ---------------------------------------------------------------------------
+# ty — strictest defensible type-checking.
+# ---------------------------------------------------------------------------
+#
+# `rules.all = "error"` promotes every warn-default diagnostic to error, so
+# newly-added rules in ty's alpha stream land as CI failures the moment
+# they surface instead of drifting into acknowledged-warning noise.  The
+# only rule we deliberately silence is `division-by-zero`, which Astral
+# themselves disable by default because of the false-positive rate.
+#
+# `src.include = ["src", "tests"]` closes the test-directory blind spot
+# (the old `ty check src/` invocation missed test-only regressions).
+# `error-on-warning = true` makes CI fail on any future warn rule, not
+# just errors — future-proofing the strict stance.
+#
+# Overrides: tests do legitimately unsafe things (duckdb fetchone() is
+# typed as Optional, tests immediately subscript without the intermediate
+# assert).  Scope the relaxation to tests/** so src/ stays tight.
+[tool.ty.environment]
+python-version = "3.13"
+python-platform = "linux"
+python = ".venv"
+root = ["./src"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+respect-ignore-files = true
+
+[tool.ty.terminal]
+error-on-warning = true
+output-format = "concise"
+
+[tool.ty.rules]
+all = "error"
+division-by-zero = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+not-subscriptable = "ignore"         # duckdb fetchone() returns Optional; tests subscript directly
+not-iterable = "ignore"              # same pattern: Optional result of DuckDB SELECT COUNT(*)
+unsupported-operator = "ignore"      # polars Decimal-union arithmetic in test assertions
+invalid-argument-type = "ignore"     # test helpers pass looser dict shapes than production signatures
+possibly-unresolved-reference = "warn"
+possibly-missing-attribute = "warn"
+unused-ignore-comment = "warn"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

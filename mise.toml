@@ -82,8 +82,8 @@ description = "Apply formatting"
 run = "uv run ruff format ."
 
 [tasks.typecheck]
-description = "Type-check with ty"
-run = "uv run ty check src/"
+description = "Type-check with ty (strict, includes tests)"
+run = "uv run ty check src/ tests/"
 
 [tasks.test]
 description = "Run the full pytest suite"
