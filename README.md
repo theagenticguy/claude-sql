@@ -1,5 +1,13 @@
 # claude-sql
 
+[![CI](https://github.com/theagenticguy/claude-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/theagenticguy/claude-sql/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/theagenticguy/claude-sql/actions/workflows/codeql.yml/badge.svg)](https://github.com/theagenticguy/claude-sql/actions/workflows/codeql.yml)
+[![Semgrep](https://github.com/theagenticguy/claude-sql/actions/workflows/semgrep.yml/badge.svg)](https://github.com/theagenticguy/claude-sql/actions/workflows/semgrep.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/theagenticguy/claude-sql/badge)](https://securityscorecards.dev/viewer/?uri=github.com/theagenticguy/claude-sql)
+[![codecov](https://codecov.io/gh/theagenticguy/claude-sql/graph/badge.svg)](https://codecov.io/gh/theagenticguy/claude-sql)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/release/python-3130/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+
 > **Ask your Claude Code transcripts anything.**
 > Your sessions are already on disk. `claude-sql` turns them into a
 > searchable, explorable, self-improving record of your work — in place,
@@ -341,7 +349,9 @@ mise tasks               # list every mise task
 `mise run install` installs **lefthook** git hooks:
 
 - **pre-commit** — parallel `ruff check --fix` + `ruff format` on staged
-  Python files (auto-staged), plus `ty check src/` across the whole tree.
+  Python files (auto-staged), `ty check src/ tests/` across the whole tree
+  (strict mode), and `uv lock --check` when `pyproject.toml` or `uv.lock`
+  is staged.
 - **commit-msg** — validates the message via `cz check --allow-abort`
   against the conventional-commits schema.
 - **pre-push** — runs the full pytest suite before the push lands.
@@ -374,6 +384,24 @@ mise run changelog       # regenerate CHANGELOG.md without bumping
 `[tool.commitizen]` is wired to `version_provider = "uv"`, so every bump
 keeps `pyproject.toml[project.version]` and `uv.lock` in sync
 atomically.
+
+### Quality gates
+
+Local `mise run check` (`lint + fmt + typecheck + test`) and GitHub
+Actions run the same commands against the same pinned tool versions (via
+`jdx/mise-action`), so contributors who pass the hooks locally can trust
+CI agrees. On top of the local gate, CI layers in:
+
+- **Semgrep** — `p/auto` + `p/owasp-top-ten` rulesets, SARIF uploaded
+  to GitHub code scanning.
+- **CodeQL** — `security-and-quality` query pack, weekly cron.
+- **OSV-Scanner** — known-CVE scan of `uv.lock`, fails on findings.
+- **OpenSSF Scorecard** — weekly, SARIF to code scanning.
+- **Codecov** — coverage.xml uploaded via tokenless OIDC.
+- **CycloneDX SBOM** — generated + attached on every release.
+
+See `docs/adr/0015-stack-modernization.md` and
+`docs/adr/0016-ci-hardening.md` for the full rationale.
 
 ## Design notes
 
