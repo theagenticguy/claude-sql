@@ -274,7 +274,7 @@ class Settings(BaseSettings):
     seed: int = 42
 
     # ------------------------------------------------------------------
-    # v2: TF-IDF
+    # v2: TF-IDF  # noqa: ERA001 — section header, not commented-out code
     # ------------------------------------------------------------------
     tfidf_min_df: int = 2
     tfidf_max_df: float = 0.95

@@ -3,18 +3,29 @@
 # Best-practice mise + uv combo:
 #   * ``mise`` pins tool versions (Python, uv) so contributors get identical
 #     interpreters without touching system Python.
-#   * ``_.python.venv`` auto-creates ``.venv`` on ``cd`` and activates it.
+#   * ``python.uv_venv_auto`` auto-creates ``.venv`` on ``cd`` and sources it
+#     (v2 of the older ``_.python.venv`` idiom; uv-aware).
 #   * ``uv`` manages packages + lockfile (``uv.lock``); never hand-edit deps
 #     in ``pyproject.toml`` — use ``uv add``/``uv remove``.
 #   * Every project command is a mise task so the ``claude-sql`` developer
 #     only needs ``mise run <task>`` (no memorizing raw ``uv``/``ruff`` invocations).
 
+min_version = "2025.1.0"
+
 [tools]
-python = "3.12"
+python = "3.13"
 uv = "latest"
 
+[settings]
+# uv-aware venv auto-activation.  Replaces the legacy `_.python.venv` block.
+python.uv_venv_auto = "create|source"
+
 [env]
-_.python.venv = { path = ".venv", create = true }
+# No .pyc trash on the /efs network FS (working tree lives there).
+PYTHONDONTWRITEBYTECODE = "1"
+# Silence uv's hardlink-fallback warning when cache and venv are on
+# different mounts — common on /efs + /home devboxes.
+UV_LINK_MODE = "copy"
 
 # ---------------------------------------------------------------------------
 # Install / sync
@@ -28,6 +39,10 @@ run = "uv sync --all-extras"
 [tasks.upgrade]
 description = "Upgrade every dependency to the latest compatible version"
 run = "uv lock --upgrade && uv sync"
+
+[tasks."lock:check"]
+description = "CI freshness gate: fail if uv.lock is stale"
+run = "uv lock --check"
 
 # ---------------------------------------------------------------------------
 # Git hooks (lefthook)
@@ -43,6 +58,7 @@ run = "uv run lefthook uninstall"
 
 [tasks."hooks:run"]
 description = "Run a lefthook manually: `mise run hooks:run -- pre-commit`"
+hide = true
 run = "uv run lefthook run"
 
 # ---------------------------------------------------------------------------
@@ -67,14 +83,18 @@ run = "uv run cz changelog"
 
 # ---------------------------------------------------------------------------
 # Quality gates (run in parallel inside `mise run check`)
+# `sources = [...]` makes each task skip when the source tree hasn't moved
+# by mtime — ~95% speedup on docs-only re-runs, no effect on a cold run.
 # ---------------------------------------------------------------------------
 
 [tasks.lint]
 description = "Lint with ruff"
+sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run ruff check ."
 
 [tasks.fmt]
 description = "Check formatting"
+sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run ruff format --check ."
 
 [tasks."fmt:write"]
@@ -82,11 +102,13 @@ description = "Apply formatting"
 run = "uv run ruff format ."
 
 [tasks.typecheck]
-description = "Type-check with ty"
-run = "uv run ty check src/"
+description = "Type-check with ty (strict, includes tests)"
+sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+run = "uv run ty check src/ tests/"
 
 [tasks.test]
 description = "Run the full pytest suite"
+sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run pytest tests/ --no-header -q"
 
 [tasks.check]
@@ -119,4 +141,5 @@ run = "uv tool uninstall claude-sql"
 
 [tasks.cli]
 description = "Run the claude-sql CLI in this venv"
+hide = true
 run = "uv run claude-sql"

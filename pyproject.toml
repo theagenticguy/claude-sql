@@ -7,7 +7,11 @@ license = { text = "Apache-2.0" }
 authors = [
     { name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.13"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "anthropic>=0.40",
     "anyio>=4.13.0",
@@ -45,12 +49,155 @@ dev = [
     "ty>=0.0.31",
 ]
 
+# ---------------------------------------------------------------------------
+# uv — reproducibility + host-python independence.
+# ---------------------------------------------------------------------------
+#
+# required-version gates parsing before any command runs, so older uv
+# binaries can't silently ignore newer keys.  only-managed refuses to bind
+# against whatever python3 happens to be on PATH — contributors get the
+# exact CPython mise installed.  compile-bytecode = true moves .pyc
+# generation to install time, which matters for a `uv tool install claude-sql`
+# end-user path.  link-mode = clone is the Linux/macOS default; pinning it
+# makes intent explicit across machines.
+[tool.uv]
+required-version = ">=0.11.7"
+resolution = "highest"
+python-preference = "only-managed"
+python-downloads = "automatic"
+compile-bytecode = true
+link-mode = "clone"
+
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 100
+src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+# Expanded from the original E,F,I,N,UP,B,SIM baseline.  See
+# docs/adr/0015-stack-modernization.md for the rationale behind each family.
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "SIM",
+    "ANN", "ASYNC", "BLE", "C4", "DTZ", "ERA", "FBT", "G",
+    "ICN", "ISC", "LOG", "PERF", "PIE", "PL", "PT", "PTH",
+    "RET", "RSE", "S", "T20", "TID", "TRY", "PGH", "RUF",
+]
+ignore = [
+    # Formatter overlap — ruff docs say don't select these alongside the formatter.
+    "E501", "ISC001", "COM812",
+    # ANN-lite: drop dogmatic noise.  ANN101/102 are removed rules.
+    "ANN401",
+    # Tryceratops: the two chronically-noisy rules.
+    "TRY003", "TRY300",
+    # PL sensible subset: drop refactor-metrics + magic-value; keep PLE/PLW/PLC + useful PLR.
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",
+    # Lazy imports are intentional for expensive/optional deps (boto3, hnsw, umap, duckdb VSS).
+    "PLC0415",
+    # Bandit: subprocess rules that don't apply to this project.
+    "S603", "S607",
+    # DuckDB SQL f-strings are the local read-only query pattern, not SQL injection.
+    "S608",
+    # Non-ASCII chars (→, —, curly quotes) in docstrings / comments are intentional.
+    "RUF001", "RUF002", "RUF003",
+    # os.path.expanduser is heavily used; migration to Path.expanduser adds churn without
+    # signal — many call sites immediately coerce back to str for DuckDB.
+    "PTH111",
+    # PERF203: try/except in loop is intentional for DuckDB IOException retry.
+    "PERF203",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = [
+    "S101", "S105", "S106", "S107",
+    "PLR2004", "ANN", "T20",
+    "FBT001", "FBT002",
+    "SLF001", "PT011", "PT018", "D",
+]
+"**/__init__.py" = ["F401", "E402"]
+"src/claude_sql/cli.py" = ["T20"]
+"src/claude_sql/output.py" = ["T20"]
+"scripts/**/*" = ["T20", "S101", "ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["claude_sql"]
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "cyclopts.Parameter",
+    "pydantic.Field",
+    "pydantic_settings.SettingsConfigDict",
+]
+
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true
+suppress-none-returning = true
+allow-star-arg-any = true
+
+[tool.ruff.lint.pylint]
+max-args = 8
+max-branches = 15
+max-returns = 8
+max-statements = 60
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+# ---------------------------------------------------------------------------
+# ty — strictest defensible type-checking.
+# ---------------------------------------------------------------------------
+#
+# `rules.all = "error"` promotes every warn-default diagnostic to error, so
+# newly-added rules in ty's alpha stream land as CI failures the moment
+# they surface instead of drifting into acknowledged-warning noise.  The
+# only rule we deliberately silence is `division-by-zero`, which Astral
+# themselves disable by default because of the false-positive rate.
+#
+# `src.include = ["src", "tests"]` closes the test-directory blind spot
+# (the old `ty check src/` invocation missed test-only regressions).
+# `error-on-warning = true` makes CI fail on any future warn rule, not
+# just errors — future-proofing the strict stance.
+#
+# Overrides: tests do legitimately unsafe things (duckdb fetchone() is
+# typed as Optional, tests immediately subscript without the intermediate
+# assert).  Scope the relaxation to tests/** so src/ stays tight.
+[tool.ty.environment]
+python-version = "3.13"
+python-platform = "linux"
+python = ".venv"
+root = ["./src"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+respect-ignore-files = true
+
+[tool.ty.terminal]
+error-on-warning = true
+output-format = "concise"
+
+[tool.ty.rules]
+all = "error"
+division-by-zero = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+not-subscriptable = "ignore"         # duckdb fetchone() returns Optional; tests subscript directly
+not-iterable = "ignore"              # same pattern: Optional result of DuckDB SELECT COUNT(*)
+unsupported-operator = "ignore"      # polars Decimal-union arithmetic in test assertions
+invalid-argument-type = "ignore"     # test helpers pass looser dict shapes than production signatures
+possibly-unresolved-reference = "warn"
+possibly-missing-attribute = "warn"
+unused-ignore-comment = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -73,4 +220,11 @@ update_changelog_on_bump = true
 major_version_zero = true
 annotated_tag = true
 changelog_incremental = true
+changelog_merge_prerelease = true
+allow_abort = false
+allowed_prefixes = ["Merge", "Revert", "Pull request", "fixup!", "squash!"]
 bump_message = "chore(release): $current_version → $new_version"
+# pre/post bump hooks keep uv.lock + .venv in sync with the bump commit, so
+# `mise run cli` works immediately after a release without an extra sync.
+pre_bump_hooks = ["uv lock"]
+post_bump_hooks = ["uv sync"]

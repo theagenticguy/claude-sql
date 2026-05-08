@@ -321,11 +321,8 @@ def test_sessions_count(fixtures_dir: Path) -> None:
 
 def test_todo_events_count(fixtures_dir: Path) -> None:
     con = _connect(fixtures_dir)
-    # Hand count:
-    #   Session 1: 2 TodoWrite calls, 2 todos each  = 4
-    #   Session 2: 1 TodoWrite call, 1 todo         = 1
-    #   Session 3: 1 TodoWrite call, 1 todo         = 1
-    # Total = 6
+    # Hand count: Session 1 contributes 4, Session 2 contributes 1, Session 3 contributes 1.
+    # (Inline tally removed to appease ERA001 — the expected total below is the source of truth.)
     n = con.execute("SELECT count(*) FROM todo_events").fetchone()[0]
     assert n == 6
 

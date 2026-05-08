@@ -37,11 +37,25 @@ parquets that exist — missing ones warn and no-op, never crash.
 - **Quality gate:** `mise run check` must pass before any commit —
   that's `lint + fmt + typecheck + test` in parallel. Treat every
   non-zero exit as a blocker, not a "pre-existing" issue to skip past.
+- **Python floor:** `3.13` (`.python-version` + `pyproject.toml`
+  `requires-python` + `mise.toml [tools].python` all agree). 3.14 is
+  deferred pending `hdbscan` cp314 wheels — see
+  `docs/adr/0015-stack-modernization.md`.
 - **Formatting:** `mise run fmt:write` applies ruff formatting. Line length
-  is 100. Ruff lint selectors are `E, F, I, N, UP, B, SIM`.
-- **Type checker:** `ty` (not `mypy` or `pyright`). `mise run typecheck`.
-  Editor Pyright warnings about unresolved imports are false positives from
-  a global install that can't see the project's `.venv`; trust `ty`.
+  is 100. Ruff runs a 32-family strict selector set (E, W, F, I, N, UP, B,
+  SIM, ANN, ASYNC, BLE, C4, DTZ, ERA, FBT, G, ICN, ISC, LOG, PERF, PIE, PL,
+  PT, PTH, RET, RSE, S, T20, TID, TRY, PGH, RUF) with principled ignores
+  documented inline in `pyproject.toml`. See the ADR for the rationale.
+- **Type checker:** `ty` in strict mode (`[tool.ty.rules] all = "error"`)
+  over `src/ tests/`. Promotes every warn-default diagnostic so new ty
+  rules fail CI instead of drifting into noise. Tests carry a narrow
+  `[[tool.ty.overrides]]` for the DuckDB-`Optional`-subscript false-
+  positive class. Editor Pyright warnings about unresolved imports or
+  `Optional[...]` subscript are false positives from a global install
+  that can't see the project's `.venv`; trust `ty`.
+- **Reproducibility:** `[tool.uv]` pins `required-version >= 0.11.7`,
+  `python-preference = only-managed`, `compile-bytecode = true`,
+  `link-mode = clone`. `mise run lock:check` is the CI freshness gate.
 - **Tests:** `pytest` under `tests/`. `mise run test`. Tests must not hit
   Bedrock — mock the client. The live corpus is the one under
   `~/.claude/projects/`, so integration tests should use a small fixture

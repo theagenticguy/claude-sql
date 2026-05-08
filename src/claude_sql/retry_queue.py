@@ -66,7 +66,7 @@ def _connect(path: Path, *, max_attempts: int = 20) -> duckdb.DuckDBPyConnection
             last_err = exc
             time.sleep(delay)
             delay = min(delay * 1.5, 1.6)
-    assert last_err is not None
+    assert last_err is not None  # noqa: S101 — loop-postcondition invariant
     raise last_err
 
 

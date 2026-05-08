@@ -38,14 +38,16 @@ import polars as pl
 from cyclopts import App, Parameter
 from loguru import logger
 
-from claude_sql import blind_handover as _blind_handover
-from claude_sql import checkpointer
-from claude_sql import freeze as _freeze
-from claude_sql import judge_worker as _judge_worker
-from claude_sql import judges as _judge_catalog
-from claude_sql import kappa_worker as _kappa_worker
-from claude_sql import skills_catalog as _skills_catalog
-from claude_sql import ungrounded_worker as _ungrounded_worker
+from claude_sql import (
+    blind_handover as _blind_handover,
+    checkpointer,
+    freeze as _freeze,
+    judge_worker as _judge_worker,
+    judges as _judge_catalog,
+    kappa_worker as _kappa_worker,
+    skills_catalog as _skills_catalog,
+    ungrounded_worker as _ungrounded_worker,
+)
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import run_communities
 from claude_sql.config import Settings
@@ -334,8 +336,7 @@ def _describe_cache_entry(name: str, path: Path) -> dict[str, object]:
     for p in parts:
         st = p.stat()
         total_bytes += st.st_size
-        if st.st_mtime > latest_mtime:
-            latest_mtime = st.st_mtime
+        latest_mtime = max(latest_mtime, st.st_mtime)
         if st.st_size <= 16:
             healthy = False
     entry["bytes"] = total_bytes
@@ -1054,9 +1055,17 @@ def embed(
     ----------------------------
     ::
 
-        {"pipeline": "embed", "candidates": N, "batches": B,
-         "batch_size": 96, "concurrency": 2, "model": "...",
-         "since_days": null, "limit": null, "dry_run": true}
+        {
+            "pipeline": "embed",
+            "candidates": N,
+            "batches": B,
+            "batch_size": 96,
+            "concurrency": 2,
+            "model": "...",
+            "since_days": null,
+            "limit": null,
+            "dry_run": true,
+        }
 
     Real-run output
     ---------------

@@ -38,12 +38,10 @@ import polars as pl
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
     ClientError,
+    ConnectionError as BotoConnectionError,
     EndpointConnectionError,
     ReadTimeoutError,
     SSLError,
-)
-from botocore.exceptions import (
-    ConnectionError as BotoConnectionError,
 )
 from loguru import logger
 from tenacity import (

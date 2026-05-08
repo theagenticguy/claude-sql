@@ -64,7 +64,7 @@ def test_parse_judge_response_ideal_format() -> None:
 
 def test_parse_judge_response_json_fallback() -> None:
     text = '{"score": 0, "rationale": "clean turn"}'
-    score, rationale = jw.parse_judge_response(text)
+    score, _rationale = jw.parse_judge_response(text)
     assert score == 0
 
 
