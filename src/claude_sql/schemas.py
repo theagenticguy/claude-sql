@@ -174,6 +174,10 @@ class MessageTrajectory(BaseModel):
     """Per-message sentiment + transition-filler flag.
 
     Applied only to messages that pass the cheap regex heuristic pre-filter.
+    Classification is on the message's standalone polarity — the model
+    sees just this one message, with no surrounding turns. The legacy
+    field name ``sentiment_delta`` is preserved for parquet compatibility,
+    but the semantics are absolute polarity, not "delta vs prior".
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -181,10 +185,14 @@ class MessageTrajectory(BaseModel):
     sentiment_delta: Literal["positive", "neutral", "negative"] = Field(
         ...,
         description=(
-            "Emotional polarity vs the prior message.  "
-            "'positive': excitement, approval, momentum. "
-            "'neutral': factual, procedural, no affect. "
-            "'negative': frustration, pushback, blocked."
+            "Standalone emotional polarity of this single message — judged "
+            "from the message text alone, no surrounding context.  "
+            "'positive': excitement, approval, momentum, explicit thanks. "
+            "'neutral': factual, procedural, no affect (this is the "
+            "majority class for a coding session — use it aggressively). "
+            "'negative': frustration, pushback, blocked, explicit "
+            "correction. "
+            "When the cue is mild or ambiguous, prefer 'neutral'."
         ),
     )
     is_transition: bool = Field(

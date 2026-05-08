@@ -182,10 +182,20 @@ class Settings(BaseSettings):
     sonnet_model_id: str = "global.anthropic.claude-sonnet-4-6"
     #: (input, output) $/MTok for Sonnet 4.6 on Bedrock us-east-1.
     sonnet_pricing: tuple[float, float] = (3.0, 15.0)
-    #: Thinking mode for classification.  ``"adaptive"`` keeps reasoning on;
-    #: ``"disabled"`` is the escape hatch if Bedrock 400s on thinking +
-    #: output_config (undocumented incompatibility).
+    #: Default thinking mode used by the session-level ``classify`` and
+    #: ``conflicts`` pipelines.  ``"adaptive"`` lets Sonnet reason before
+    #: emitting structured output; ``"disabled"`` is the escape hatch when
+    #: Bedrock 400s on thinking + output_config (rare, undocumented).
     classify_thinking: Literal["adaptive", "disabled"] = "adaptive"
+    #: Per-message trajectory classifier thinking mode. Disabled by
+    #: default — trajectory is a 3-class enum + 1 boolean; reasoning burns
+    #: 5–20× output tokens for no measurable quality gain on this shape.
+    trajectory_thinking: Literal["adaptive", "disabled"] = "disabled"
+    #: Friction classifier thinking mode. Disabled by default for the same
+    #: reason as trajectory: short-message classification doesn't benefit
+    #: from reasoning.  Bumps to ``adaptive`` only if quality regresses
+    #: in real eval data.
+    friction_thinking: Literal["adaptive", "disabled"] = "disabled"
     #: Max output tokens for a single classification call.
     classify_max_tokens: int = 2048
     #: Per-text clip used when assembling session_text — tool_results can be

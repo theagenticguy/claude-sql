@@ -279,3 +279,41 @@ def test_dry_run_counts_short_user_messages(tmp_path: Path) -> None:
     assert plan["candidates"] == 3
     assert plan["dry_run"] is True
     assert not (tmp_path / "user_friction.parquet").exists()
+
+
+def test_candidate_sql_excludes_claude_code_system_markers(tmp_path: Path) -> None:
+    """Filter out the two boilerplate strings Claude Code injects as
+    user-role messages. An audit of the live ``user_friction.parquet``
+    showed 279 of 298 LLM-classified rows were these two markers —
+    ~94% of friction Bedrock calls were noise. Drop them at the SQL
+    layer so they never reach Sonnet."""
+    con = duckdb.connect(":memory:")
+    con.execute(
+        """
+        CREATE TABLE messages_text AS
+        SELECT * FROM (VALUES
+            ('u1', 's1', TIMESTAMPTZ '2026-04-20T10:00:00Z', 'user', 'screenshot?'),
+            ('u2', 's1', TIMESTAMPTZ '2026-04-20T10:01:00Z', 'user',
+             'Continue from where you left off.'),
+            ('u3', 's1', TIMESTAMPTZ '2026-04-20T10:02:00Z', 'user',
+             '[Request interrupted by user for tool use]'),
+            ('u4', 's1', TIMESTAMPTZ '2026-04-20T10:03:00Z', 'user',
+             '  Continue from where you left off.  '),
+            ('u5', 's2', TIMESTAMPTZ '2026-04-20T10:04:00Z', 'user', 'why did you do that?')
+        ) AS t(uuid, session_id, ts, role, text_content);
+        """
+    )
+
+    settings = Settings(
+        user_friction_parquet_path=tmp_path / "user_friction.parquet",
+        checkpoint_db_path=tmp_path / "checkpoint.duckdb",
+        friction_max_chars=300,
+    )
+    plan = friction_worker.detect_user_friction(
+        con, settings, since_days=None, limit=None, dry_run=True
+    )
+
+    # u2, u3, u4 are system markers (u4 surrounded by whitespace, the
+    # filter trims before comparison). Only u1 and u5 should remain.
+    assert isinstance(plan, dict)
+    assert plan["candidates"] == 2

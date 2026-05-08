@@ -45,6 +45,7 @@ from loguru import logger
 
 from claude_sql import checkpointer, retry_queue
 from claude_sql.llm_worker import (
+    USER_FRICTION_SYSTEM_PROMPT,
     BedrockRefusalError,
     _build_bedrock_client,
     _classify_one,
@@ -179,13 +180,32 @@ _SCHEMA: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+#: Claude Code injects these strings as user-role messages even though
+#: they're system-generated bookkeeping. An audit of the live
+#: ``user_friction.parquet`` showed they accounted for 279 of 298
+#: LLM-classified rows (~94% of friction Bedrock calls). Filter at the
+#: SQL boundary so they never reach Sonnet.
+_SYSTEM_MARKER_TEXTS: tuple[str, ...] = (
+    "Continue from where you left off.",
+    "[Request interrupted by user for tool use]",
+)
+
+
 def _candidate_sql(max_chars: int, since_days: int | None) -> tuple[str, list[Any]]:
-    """SQL pulling user-role messages under the char cutoff."""
+    """SQL pulling user-role messages under the char cutoff.
+
+    Claude Code system markers (see ``_SYSTEM_MARKER_TEXTS``) are
+    excluded here because they're CLI bookkeeping, not user-typed
+    friction signals. Single-quotes inside markers are escaped per SQL
+    rules.
+    """
+    quoted = ", ".join(f"'{m.replace(chr(39), chr(39) * 2)}'" for m in _SYSTEM_MARKER_TEXTS)
     where = [
         "mt.text_content IS NOT NULL",
         "length(mt.text_content) >= 1",
         f"length(mt.text_content) <= {int(max_chars)}",
         "mt.role = 'user'",
+        f"trim(mt.text_content) NOT IN ({quoted})",
     ]
     if since_days is not None:
         where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
@@ -357,6 +377,7 @@ async def _classify_async(
                 max_tokens=settings.classify_max_tokens,
                 thinking_mode=thinking_mode,
                 sem=sem,
+                system=USER_FRICTION_SYSTEM_PROMPT,
             )
             for prompt in prompts
         ]
@@ -489,7 +510,7 @@ def detect_user_friction(
         llm_calls, estimated_cost_usd, ...}``; otherwise the count of rows
         written to the parquet.
     """
-    thinking_mode = "disabled" if no_thinking else settings.classify_thinking
+    thinking_mode = "disabled" if no_thinking else settings.friction_thinking
 
     if dry_run:
         sql, _ = _candidate_sql(settings.friction_max_chars, since_days)
