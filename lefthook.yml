@@ -79,7 +79,10 @@ pre-push:
     - name: pytest
       run: "{uv} pytest tests/ --no-header -q"
       glob: "**/*.py"
-      files: "git diff --name-only @{push} HEAD"
+      # Prefer ``@{push}`` (configured upstream) but fall back to ``HEAD~``
+      # so the first push of a new branch still gates on pytest instead of
+      # the whole-branch pytest failing with git exit 128.
+      files: "git diff --name-only @{push} HEAD || git diff --name-only HEAD~"
       skip:
         - merge
         - rebase
