@@ -40,6 +40,7 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import polars as pl
 from loguru import logger
 
@@ -360,7 +361,7 @@ async def _classify_async(
 
     # 2. LLM path.
     client = _build_bedrock_client(settings)
-    sem = asyncio.Semaphore(settings.llm_concurrency)
+    sem = anyio.CapacityLimiter(settings.llm_concurrency)
     chunk_size = max(settings.batch_size * 4, 256)
     written = len(fast_rows)
 
