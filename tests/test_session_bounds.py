@@ -112,7 +112,7 @@ def test_session_bounds_returns_last_ts_and_mtime(
     # The mtime must land within the set of our fixture-file timestamps.
     one_path = tmp_path / "projects" / "proj-a" / "sess-one.jsonl"
     assert mtime_one is not None
-    assert abs(mtime_one.timestamp() - os.stat(one_path).st_mtime) < 1.0
+    assert abs(mtime_one.timestamp() - one_path.stat().st_mtime) < 1.0
 
 
 def test_session_bounds_advances_with_file_mtime(
@@ -124,7 +124,7 @@ def test_session_bounds_advances_with_file_mtime(
 
     # Advance the file mtime.
     one_path = tmp_path / "projects" / "proj-a" / "sess-one.jsonl"
-    later = os.stat(one_path).st_mtime + 60
+    later = one_path.stat().st_mtime + 60
     os.utime(one_path, (later, later))
 
     after = session_bounds(fixture_con)

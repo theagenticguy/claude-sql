@@ -27,9 +27,9 @@ iter_session_texts(con, *, settings, since_days=None, limit=None) -> Iterator[tu
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -263,7 +263,7 @@ def session_bounds(
         mtime: datetime | None = None
         if path:
             try:
-                st = os.stat(path)
+                st = Path(path).stat()
                 mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
             except OSError:
                 mtime = None

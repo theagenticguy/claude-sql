@@ -136,8 +136,9 @@ def detect(turns: list[Turn], freeze_sha: str) -> pl.DataFrame:
     for t in turns:
         claims = extract_claims(t.assistant_text)
         checked = check_claims(claims, t.tool_output_text)
+        # PERF401: comprehension would obscure the nested per-turn state mapping.
         for row in checked:
-            rows.append(
+            rows.append(  # noqa: PERF401
                 {
                     "session_id": t.session_id,
                     "turn_idx": t.turn_idx,

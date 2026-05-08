@@ -39,8 +39,7 @@ from typing import Any
 import polars as pl
 import yaml
 from loguru import logger
-from packaging.version import InvalidVersion
-from packaging.version import Version as _Version
+from packaging.version import InvalidVersion, Version as _Version
 
 from claude_sql.config import Settings
 

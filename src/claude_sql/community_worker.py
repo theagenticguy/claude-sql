@@ -263,8 +263,9 @@ def run_communities(
                 noise_count += 1
             continue
         real_communities += 1
+        # PERF401: comprehension would obscure the nested control flow above.
         for node in comm:
-            rows.append((sids[node], cid, size))
+            rows.append((sids[node], cid, size))  # noqa: PERF401
 
     logger.info(
         "Louvain: {} raw communities ({} kept >= {} sessions, {} singletons -> noise) in {:.1f}s",

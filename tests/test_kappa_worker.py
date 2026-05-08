@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import pytest
 
 from claude_sql import kappa_worker as kw
 
@@ -98,9 +99,5 @@ def test_load_scores_rejects_missing_columns(tmp_path) -> None:
     # Write a parquet missing 'axis'
     p = tmp_path / "bad.parquet"
     pl.DataFrame({"session_id": ["s1"], "judge_shortname": ["x"], "score": [1]}).write_parquet(p)
-    try:
+    with pytest.raises(ValueError, match="axis"):
         kw.load_scores(p)
-    except ValueError as e:
-        assert "axis" in str(e)
-    else:
-        raise AssertionError("expected ValueError on missing column")

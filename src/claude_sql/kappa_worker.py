@@ -60,7 +60,7 @@ def cohens_kappa(a: np.ndarray, b: np.ndarray) -> float:
     Returns 0.0 when observers never disagree *or* agree above chance
     (i.e., ``pe == 1.0``), not NaN, so downstream stats stay valid.
     """
-    assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"
+    assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"  # noqa: S101 — input invariant
     if len(a) == 0:
         return 0.0
     categories = sorted(set(a.tolist()) | set(b.tolist()))

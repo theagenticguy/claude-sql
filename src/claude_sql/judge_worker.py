@@ -33,12 +33,10 @@ import polars as pl
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
     ClientError,
+    ConnectionError as BotoConnectionError,
     EndpointConnectionError,
     ReadTimeoutError,
     SSLError,
-)
-from botocore.exceptions import (
-    ConnectionError as BotoConnectionError,
 )
 from loguru import logger
 from tenacity import (
@@ -142,11 +140,11 @@ def parse_rubric(rubric_yaml: str) -> list[Axis]:
     data = yaml.safe_load(rubric_yaml) or {}
     raw = data.get("axes") or []
     if not isinstance(raw, list):
-        raise ValueError("rubric.axes must be a list")
+        raise TypeError("rubric.axes must be a list")
     out: list[Axis] = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise ValueError(f"rubric.axes[{i}] must be a mapping")
+            raise TypeError(f"rubric.axes[{i}] must be a mapping")
         name = entry.get("name")
         if not name:
             raise ValueError(f"rubric.axes[{i}] is missing 'name'")
@@ -219,7 +217,7 @@ def parse_judge_response(text: str) -> tuple[int | None, str]:
 # ---------------------------------------------------------------------------
 
 
-def _bedrock_client(region: str = "us-east-1"):
+def _bedrock_client(region: str = "us-east-1") -> Any:
     """Return a tuned boto3 bedrock-runtime client."""
     cfg = BotoConfig(
         region_name=region,
@@ -263,7 +261,7 @@ def _converse_once(
 
 
 # ---------------------------------------------------------------------------
-# Planning (dry-run)
+# Planning (dry-run)  # noqa: ERA001 — section header, not commented-out code
 # ---------------------------------------------------------------------------
 
 

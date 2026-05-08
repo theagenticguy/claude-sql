@@ -15,7 +15,7 @@ from loguru import logger
 _FORMAT = "<green>{time:HH:mm:ss}</green> <level>{level:<7}</level> {extra} {message}"
 
 
-def configure_logging(verbose: bool = False, quiet: bool = False) -> None:
+def configure_logging(verbose: bool = False, quiet: bool = False) -> None:  # noqa: FBT001, FBT002 — CLI flag pass-through
     """Install the stderr loguru handler for claude-sql.
 
     Parameters

@@ -49,12 +49,107 @@ dev = [
     "ty>=0.0.31",
 ]
 
+# ---------------------------------------------------------------------------
+# uv — reproducibility + host-python independence.
+# ---------------------------------------------------------------------------
+#
+# required-version gates parsing before any command runs, so older uv
+# binaries can't silently ignore newer keys.  only-managed refuses to bind
+# against whatever python3 happens to be on PATH — contributors get the
+# exact CPython mise installed.  compile-bytecode = true moves .pyc
+# generation to install time, which matters for a `uv tool install claude-sql`
+# end-user path.  link-mode = clone is the Linux/macOS default; pinning it
+# makes intent explicit across machines.
+[tool.uv]
+required-version = ">=0.11.7"
+resolution = "highest"
+python-preference = "only-managed"
+python-downloads = "automatic"
+compile-bytecode = true
+link-mode = "clone"
+
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 100
+src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+# Expanded from the original E,F,I,N,UP,B,SIM baseline.  See
+# docs/adr/0015-stack-modernization.md for the rationale behind each family.
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "SIM",
+    "ANN", "ASYNC", "BLE", "C4", "DTZ", "ERA", "FBT", "G",
+    "ICN", "ISC", "LOG", "PERF", "PIE", "PL", "PT", "PTH",
+    "RET", "RSE", "S", "T20", "TID", "TRY", "PGH", "RUF",
+]
+ignore = [
+    # Formatter overlap — ruff docs say don't select these alongside the formatter.
+    "E501", "ISC001", "COM812",
+    # ANN-lite: drop dogmatic noise.  ANN101/102 are removed rules.
+    "ANN401",
+    # Tryceratops: the two chronically-noisy rules.
+    "TRY003", "TRY300",
+    # PL sensible subset: drop refactor-metrics + magic-value; keep PLE/PLW/PLC + useful PLR.
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",
+    # Lazy imports are intentional for expensive/optional deps (boto3, hnsw, umap, duckdb VSS).
+    "PLC0415",
+    # Bandit: subprocess rules that don't apply to this project.
+    "S603", "S607",
+    # DuckDB SQL f-strings are the local read-only query pattern, not SQL injection.
+    "S608",
+    # Non-ASCII chars (→, —, curly quotes) in docstrings / comments are intentional.
+    "RUF001", "RUF002", "RUF003",
+    # os.path.expanduser is heavily used; migration to Path.expanduser adds churn without
+    # signal — many call sites immediately coerce back to str for DuckDB.
+    "PTH111",
+    # PERF203: try/except in loop is intentional for DuckDB IOException retry.
+    "PERF203",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = [
+    "S101", "S105", "S106", "S107",
+    "PLR2004", "ANN", "T20",
+    "FBT001", "FBT002",
+    "SLF001", "PT011", "PT018", "D",
+]
+"**/__init__.py" = ["F401", "E402"]
+"src/claude_sql/cli.py" = ["T20"]
+"src/claude_sql/output.py" = ["T20"]
+"scripts/**/*" = ["T20", "S101", "ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["claude_sql"]
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "cyclopts.Parameter",
+    "pydantic.Field",
+    "pydantic_settings.SettingsConfigDict",
+]
+
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true
+suppress-none-returning = true
+allow-star-arg-any = true
+
+[tool.ruff.lint.pylint]
+max-args = 8
+max-branches = 15
+max-returns = 8
+max-statements = 60
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
