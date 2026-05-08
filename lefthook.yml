@@ -58,6 +58,15 @@ pre-commit:
         - rebase
       fail_text: "ty typecheck failed — run `mise run typecheck` locally to reproduce."
 
+    # Catches the 'bumped pyproject.toml but forgot to regenerate uv.lock'
+    # drift.  ms-scale check — only fires when pyproject.toml or uv.lock
+    # is actually staged.
+    - name: uv-lock-sync
+      run: uv lock --check
+      glob: "{pyproject.toml,uv.lock}"
+      priority: 4
+      fail_text: "uv.lock is stale — run `uv lock` then re-stage."
+
 commit-msg:
   jobs:
     # ``cz check --commit-msg-file`` validates the message against the

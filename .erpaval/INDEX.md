@@ -17,15 +17,19 @@ lessons before starting work.
 - [ty strict mode is `rules.all = "error"`](solutions/api-patterns/ty-strict-mode-all-error.md) — ty has no `--strict` flag; the canonical strict knob is `[tool.ty.rules] all = "error"` + `error-on-warning`, minus `division-by-zero`.
 - [hdbscan cp314 wheel gap](solutions/api-patterns/hdbscan-cp314-wheel-gap.md) — 0.8.42 is the lone Python 3.14 blocker in the scientific-python closure; sdist fallback is unacceptable for `uv tool install` end-users.
 - [Lefthook pre-push `HEAD~` fallback](solutions/api-patterns/lefthook-push-gate-fallback.md) — `@{push}` fails with exit 128 on first-push-of-branch; keep the `|| git diff --name-only HEAD~` fallback.
+- [Semgrep in CI: container, not deprecated action](solutions/api-patterns/semgrep-ci-container-not-action.md) — `returntocorp/semgrep-action` is deprecated; `semgrep ci` rejects `--config`. Run `semgrep scan` inside the `semgrep/semgrep` container.
+- [CycloneDX SBOM for uv projects](solutions/api-patterns/cyclonedx-python-uv-environment.md) — cdxgen + `uv export` don't speak uv.lock; `cyclonedx-py environment .venv` is the working path.
 
 ### best-practices/
 
 - [Sharded cache field-name stability](solutions/best-practices/sharded-cache-field-name-stability.md) — when a path's storage shape shifts (file→dir), reinterpret semantics in a helper, don't rename the Settings field.
 - [Anthropic canonical XML tags](solutions/best-practices/anthropic-xml-canonical-tags.md) — use `<instructions>`, `<context>`, `<examples><example>`, `<anti_patterns>`; avoid invented tags like `<task>`.
 - [anyio for blocking-IO async pipelines](solutions/best-practices/anyio-structured-concurrency-for-blocking-io.md) — CapacityLimiter + `to_thread.run_sync` propagate cancellation to the thread pool, unlike `asyncio.to_thread`.
+- [SARIF scanners: split report vs gate](solutions/best-practices/sarif-scanner-report-vs-gate.md) — run scanner with `|| true` + SARIF → upload → re-run to gate. Decouples code-scanning visibility from CI blocking.
 
 ## Recent additions
 
+- 2026-05-08 — CI-hardening session (session-c4635d → chore/ci-hardening): 3 new lessons on Semgrep-in-CI (container not deprecated action), CycloneDX SBOM for uv projects, and SARIF scanner report-vs-gate split.
 - 2026-05-08 — Stack-modernization session (session-638df1 → chore/stack-modernization): 3 new lessons on ty strict mode, hdbscan as the lone 3.14 blocker, and the lefthook first-push `@{push}` gotcha.
 - 2026-05-08 — DuckDB perf + LLM prompt-quality session (sessions session-f988cf → fix/llm-prompt-quality): 5 new lessons on Bedrock concurrency, tokenizer gotchas, CRIS resolution, XML prompting, and anyio patterns.
 - 2026-05-07 — Initial perf optimization: 4 lessons on DuckDB ATTACH, memory_limit, list_avg semantics, and sharded-cache migration strategy.

@@ -1,0 +1,43 @@
+name: OSV-Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "33 5 * * 2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  osv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install osv-scanner
+        run: |
+          curl -sL -o /tmp/osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.3.5/osv-scanner_linux_amd64
+          chmod +x /tmp/osv-scanner
+      - name: Scan uv.lock (SARIF output)
+        run: |
+          /tmp/osv-scanner scan source \
+            --lockfile=uv.lock \
+            --format=sarif \
+            --output=osv.sarif || true
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+      - name: Fail on vulnerabilities
+        run: /tmp/osv-scanner scan source --lockfile=uv.lock

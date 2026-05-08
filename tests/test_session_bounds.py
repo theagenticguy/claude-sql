@@ -94,8 +94,42 @@ def fixture_con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
         ],
     )
     glob = str(tmp_path / "projects" / "*" / "*.jsonl")
+    # Seed an empty subagent tree under tmp_path so the default globs (which
+    # point at ~/.claude/...) don't crash DuckDB's read_json on a fresh host
+    # (e.g. CI runners, first-install dev boxes without any subagents yet).
+    subagent_dir = (
+        tmp_path / "projects" / "proj-a" / ("00000000-0000-0000-0000-000000000000") / "subagents"
+    )
+    subagent_dir.mkdir(parents=True, exist_ok=True)
+    # Write a single stub subagent record + meta so read_json can infer a
+    # schema containing every column the downstream subagent views select
+    # (timestamp, type, message.{role,model,usage,content} for v_raw_subagents;
+    # agentType + description for v_raw_subagent_meta).  The row is filtered
+    # out of all downstream queries by its non-matching parent session id.
+    _write_session_jsonl(
+        subagent_dir / "agent-placeholder.jsonl",
+        session_id="placeholder",
+        messages=[
+            _user_text_record(
+                "sa-stub",
+                "placeholder",
+                "2026-01-01T00:00:00.000Z",
+                "subagent stub record to give read_json a schema to infer from",
+            ),
+        ],
+    )
+    (subagent_dir / "agent-placeholder.meta.json").write_text(
+        json.dumps({"agentType": "stub", "description": "stub"}),
+    )
+    subagent_glob = str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.jsonl")
+    subagent_meta_glob = str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.meta.json")
     con = duckdb.connect(":memory:")
-    register_raw(con, glob=glob)
+    register_raw(
+        con,
+        glob=glob,
+        subagent_glob=subagent_glob,
+        subagent_meta_glob=subagent_meta_glob,
+    )
     register_views(con)
     return con
 
