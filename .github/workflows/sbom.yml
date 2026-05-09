@@ -21,11 +21,14 @@ jobs:
         # --format cyclonedx flag.  cyclonedx-python ships a first-class
         # `environment` adapter that walks the installed .venv and emits
         # the resolved dep graph — exactly what we want.
+        # `cyclonedx-py environment` accepts --output-format / --output-file
+        # but not --schema-version or --outfile. The previous shape failed at
+        # release time with "unrecognized arguments". Schema version defaults
+        # to the latest CycloneDX spec the installed cyclonedx-bom supports.
         run: |
           uvx --from cyclonedx-bom cyclonedx-py environment .venv \
             --output-format JSON \
-            --schema-version 1.6 \
-            --outfile SBOM.cdx.json
+            --output-file SBOM.cdx.json
       - uses: actions/upload-artifact@v7
         with:
           name: sbom
