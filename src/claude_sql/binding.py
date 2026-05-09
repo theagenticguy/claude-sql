@@ -79,15 +79,6 @@ TRAILER_RUNTIME: str = "Claude-Agent-Runtime"
 """Trailer key carrying the agent runtime identifier (``vendor/version``)."""
 
 
-# Trailer keys to scan for when reading; lowercased for case-insensitive
-# match against ``git interpret-trailers --parse`` output.
-_TRAILER_KEYS_LOWER: tuple[str, ...] = (
-    TRAILER_DIGEST.lower(),
-    TRAILER_URI.lower(),
-    TRAILER_RUNTIME.lower(),
-)
-
-
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -743,10 +734,7 @@ def resolve_commit_to_transcript(
 
     if trailer is not None:
         return trailer
-    # ``note is not None`` here by exhaustion of the branches above:
-    # we already returned/raised when both were None and when both
-    # were non-None. Raise rather than ``assert`` so production code
-    # never relies on ``-O`` keeping the check alive.
-    if note is None:
-        raise LookupError(f"no transcript binding for commit {commit_sha}")
+    # ``note is not None`` here by exhaustion: lines above returned/raised on
+    # (both None) and (both non-None); the only remaining state is note-only.
+    assert note is not None  # noqa: S101  type-narrow for the type checker
     return note

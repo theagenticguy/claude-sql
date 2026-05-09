@@ -473,9 +473,8 @@ def test_detect_agent_runtime_default(monkeypatch: pytest.MonkeyPatch) -> None:
 # (this is the kind of regression where importing `binding` from `cli`
 # silently breaks because of a circular import).
 def test_binding_module_imports_via_cli() -> None:
-    if "claude_sql.cli" not in sys.modules:
-        import claude_sql.cli  # noqa: F401  intentional import
     from claude_sql.cli import bind_cmd, resolve_cmd
 
     assert callable(bind_cmd)
     assert callable(resolve_cmd)
+    assert "claude_sql.cli" in sys.modules
