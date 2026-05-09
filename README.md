@@ -312,6 +312,7 @@ Every option is configurable via `CLAUDE_SQL_*`:
 |---|---|---|
 | `CLAUDE_SQL_DEFAULT_GLOB` | `~/.claude/projects/*/*.jsonl` | Main transcript glob |
 | `CLAUDE_SQL_SUBAGENT_GLOB` | `~/.claude/projects/*/*/subagents/agent-*.jsonl` | Subagent transcripts |
+| `CLAUDE_SQL_TEAM_CORPUS_ROOT` | `None` | Team-corpus root; when set, derives all three globs from `<root>/<author>/projects/*` (replaces the personal corpus) |
 | `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region |
 | `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Embedding model |
 | `CLAUDE_SQL_SONNET_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Classification model |

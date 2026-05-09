@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import warnings
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -124,6 +124,18 @@ class Settings(BaseSettings):
     default_glob: str = Field(default_factory=_default_glob)
     subagent_glob: str = Field(default_factory=_default_subagent_glob)
     subagent_meta_glob: str = Field(default_factory=_default_subagent_meta_glob)
+    #: Team-corpus root.  When set, ``default_glob`` / ``subagent_glob`` /
+    #: ``subagent_meta_glob`` are derived from ``<root>/<author>/projects/*``
+    #: instead of ``~/.claude/projects/*``.  Replaces (does not union with)
+    #: the personal corpus root; an explicit per-glob override always wins.
+    team_corpus_root: Path | None = Field(
+        default=None,
+        description=(
+            "If set, default_glob/subagent_glob/subagent_meta_glob derive from "
+            "<root>/<author>/projects/* instead of ~/.claude/projects/*. "
+            "Replaces (does not union with) the personal corpus root."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Bedrock / embedding
@@ -295,6 +307,46 @@ class Settings(BaseSettings):
     #: thrashes the host once a clustering run starts spilling — point at
     #: ``~/.claude/duckdb_tmp`` (real disk) instead.
     duckdb_temp_dir: Path = Field(default_factory=_default_duckdb_temp_dir)
+
+    @model_validator(mode="after")
+    def _derive_team_corpus_globs(self) -> Self:
+        """Rewrite the three transcript globs when ``team_corpus_root`` is set.
+
+        Pattern: ``<root>/<author>/projects/<project>/<sid>.jsonl`` (and the
+        matching ``subagents/`` siblings).  Replaces — does not union with —
+        the personal corpus root, per memo §Coherent Actions #3.
+
+        Per-glob user pins always win: if any of ``default_glob`` /
+        ``subagent_glob`` / ``subagent_meta_glob`` differ from their factory
+        defaults at validation time, none of them are rewritten (we can't
+        cherry-pick a partial rewrite without smuggling intent).
+        """
+        root = self.team_corpus_root
+        if root is None:
+            return self
+        # Detect "user pinned a glob" by comparing to the factory-provided
+        # default rather than literal string equality, so refactors of
+        # ``_default_glob()`` and friends don't silently break this path.
+        user_pinned = (
+            self.default_glob != _default_glob()
+            or self.subagent_glob != _default_subagent_glob()
+            or self.subagent_meta_glob != _default_subagent_meta_glob()
+        )
+        if user_pinned:
+            return self
+        resolved = root.expanduser().resolve()
+        object.__setattr__(self, "default_glob", f"{resolved}/*/projects/*/*.jsonl")
+        object.__setattr__(
+            self,
+            "subagent_glob",
+            f"{resolved}/*/projects/*/subagents/agent-*.jsonl",
+        )
+        object.__setattr__(
+            self,
+            "subagent_meta_glob",
+            f"{resolved}/*/projects/*/subagents/agent-*.meta.json",
+        )
+        return self
 
     @model_validator(mode="after")
     def _resolve_concurrency_alias(self) -> Settings:
