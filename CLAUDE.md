@@ -37,6 +37,14 @@ parquets that exist — missing ones warn and no-op, never crash.
 - **Quality gate:** `mise run check` must pass before any commit —
   that's `lint + fmt + typecheck + test` in parallel. Treat every
   non-zero exit as a blocker, not a "pre-existing" issue to skip past.
+- **Security gate:** `mise run security` runs all four SAST/SCA/secrets
+  scanners in parallel — `bandit + semgrep + osv + leaks` — and writes
+  SARIF under `.sarif/` (gitignored). Mirrors what CI uploads to GitHub
+  code scanning. Each scanner uses `--exit-zero` / `--exit-code=0` per
+  `.erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md`;
+  gating happens in code scanning UI, not the scanner exit code. Run
+  before opening a PR if you've touched anything load-bearing
+  (binding/ingestion/CLI surface).
 - **Python floor:** `3.13` (`.python-version` + `pyproject.toml`
   `requires-python` + `mise.toml [tools].python` all agree). 3.14 is
   deferred pending `hdbscan` cp314 wheels — see
