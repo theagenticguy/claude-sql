@@ -3,7 +3,7 @@
 **Category:** api-patterns
 **Tags:** cyclonedx, sbom, uv, python, supply-chain, github-actions
 **Applies to:** any Python project managed by uv that needs a CycloneDX SBOM
-**Date:** 2026-05-08
+**Date:** 2026-05-08 (updated 2026-05-09 — flag-shape fix)
 
 ## Situation
 
@@ -31,13 +31,24 @@ Works:
 uv sync --frozen    # or --locked --all-extras --all-groups
 uvx --from cyclonedx-bom cyclonedx-py environment .venv \
   --output-format JSON \
-  --schema-version 1.6 \
-  --outfile SBOM.cdx.json
+  --output-file SBOM.cdx.json
 ```
 
 The `--from cyclonedx-bom` tells `uvx` which PyPI package ships the
 `cyclonedx-py` entry point (the package name and CLI name differ).
 Run inside a workflow or locally the same way.
+
+**Flag-shape gotcha (caught 2026-05-09 on the v0.3.0 release).** The
+`environment` subcommand only accepts `--output-format` (`--of`) and
+`--output-file` (`-o`). It does **NOT** accept `--schema-version` or
+`--outfile`. Earlier `--schema-version 1.6 --outfile ...` invocations
+silently passed local checks because `uvx --help` resolves at the
+top-level parser; the failure shows up only when the subcommand actually
+runs ("unrecognized arguments"). Schema version defaults to the latest
+spec the installed `cyclonedx-bom` supports — leave it implicit unless
+you have a specific consumer that needs a pinned older spec, in which
+case use `--validate`/`--no-validate` for the surrounding sanity check
+rather than reaching for a non-existent flag.
 
 ## Release workflow
 
@@ -59,8 +70,7 @@ jobs:
         run: |
           uvx --from cyclonedx-bom cyclonedx-py environment .venv \
             --output-format JSON \
-            --schema-version 1.6 \
-            --outfile SBOM.cdx.json
+            --output-file SBOM.cdx.json
       - uses: actions/upload-artifact@v7
         with: { name: sbom, path: SBOM.cdx.json }
       - name: Attach SBOM to release
