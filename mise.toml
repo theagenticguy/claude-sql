@@ -23,7 +23,7 @@ uv = "latest"
 # it lives in `.venv` alongside ruff/ty/pytest, not under [tools].
 osv-scanner = "latest"
 semgrep = "latest"
-"aqua:betterleaks/betterleaks" = "latest"
+"aqua:betterleaks/betterleaks" = "1.2.0"
 
 [settings]
 # uv-aware venv auto-activation.  Replaces the legacy `_.python.venv` block.
