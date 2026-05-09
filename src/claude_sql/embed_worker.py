@@ -8,16 +8,15 @@ The worker converts the int8 response to float on insert because DuckDB's VSS
 HNSW index requires ``FLOAT[]`` columns (storage loss of ~4x is accepted in
 v1 — see research notes).
 
-Tenacity retries on transient Bedrock errors; ``before_sleep_log`` requires a
-stdlib logger, so this module uses both loguru (primary) and a single stdlib
-logger (retry hook only).
+Tenacity retries on transient Bedrock errors via the loguru-native
+``loguru_before_sleep`` helper from ``logging_setup`` — keeps every module
+in claude-sql on a single logger (no stdlib ``logging`` imports).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +35,6 @@ from botocore.exceptions import (
 )
 from loguru import logger
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
@@ -44,6 +42,7 @@ from tenacity import (
 )
 
 from claude_sql.config import Settings
+from claude_sql.logging_setup import loguru_before_sleep
 from claude_sql.parquet_shards import iter_part_files, write_part
 
 #: Conservative per-text character cap before sending to Bedrock.  The real
@@ -58,10 +57,6 @@ _RETRY_CODES: set[str] = {
     "ModelTimeoutException",
     "ModelErrorException",
 }
-
-#: Stdlib logger used only by tenacity's ``before_sleep_log`` hook.  Everything
-#: else in this module logs via loguru.
-_retry_logger = logging.getLogger("claude_sql.embed_worker")
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -174,7 +169,7 @@ def _build_bedrock_client(settings: Settings) -> Any:
     stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception(_is_retryable),
-    before_sleep=before_sleep_log(_retry_logger, logging.WARNING),
+    before_sleep=loguru_before_sleep("WARNING"),
     reraise=True,
 )
 def _invoke_bedrock_sync(

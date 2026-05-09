@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 import threading
@@ -45,7 +44,6 @@ from botocore.exceptions import (
 )
 from loguru import logger
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
@@ -53,6 +51,7 @@ from tenacity import (
 )
 
 from claude_sql import checkpointer, retry_queue
+from claude_sql.logging_setup import loguru_before_sleep
 from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
@@ -82,7 +81,6 @@ _RETRY_CODES: set[str] = {
     "InternalServerException",
     "InternalFailure",
 }
-_retry_logger = logging.getLogger("claude_sql.llm_worker")
 
 
 #: When set, every classifier call appends a JSONL trace row to this path
@@ -204,7 +202,7 @@ def _build_bedrock_client(settings: Settings) -> Any:
     stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception(_is_retryable),
-    before_sleep=before_sleep_log(_retry_logger, logging.WARNING),
+    before_sleep=loguru_before_sleep("WARNING"),
     reraise=True,
 )
 def _invoke_classifier_sync(

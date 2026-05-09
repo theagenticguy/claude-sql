@@ -69,6 +69,72 @@ parquets that exist — missing ones warn and no-op, never crash.
   `~/.claude/projects/`, so integration tests should use a small fixture
   directory, not the live one.
 
+## CodeQL hygiene (the rules ruff misses)
+
+GitHub Advanced Security runs CodeQL on every PR. Ruff's 32-family
+selector catches most issues, but two CodeQL rules fire on patterns
+ruff lets through. Both have a one-line fix; both are easy to forget.
+
+- **`py/empty-except` — every `try/except: pass` block needs a comment
+  explaining why.** Ruff's `S110` only fires on broad excepts
+  (`except Exception:`). A *narrow* except (`except (ImportError,
+  AttributeError):`) with a bare `pass` body is invisible to ruff,
+  but CodeQL flags it without an inline explanation. Always pair the
+  `except: pass` with a one-line comment naming what the exception
+  represents and why ignoring it is correct. Example shape:
+
+  ```python
+  try:
+      import optional_dep
+  except ImportError:
+      # Optional dep — no-op when not installed; the caller's fallback handles it.
+      pass
+  ```
+
+- **`py/unused-local-variable` — classes / functions defined inside a
+  test function must be referenced.** Ruff's `F841` only flags assigned
+  names, not nested `class Foo: …` declarations. Don't define test
+  scaffolding (mock classes, fake exceptions, helper functions) you
+  don't end up using. If a class was kept "just in case" or for a
+  branch that never materialized, delete it before committing.
+
+Both checks run automatically — there's no `mise run codeql` task.
+Treat the comment / unused-name discipline as part of writing the test
+in the first place. The rules below in `pyproject.toml` should be kept
+maximally aggressive so the *next* class of CodeQL findings has a
+ruff-side analog wherever one exists.
+
+## Logging: loguru only, no stdlib `logging`
+
+Every module in `claude_sql` logs through `from loguru import logger`.
+Stdlib `logging` is **banned** — `[tool.ruff.lint.flake8-tidy-imports.banned-api]`
+in `pyproject.toml` rejects `import logging` / `from logging import …`
+with a `TID251` error. Mixing the two leaves messages stuck in the
+stdlib root logger that the user's loguru sink never sees.
+
+The historic exception was tenacity's `before_sleep_log(stdlib_logger,
+level)` callback, which required a `logging.LoggerProtocol`. That has
+been replaced by `claude_sql.logging_setup.loguru_before_sleep("LEVEL")`,
+which emits the same retry-state line shape via loguru. Use it on every
+new tenacity `@retry` decorator:
+
+```python
+from claude_sql.logging_setup import loguru_before_sleep
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    before_sleep=loguru_before_sleep("WARNING"),
+    reraise=True,
+)
+def call_bedrock(...): ...
+```
+
+If you find yourself reaching for `logging` because some third-party API
+demands a stdlib logger, write a small loguru-backed adapter under
+`logging_setup.py` rather than punching a hole in the ban.
+
 ## Git hooks (lefthook) and commit conventions (commitizen)
 
 First-time setup after cloning:
