@@ -1,3 +1,13 @@
+## Unreleased
+
+### Feat
+
+- **ci**: PyPI Trusted Publishing workflow + cz changelog drift gate
+
+### Fix
+
+- **ci**: correct cyclonedx-py environment flags in SBOM workflow (#20)
+
 ## v0.3.0 (2026-05-09)
 
 ### Feat

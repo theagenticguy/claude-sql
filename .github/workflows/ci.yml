@@ -45,6 +45,39 @@ jobs:
       - uses: jdx/mise-action@v4
       - run: uv lock --check
 
+  changelog-check:
+    # Drift detector for CHANGELOG.md vs commitizen's projection.
+    #
+    # ``cz changelog --incremental`` re-renders the "Unreleased" section
+    # from conventional-commit messages and prepends to CHANGELOG.md.
+    # On a clean tree where the changelog is current with main, the
+    # incremental rewrite is a no-op and ``git diff --exit-code`` returns
+    # 0. Any drift — hand-edits, missed ``mise run bump``, malformed
+    # commit subjects — produces a diff and fails the job.
+    #
+    # We need full history (fetch-depth: 0) so cz can compute deltas
+    # back to the prior tag.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+      - run: uv sync --locked --all-extras --all-groups
+      - name: Snapshot CHANGELOG.md
+        run: cp CHANGELOG.md CHANGELOG.md.before
+      - name: Re-render via commitizen
+        run: uv run cz changelog --incremental
+      - name: Verify no drift
+        run: |
+          if ! diff -u CHANGELOG.md.before CHANGELOG.md > /tmp/changelog.diff; then
+            echo "::error::CHANGELOG.md is out of sync with commit history."
+            echo "Run 'mise run changelog' locally and commit the result."
+            echo "----- diff (cz would write):"
+            cat /tmp/changelog.diff
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     permissions:

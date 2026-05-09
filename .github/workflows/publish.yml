@@ -1,0 +1,113 @@
+name: Publish
+
+# Two paths to PyPI:
+#
+# 1. ``release: types: [published]`` → publishes to **PyPI** when a
+#    GitHub release is created (the same trigger ``sbom.yml`` uses, so
+#    `mise run bump` → push tag → `gh release create vX.Y.Z` produces
+#    both the SBOM and the PyPI upload in one motion).
+#
+# 2. ``workflow_dispatch`` → publishes to **TestPyPI** for dry-run
+#    verification. Run via the Actions UI or
+#    ``gh workflow run publish.yml`` to validate metadata + the upload
+#    shape before cutting a real release.
+#
+# Authentication: Trusted Publishing (OIDC). No API tokens, no
+# repo secrets. The PyPI / TestPyPI publisher entries must list:
+#   * Owner / repo: theagenticguy / claude-sql
+#   * Workflow filename: publish.yml
+#   * Environment: pypi (production) / testpypi (dry-run)
+#
+# See:
+#   * https://docs.pypi.org/trusted-publishers/
+#   * https://github.com/marketplace/actions/pypi-publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - name: Sync project (locked)
+        run: uv sync --locked --all-extras --all-groups
+      - name: Build distributions
+        run: uv build
+      - name: Inspect with twine
+        run: uvx twine check dist/*
+      - name: Upload dist as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.target == 'testpypi'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/claude-sql
+    permissions:
+      id-token: write   # Trusted Publishing OIDC
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI has older copies of the same name uploaded by other
+          # users sometimes; skip-existing avoids 400 on re-publish of an
+          # already-uploaded version during dry-run iteration.
+          skip-existing: true
+          print-hash: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/claude-sql
+    permissions:
+      id-token: write   # Trusted Publishing OIDC
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

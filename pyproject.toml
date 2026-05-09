@@ -8,9 +8,23 @@ authors = [
     { name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }
 ]
 requires-python = ">=3.13"
+keywords = [
+    "claude", "claude-code", "anthropic", "duckdb", "sql",
+    "semantic-search", "embeddings", "bedrock", "transcripts",
+    "analytics", "observability",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+    "Typing :: Typed",
 ]
 dependencies = [
     "anthropic>=0.40",
@@ -35,6 +49,12 @@ dependencies = [
 
 [project.scripts]
 claude-sql = "claude_sql.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/theagenticguy/claude-sql"
+Repository = "https://github.com/theagenticguy/claude-sql"
+Issues = "https://github.com/theagenticguy/claude-sql/issues"
+Changelog = "https://github.com/theagenticguy/claude-sql/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["uv_build>=0.11.6,<0.12.0"]
