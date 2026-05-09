@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -40,7 +39,6 @@ from botocore.exceptions import (
 )
 from loguru import logger
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception,
     stop_after_attempt,
@@ -49,8 +47,8 @@ from tenacity import (
 
 from claude_sql import judges as judge_catalog
 from claude_sql.judges import Judge
+from claude_sql.logging_setup import loguru_before_sleep
 
-_retry_logger = logging.getLogger("claude_sql.judge_worker")
 _RETRY_CODES: set[str] = {
     "ThrottlingException",
     "ServiceUnavailableException",
@@ -232,7 +230,7 @@ def _bedrock_client(region: str = "us-east-1") -> Any:
     stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception(_is_retryable),
-    before_sleep=before_sleep_log(_retry_logger, logging.WARNING),
+    before_sleep=loguru_before_sleep("WARNING"),
     reraise=True,
 )
 def _converse_once(

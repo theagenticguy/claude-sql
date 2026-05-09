@@ -45,6 +45,7 @@ dev = [
     "bandit[sarif]>=1.9.4",
     "commitizen>=4.13.10",
     "lefthook>=2.1.6",
+    "moto[bedrock-runtime,s3]>=5.2.0",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.11",
@@ -121,12 +122,24 @@ ignore = [
 "scripts/**/*" = ["T20", "S101", "ANN"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["claude_sql"]
+# ``conftest`` is on the test pythonpath and grouped with claude_sql so isort
+# keeps the test-helper imports adjacent to the package imports rather than
+# above them as third-party.
+known-first-party = ["claude_sql", "conftest"]
 combine-as-imports = true
 split-on-trailing-comma = true
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
+
+# Forbid stdlib `logging` everywhere in claude-sql. The whole package logs
+# via loguru, including tenacity retry hooks (which historically pulled
+# stdlib `logging` in just to satisfy `before_sleep_log`'s LoggerProtocol —
+# now superseded by `claude_sql.logging_setup.loguru_before_sleep`).
+# Mixing the two leads to messages that disappear from the loguru sink
+# the user actually sees. Ban at the import boundary.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"logging".msg = "Use loguru via `from loguru import logger`. For tenacity retry callbacks use `claude_sql.logging_setup.loguru_before_sleep('LEVEL')`."
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
@@ -175,7 +188,11 @@ docstring-code-line-length = "dynamic"
 python-version = "3.13"
 python-platform = "linux"
 python = ".venv"
-root = ["./src"]
+# Both ./src and ./tests are on the import root so tests can import
+# helpers from ``conftest`` (pytest auto-loads it as a top-level module
+# at collection time — ty needs the path on its module-discovery list to
+# resolve the same import statically).
+root = ["./src", "./tests"]
 
 [tool.ty.src]
 include = ["src", "tests"]
@@ -229,6 +246,11 @@ skips = ["B101", "B404", "B603", "B607", "B608"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put tests/ on sys.path so test modules can ``from conftest import …``
+# the shared fixtures defined in ``tests/conftest.py``. Pytest auto-loads
+# conftest as a plugin, but doesn't expose its symbols as a regular import
+# unless the directory is on the import path.
+pythonpath = ["tests"]
 
 # ---------------------------------------------------------------------------
 # Commitizen — conventional commits + version bumping.
