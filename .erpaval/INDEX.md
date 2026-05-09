@@ -23,6 +23,7 @@ lessons before starting work.
 - [PR↔transcript binding: trailers + git notes from `prepare-commit-msg`](solutions/api-patterns/git-trailer-and-notes-binding.md) — commit-trailers + `refs/notes/transcripts` is the survivable, host-agnostic primitive; run from `prepare-commit-msg` (not `commit-msg` or `pre-commit`).
 - [bandit `-f sarif` needs the `[sarif]` extra](solutions/api-patterns/bandit-sarif-formatter-extras.md) — without `bandit[sarif]`, `-f sarif` raises `ModuleNotFoundError` at runtime, not install time. Pair with `[tool.bandit] skips` aligned 1:1 with ruff's S-ignores.
 - [betterleaks isn't on PyPI — Go binary, install via mise `aqua:`](solutions/api-patterns/betterleaks-not-on-pypi.md) — `uv add betterleaks` fails (not a Python package); use `aqua:betterleaks/betterleaks` locally + raw curl + `tar -xzf` in CI. Filename pattern is `betterleaks_<version>_linux_x64.tar.gz` — note the embedded version.
+- [Claude Code tool taxonomy migrated 2026 (v2.1.16/v2.1.63)](solutions/api-patterns/claude-code-tool-taxonomy-2026.md) — `Task`→`Agent` rename and `TodoWrite`→`TaskCreate` family split for interactive sessions; split DuckDB views by semantic (launcher vs tracker), keep `TodoWrite` for `--print`/SDK, COALESCE `taskId`/`id` across native + mcp variants.
 
 ### best-practices/
 
@@ -36,6 +37,7 @@ lessons before starting work.
 
 ## Recent additions
 
+- 2026-05-09 — Claude Code tool-taxonomy audit (session-38d7e6 → chore/tool-taxonomy-2026): 1 new lesson capturing the v2.1.16 `TodoWrite`→`TaskCreate`-family split for interactive sessions and the v2.1.63 `Task`→`Agent` rename. Pairs with ADR 0017 + new DuckDB views (`subagent_spawns` / `task_creations` / `task_updates` / `tasks_state_current`).
 - 2026-05-09 — Security hardening (PR #15 → chore/security-hardening): 3 new lessons on bandit's `[sarif]` extra requirement, betterleaks not being on PyPI (Go binary install pattern), and the post-2025-07 SARIF category-uniqueness rule.
 - 2026-05-09 — Strategy actions 1+2+3 implementation (session-2293a5 → 4 PRs: #10 strategy memo, #11 team-corpus, #12 binding, #13 review-sheet): 4 new lessons on git-trailer + notes binding, Bedrock InvokeModel-vs-Converse, Settings derivation via model_validator, and stacked-PR CI triggers.
 - 2026-05-08 — CI-hardening session (session-c4635d → chore/ci-hardening): 3 new lessons on Semgrep-in-CI (container not deprecated action), CycloneDX SBOM for uv projects, and SARIF scanner report-vs-gate split.

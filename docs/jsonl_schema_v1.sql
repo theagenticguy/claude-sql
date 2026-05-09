@@ -118,8 +118,11 @@ CREATE VIEW tool_results (
 
 -- =====================================================================
 -- todo_events (7 cols)
---   One row per todo entry per TodoWrite snapshot. snapshot_ix is a per-
---   session sequence that todo_state_current uses to pick the latest state.
+--   One row per todo entry per TodoWrite snapshot. TodoWrite is the
+--   pre-v2.1.16 surface and remains for --print mode + the Agent SDK;
+--   v2.1.16+ interactive sessions use tasks_state_current instead.
+--   snapshot_ix is a per-session sequence that todo_state_current uses
+--   to pick the latest state.
 -- =====================================================================
 CREATE VIEW todo_events (
     session_id           UUID,
@@ -145,10 +148,83 @@ CREATE VIEW todo_state_current (
 );
 
 -- =====================================================================
--- task_spawns (8 cols)
---   tool_calls filtered to Task / Agent / TaskCreate / mcp__tasks__task_create
---   — the launch site for subagents and managed tasks. Join to
+-- subagent_spawns (9 cols)
+--   tool_calls filtered to Task / Agent — Claude Code v2.1.63 renamed
+--   the subagent launcher from "Task" to "Agent". Join to
 --   subagent_sessions by matching parent_session_id + timing.
+-- =====================================================================
+CREATE VIEW subagent_spawns (
+    session_id           UUID,
+    spawned_at           TIMESTAMP,
+    message_uuid         UUID,
+    tool_use_id          VARCHAR,
+    spawn_tool           VARCHAR,
+    subagent_type        VARCHAR,
+    description          VARCHAR,
+    prompt               VARCHAR,
+    run_in_background    VARCHAR
+);
+
+-- =====================================================================
+-- task_creations (9 cols)
+--   tool_calls filtered to TaskCreate / mcp__tasks__task_create — the
+--   v2.1.16+ persistent task-tracker creation surface. Distinct from
+--   subagent_spawns: input shape carries {subject, description,
+--   activeForm, metadata}, not {subagent_type, prompt}.
+-- =====================================================================
+CREATE VIEW task_creations (
+    session_id           UUID,
+    created_at           TIMESTAMP,
+    message_uuid         UUID,
+    tool_use_id          VARCHAR,
+    create_tool          VARCHAR,
+    subject              VARCHAR,
+    description          VARCHAR,
+    active_form          VARCHAR,
+    metadata             JSON
+);
+
+-- =====================================================================
+-- task_updates (9 cols)
+--   tool_calls filtered to TaskUpdate / mcp__tasks__task_update. Native
+--   uses taskId (camel) while the mcp variant uses id; the view
+--   COALESCEs them into a single task_id column.
+-- =====================================================================
+CREATE VIEW task_updates (
+    session_id           UUID,
+    updated_at           TIMESTAMP,
+    message_uuid         UUID,
+    tool_use_id          VARCHAR,
+    update_tool          VARCHAR,
+    task_id              VARCHAR,
+    status               VARCHAR,
+    add_blocked_by       JSON,
+    owner                VARCHAR
+);
+
+-- =====================================================================
+-- tasks_state_current (7 cols)
+--   Latest status per (session_id, task_id) joining task_creations to
+--   task_updates. Recovers the runtime-assigned task_id from the
+--   matching tool_result ("Task #N created" / json {taskId}). Mirror of
+--   todo_state_current for the v2.1.16+ family.
+-- =====================================================================
+CREATE VIEW tasks_state_current (
+    session_id           UUID,
+    task_id              VARCHAR,
+    subject              VARCHAR,
+    active_form          VARCHAR,
+    status               VARCHAR,
+    created_at           TIMESTAMP,
+    last_updated_at      TIMESTAMP
+);
+
+-- =====================================================================
+-- task_spawns (8 cols) — DEPRECATED, removed next minor release
+--   Predates the v2.1.63 Task→Agent rename and the v2.1.16
+--   TodoWrite→TaskCreate split. Now a UNION ALL alias over
+--   subagent_spawns + task_creations; TaskCreate rows have NULL
+--   subagent_type/prompt by design. Use the two underlying views.
 -- =====================================================================
 CREATE VIEW task_spawns (
     session_id           UUID,

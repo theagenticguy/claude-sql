@@ -63,6 +63,10 @@ VIEW_NAMES: tuple[str, ...] = (
     "tool_results",
     "todo_events",
     "todo_state_current",
+    "subagent_spawns",
+    "task_creations",
+    "task_updates",
+    "tasks_state_current",
     "task_spawns",
     "skill_invocations",
     "subagent_sessions",
@@ -287,7 +291,16 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
     Must be called after :func:`register_raw`. Creates, in order:
     ``sessions``, ``messages``, ``content_blocks``, ``messages_text``,
     ``tool_calls``, ``tool_results``, ``todo_events``, ``todo_state_current``,
-    ``task_spawns``, ``subagent_sessions``, ``subagent_messages``.
+    ``subagent_spawns``, ``task_creations``, ``task_updates``,
+    ``tasks_state_current``, ``task_spawns`` (deprecated alias),
+    ``subagent_sessions``, ``subagent_messages``.
+
+    The split between ``subagent_spawns`` and ``task_creations`` reflects
+    the Claude Code v2.1.63 ``Task``→``Agent`` rename and the v2.1.16
+    (Jan 2026) split of interactive todo tracking from ``TodoWrite`` into
+    the ``TaskCreate``/``TaskGet``/``TaskList``/``TaskUpdate`` family.
+    Pre-2026 transcripts and Agent-SDK / ``--print`` runs still emit
+    ``TodoWrite`` (covered by ``todo_events``).
 
     Parameters
     ----------
@@ -466,23 +479,155 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.debug("Registered view: todo_state_current")
 
+        # Subagent launchers: ``Task`` (pre-v2.1.63) and ``Agent`` (v2.1.63+).
+        # Input shape: {subagent_type, description, prompt, run_in_background?}.
         con.execute(
             """
-            CREATE OR REPLACE VIEW task_spawns AS
+            CREATE OR REPLACE VIEW subagent_spawns AS
             SELECT
                 session_id,
                 ts AS spawned_at,
                 message_uuid,
                 tool_use_id,
                 tool_name AS spawn_tool,
-                json_extract_string(tool_input, '$.subagent_type') AS subagent_type,
-                json_extract_string(tool_input, '$.description')   AS description,
-                json_extract_string(tool_input, '$.prompt')        AS prompt
+                json_extract_string(tool_input, '$.subagent_type')      AS subagent_type,
+                json_extract_string(tool_input, '$.description')        AS description,
+                json_extract_string(tool_input, '$.prompt')             AS prompt,
+                json_extract_string(tool_input, '$.run_in_background')  AS run_in_background
             FROM tool_calls
-            WHERE tool_name IN ('Task', 'Agent', 'TaskCreate', 'mcp__tasks__task_create');
+            WHERE tool_name IN ('Task', 'Agent');
             """
         )
-        logger.debug("Registered view: task_spawns")
+        logger.debug("Registered view: subagent_spawns")
+
+        # Persistent task creation: ``TaskCreate`` (Claude Code v2.1.16+
+        # interactive sessions) and the SDK-py mirror ``mcp__tasks__task_create``.
+        # Input shape: {subject, description, activeForm?, metadata?}. Distinct
+        # from subagent_spawns -- no subagent_type / prompt fields.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW task_creations AS
+            SELECT
+                session_id,
+                ts AS created_at,
+                message_uuid,
+                tool_use_id,
+                tool_name                                              AS create_tool,
+                json_extract_string(tool_input, '$.subject')           AS subject,
+                json_extract_string(tool_input, '$.description')       AS description,
+                json_extract_string(tool_input, '$.activeForm')        AS active_form,
+                json_extract(tool_input, '$.metadata')                 AS metadata
+            FROM tool_calls
+            WHERE tool_name IN ('TaskCreate', 'mcp__tasks__task_create');
+            """
+        )
+        logger.debug("Registered view: task_creations")
+
+        # Task lifecycle updates: ``TaskUpdate`` (v2.1.16+) and the SDK-py
+        # mirror ``mcp__tasks__task_update``. Native uses ``taskId`` (camel),
+        # mcp variant uses ``id`` -- COALESCE to one column.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW task_updates AS
+            SELECT
+                session_id,
+                ts AS updated_at,
+                message_uuid,
+                tool_use_id,
+                tool_name AS update_tool,
+                COALESCE(
+                    json_extract_string(tool_input, '$.taskId'),
+                    json_extract_string(tool_input, '$.id')
+                )                                                       AS task_id,
+                json_extract_string(tool_input, '$.status')             AS status,
+                json_extract(tool_input, '$.addBlockedBy')              AS add_blocked_by,
+                json_extract_string(tool_input, '$.owner')              AS owner
+            FROM tool_calls
+            WHERE tool_name IN ('TaskUpdate', 'mcp__tasks__task_update');
+            """
+        )
+        logger.debug("Registered view: task_updates")
+
+        # Latest status per (session_id, task_id) by joining task_creations
+        # to task_updates. The task_id on TaskCreate isn't carried in the
+        # tool_input (the runtime assigns it), so we recover it from the
+        # tool_result -- and fall back to row-position when the result is
+        # missing. Mirrors ``todo_state_current`` for the v2.1.16+ family.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW tasks_state_current AS
+            WITH creates AS (
+                SELECT
+                    tc.session_id,
+                    tc.created_at,
+                    tc.subject,
+                    tc.active_form,
+                    tc.tool_use_id,
+                    -- The runtime returns the assigned task id in tool_result.
+                    -- Common shape: text content like "Task #N created..." or
+                    -- a JSON {taskId: "N"}. Try both; fall back to per-session
+                    -- creation order.
+                    COALESCE(
+                        regexp_extract(
+                            CAST(tr.content AS VARCHAR), 'Task #(\\d+)', 1
+                        ),
+                        json_extract_string(tr.content, '$.taskId'),
+                        CAST(row_number() OVER (
+                            PARTITION BY tc.session_id ORDER BY tc.created_at
+                        ) AS VARCHAR)
+                    ) AS task_id
+                FROM task_creations tc
+                LEFT JOIN tool_results tr USING (tool_use_id)
+            ),
+            latest_status AS (
+                SELECT session_id, task_id, status, updated_at,
+                       row_number() OVER (
+                           PARTITION BY session_id, task_id
+                           ORDER BY updated_at DESC
+                       ) AS rn
+                FROM task_updates
+                WHERE task_id IS NOT NULL
+            )
+            SELECT
+                c.session_id,
+                c.task_id,
+                c.subject,
+                c.active_form,
+                COALESCE(ls.status, 'pending') AS status,
+                c.created_at,
+                ls.updated_at AS last_updated_at
+            FROM creates c
+            LEFT JOIN latest_status ls
+              ON ls.session_id = c.session_id
+             AND ls.task_id = c.task_id
+             AND ls.rn = 1;
+            """
+        )
+        logger.debug("Registered view: tasks_state_current")
+
+        # DEPRECATED: ``task_spawns`` predates the Task→Agent rename (v2.1.63)
+        # and the TodoWrite→TaskCreate split (v2.1.16). It conflated subagent
+        # launchers with task-tracker creation. Kept as a UNION ALL alias for
+        # one release; new analytics should use ``subagent_spawns`` or
+        # ``task_creations`` directly. Removed in the next minor release.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW task_spawns AS
+            SELECT
+                session_id, spawned_at, message_uuid, tool_use_id,
+                spawn_tool, subagent_type, description, prompt
+            FROM subagent_spawns
+            UNION ALL
+            SELECT
+                session_id, created_at AS spawned_at, message_uuid, tool_use_id,
+                create_tool AS spawn_tool,
+                NULL AS subagent_type,
+                description,
+                NULL AS prompt
+            FROM task_creations;
+            """
+        )
+        logger.debug("Registered view: task_spawns (deprecated)")
 
         # Every Skill / slash-command invocation observable in the transcripts,
         # unioned across the two shapes they take:
