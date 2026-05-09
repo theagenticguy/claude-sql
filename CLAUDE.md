@@ -164,6 +164,42 @@ write the message yourself — either way the `commit-msg` hook validates it.
 Bypass with `git commit --no-verify` only when you're landing a WIP and
 intend to amend it into a conventional message before pushing.
 
+## Publishing to PyPI
+
+Trusted Publishing (OIDC) wires `pypi.org` and `test.pypi.org` to this
+repo via `.github/workflows/publish.yml`. There are no API tokens; the
+workflow assumes a short-lived OIDC token at job runtime. Two paths:
+
+- **PyPI on release published.** `gh release create vX.Y.Z` →
+  `release: types: [published]` fires → the `publish-pypi` job builds
+  + uploads to https://pypi.org/p/claude-sql. Same trigger as
+  `sbom.yml`, so the release flow already produces both the SBOM and
+  the wheel in one motion.
+- **TestPyPI on workflow_dispatch.** `gh workflow run publish.yml -f
+  target=testpypi` (or click "Run workflow" in the Actions UI) builds
+  + uploads to https://test.pypi.org/p/claude-sql for dry-run
+  verification of metadata + the upload shape. Use this first when a
+  contributor PR changes anything load-bearing about the package
+  metadata.
+
+Trusted Publisher entries on PyPI / TestPyPI must list:
+
+- Project name: `claude-sql`
+- Owner / repo: `theagenticguy / claude-sql`
+- Workflow filename: `publish.yml`
+- Environment name: `pypi` (production) or `testpypi` (dry-run)
+
+The workflow declares `environment: name: pypi` / `environment: name:
+testpypi` per job — that's the load-bearing scope check. Don't drop
+the environment block; without it any compromised PR would inherit the
+ability to publish.
+
+If a wheel ever lands on PyPI and you need to redact it: `pip install
+--upgrade pkginfo` then `twine` can't unpublish but you can mark it
+`yanked` via the project page, then publish a corrected version.
+Trusted Publishing also supports per-environment `pending` publishers
+that auto-clear once the first release lands.
+
 ## Version bumping & changelog
 
 Version management is driven by `cz bump`, which reads commit history,
