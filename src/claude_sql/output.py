@@ -36,6 +36,7 @@ class OutputFormat(StrEnum):
     JSON = "json"
     NDJSON = "ndjson"
     CSV = "csv"
+    MARKDOWN = "markdown"
 
 
 # Exit codes that agents can rely on.  Keep them stable -- wire protocols

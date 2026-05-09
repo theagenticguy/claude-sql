@@ -332,13 +332,122 @@ class UserFrictionSignal(BaseModel):
 USER_FRICTION_SCHEMA: dict = _bedrock_schema(UserFrictionSignal)
 
 
+class Correction(BaseModel):
+    """One spot in the bound transcript where the human redirected the agent.
+
+    A correction is a substantive course change: the agent did one thing,
+    the human said "no, do this instead" (or equivalent), and the agent
+    pivoted. Style nits and acknowledgements don't qualify -- the
+    downstream PR review sheet uses these to surface where the agent
+    went off-rails, not where the human polished a phrase.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    what_agent_did: str = Field(
+        ...,
+        min_length=5,
+        max_length=300,
+        description=(
+            "The agent's action that was corrected, in one short clause. "
+            'Example: "Started rewriting the auth middleware from scratch."'
+        ),
+    )
+    correction: str = Field(
+        ...,
+        min_length=5,
+        max_length=300,
+        description=(
+            "What the human said to redirect, paraphrased to one short clause. "
+            'Example: "Asked to keep the existing middleware and only update the token rotator."'
+        ),
+    )
+
+
+class PRReviewSheet(BaseModel):
+    """Compressed PR review derived from the bound transcript.
+
+    Six-field schema designed to fit a 1K-token review-sheet budget when
+    rendered as Markdown. Field descriptions carry the synthesis rules so
+    downstream prompts only need to frame the task; the model's job is to
+    populate the schema from the bound JSONL transcript.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    human_intent: str = Field(
+        ...,
+        min_length=10,
+        max_length=600,
+        description=(
+            "What the human asked for in 1-3 sentences. Synthesized from the "
+            "initial user-role messages and any explicit goal restatements. "
+            "Present tense, paraphrased, not a literal quote."
+        ),
+    )
+    agent_exploration: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description=(
+            "Concrete subjects the agent explored, as 3-8 short bullets. "
+            "Each bullet is a noun phrase or short clause naming what was "
+            "investigated. Drawn from tool calls, search queries, and file "
+            "reads -- not from the agent's own narration."
+        ),
+    )
+    corrections: list[Correction] = Field(
+        ...,
+        max_length=5,
+        description=(
+            "Where the agent got corrected by the human, redirected, or ran "
+            "into stance conflicts. Up to 5 entries; empty list if none. "
+            "Skip surface-level acknowledgements; only substantive redirects."
+        ),
+    )
+    tools_used: list[str] = Field(
+        ...,
+        max_length=20,
+        description=(
+            "Tool names the agent successfully invoked (canonical names: "
+            "Read, Edit, Write, Bash, Grep, Glob, etc.). Deduplicated, "
+            "ordered by first use."
+        ),
+    )
+    tools_refused: list[str] = Field(
+        ...,
+        max_length=10,
+        description=(
+            "Tool calls the agent declined or that were blocked by hooks / "
+            "permissions. Empty list if none. Format each entry as "
+            "'ToolName: brief reason' (e.g. 'Bash: blocked by allowlist')."
+        ),
+    )
+    diff_rationale: str = Field(
+        ...,
+        min_length=20,
+        max_length=800,
+        description=(
+            "The 'why' behind the merged diff in 2-4 sentences. Names the "
+            "specific files or modules touched and the user-facing change. "
+            "Avoids restating the diff line-by-line; focus on the rationale."
+        ),
+    )
+
+
+PR_REVIEW_SHEET_SCHEMA: dict = _bedrock_schema(PRReviewSheet)
+
+
 __all__ = [
     "MESSAGE_TRAJECTORY_SCHEMA",
+    "PR_REVIEW_SHEET_SCHEMA",
     "SESSION_CLASSIFICATION_SCHEMA",
     "SESSION_CONFLICTS_SCHEMA",
     "USER_FRICTION_SCHEMA",
     "Conflict",
+    "Correction",
     "MessageTrajectory",
+    "PRReviewSheet",
     "SessionClassification",
     "SessionConflicts",
     "UserFrictionSignal",
