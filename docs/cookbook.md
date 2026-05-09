@@ -130,8 +130,11 @@ SELECT * FROM tool_rank(30) LIMIT 20;
 ```
 
 Typical hits across a Claude Code corpus: `Bash`, `Read`, `Edit`, `Grep`,
-`Write`, `Glob`, `TodoWrite`, `Task`, `Agent`, `Skill`, plus whatever MCP
-tools you have installed.
+`Write`, `Glob`, `Agent` (was `Task` pre-v2.1.63), `TaskCreate` /
+`TaskUpdate` / `TaskList` (v2.1.16+ interactive task tracker), `TodoWrite`
+(legacy + `--print` / Agent-SDK runs), `Skill`, plus whatever MCP tools
+you have installed (e.g. `mcp__tasks__task_create` mirrors the interactive
+`TaskCreate` family in SDK-py runs).
 
 ### 2.2 Slowest Bash commands (call → result latency)
 
@@ -251,6 +254,29 @@ SELECT bucket, count(*) AS sessions FROM bucketed GROUP BY 1 ORDER BY 1;
 
 This distribution is typically bimodal: most sessions either finish
 everything or finish nothing, with a smaller tail of partial completions.
+
+### 3.4 The v2.1.16+ task tracker (`tasks_state_current`)
+
+Claude Code v2.1.16 (Jan 2026) split interactive todo tracking from
+`TodoWrite` into the `TaskCreate` / `TaskUpdate` family. `TodoWrite`
+remains for `--print` mode and the Agent SDK; interactive sessions emit
+`TaskCreate` (creation) and `TaskUpdate` (status / blocker mutation).
+
+```sql
+SELECT session_id, count(*) AS opened,
+       count(*) FILTER (WHERE status = 'completed') AS done,
+       count(*) FILTER (WHERE status = 'in_progress') AS in_progress
+FROM tasks_state_current
+GROUP BY session_id
+ORDER BY opened DESC
+LIMIT 10;
+```
+
+`tasks_state_current` recovers the runtime-assigned `task_id` from the
+matching `tool_result` (`Task #N created...`) so you can join back to
+`task_updates` cleanly. SDK-py runs route through MCP -- the
+`mcp__tasks__task_create` / `mcp__tasks__task_update` mirrors are folded
+into the same views.
 
 ## 4. Subagents
 

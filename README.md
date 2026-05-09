@@ -264,9 +264,13 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `messages_text` | text blocks aggregated per message | `uuid`, `text_content` |
 | `tool_calls` | `content_blocks` where `type='tool_use'` | `tool_name`, `tool_use_id` |
 | `tool_results` | `content_blocks` where `type='tool_result'` | `tool_use_id`, `content` |
-| `todo_events` | one row per todo per `TodoWrite` snapshot | `subject`, `status`, `snapshot_ix` |
-| `todo_state_current` | latest status per `(session, subject)` | `status`, `written_at` |
-| `task_spawns` | `Task` / `Agent` / `TaskCreate` launch sites | `subagent_type`, `prompt` |
+| `todo_events` | one row per todo per `TodoWrite` snapshot (legacy + `--print`/SDK) | `subject`, `status`, `snapshot_ix` |
+| `todo_state_current` | latest status per `(session, subject)` for `TodoWrite` | `status`, `written_at` |
+| `subagent_spawns` | `Task` / `Agent` launch sites (Claude Code v2.1.63 renamed `Task`→`Agent`) | `subagent_type`, `description`, `prompt` |
+| `task_creations` | `TaskCreate` / `mcp__tasks__task_create` (interactive task tracker, v2.1.16+) | `subject`, `description`, `active_form`, `metadata` |
+| `task_updates` | `TaskUpdate` / `mcp__tasks__task_update` lifecycle events | `task_id`, `status`, `add_blocked_by`, `owner` |
+| `tasks_state_current` | latest status per `(session, task_id)` for the v2.1.16+ family | `task_id`, `subject`, `status`, `last_updated_at` |
+| `task_spawns` *(deprecated)* | `subagent_spawns` ∪ `task_creations` shim, removed next minor | `spawn_tool`, `subagent_type`, `description`, `prompt` |
 | `skill_invocations` | every `Skill` tool call + `<command-name>/foo</command-name>` user slash | `source` (`tool` / `slash_command`), `skill_id`, `args` |
 | `subagent_sessions` | rolled-up subagent runs | `parent_session_id`, `agent_hex`, `agent_type`, `description`, `started_at`, `ended_at`, `message_count`, `transcript_path` |
 | `subagent_messages` | user + assistant events from subagent transcripts | `uuid`, `parent_session_id` |
