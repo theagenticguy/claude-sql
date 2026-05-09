@@ -115,6 +115,63 @@ Commitizen config lives in `[tool.commitizen]` in `pyproject.toml`:
 `major_version_zero = true`, `update_changelog_on_bump = true`,
 `annotated_tag = true`.
 
+### Release flow under branch-protection (the branch-PR-tag dance)
+
+`origin/main` is branch-protected: direct pushes are rejected with
+`GH013: Repository rule violations found`. The release commit MUST go
+through a PR. Don't `mise run bump` on `main` and try to push — the
+local commit + tag will land in limbo. Use this sequence:
+
+1. **Branch the bump.**
+   ```bash
+   git checkout main && git fetch origin && git reset --hard origin/main
+   git checkout -b chore/release-X.Y.Z
+   mise run bump:dry-run    # confirm version + increment
+   mise run bump            # creates the commit AND the local tag
+   ```
+2. **Push branch + open PR.**
+   ```bash
+   git push -u origin chore/release-X.Y.Z
+   gh pr create --title "chore(release): A → B" --body "$(cat <<'EOF'
+   ...notes from CHANGELOG.md...
+   EOF
+   )"
+   ```
+3. **Wait for CI green**, then squash-merge:
+   ```bash
+   gh pr checks <pr-num> --watch
+   gh pr merge <pr-num> --squash --delete-branch
+   ```
+4. **Re-tag the merge SHA.** Squash-merge rewrites the commit, so the
+   local tag from step 1 points at a SHA that doesn't exist on main.
+   ```bash
+   git checkout main && git fetch origin && git reset --hard origin/main
+   git tag -d vY                                    # drop pre-merge tag
+   git tag -a vY -m "vY" $(git rev-parse HEAD)      # tag the merge SHA
+   git push origin vY                               # tags bypass branch-protection
+   ```
+5. **Cut the GitHub release** so `release: types: [published]`
+   workflows (`sbom.yml` etc.) fire:
+   ```bash
+   awk '/^## vY/{flag=1; next} /^## v/{flag=0} flag' CHANGELOG.md > /tmp/notes.md
+   gh release create vY --title vY --notes-file /tmp/notes.md --verify-tag
+   ```
+
+**If a release-triggered workflow at the tag is broken** (e.g. the v0.3.0
+SBOM run hit a bad cyclonedx-py flag shape), don't `gh workflow run --ref vY`
+to retry — that re-runs the *tagged* (broken) workflow body. Fix the
+workflow on a follow-up PR for the next release, and recover the missed
+artifact locally:
+```bash
+uvx --from cyclonedx-bom cyclonedx-py environment .venv \
+  --output-format JSON --output-file /tmp/SBOM.cdx.json
+gh release upload vY /tmp/SBOM.cdx.json --clobber
+```
+
+See `.erpaval/solutions/best-practices/cz-bump-via-pr-with-branch-protection.md`
+for the lesson capturing this; the cyclonedx-py flag-shape fix is in
+`.erpaval/solutions/api-patterns/cyclonedx-python-uv-environment.md`.
+
 ## How to run it
 
 - **As a uv tool** (preferred end-user path): `mise run tool:install` →
@@ -323,7 +380,11 @@ for the full table. The common overrides:
   this; `git commit --no-verify` is an escape hatch, not a policy.
 - `mise run check` must pass before every commit (pre-commit runs
   ruff + ty automatically; `mise run check` additionally runs pytest).
-- Push to `origin/main` only after the local check is green. `pre-push`
-  runs pytest as a final safety net.
+- **Direct push to `origin/main` is rejected** by branch-protection
+  (GH013). Open a PR for every change, including the `cz bump` release
+  commit. `pre-push` runs pytest as a final safety net before the push
+  to your feature branch.
 - Use `mise run bump` (not hand-rolled tags) for version releases. It
-  updates `CHANGELOG.md` + `pyproject.toml` + `uv.lock` atomically.
+  updates `CHANGELOG.md` + `pyproject.toml` + `uv.lock` atomically. See
+  the *Release flow under branch-protection* section above for the full
+  branch → PR → squash-merge → re-tag → push-tag → cut-release sequence.
