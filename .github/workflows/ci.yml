@@ -51,12 +51,21 @@ jobs:
     # ``cz changelog --incremental`` re-renders the "Unreleased" section
     # from conventional-commit messages and prepends to CHANGELOG.md.
     # On a clean tree where the changelog is current with main, the
-    # incremental rewrite is a no-op and ``git diff --exit-code`` returns
-    # 0. Any drift — hand-edits, missed ``mise run bump``, malformed
-    # commit subjects — produces a diff and fails the job.
+    # incremental rewrite is a no-op. Hand-edits, missed ``mise run
+    # bump``, or malformed commit subjects produce a diff and fail.
     #
     # We need full history (fetch-depth: 0) so cz can compute deltas
     # back to the prior tag.
+    #
+    # **PR-only by design.** GitHub's squash-merge appends ``(#NNN)``
+    # to the merged commit subject, so the canonical CHANGELOG.md
+    # entry on main shifts from the form the PR author committed.
+    # Running this check on push-to-main would therefore fail every
+    # squash-merge until a follow-up PR re-rendered — recursive churn
+    # for a benign mechanical drift. Restricting to ``pull_request``
+    # keeps the gate honest where it matters (PR author forgot to
+    # update CHANGELOG) without policing main.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -68,6 +77,13 @@ jobs:
         run: cp CHANGELOG.md CHANGELOG.md.before
       - name: Re-render via commitizen
         run: uv run cz changelog --incremental
+      - name: Normalize squash-merge ``(#NNN)`` suffix on both sides
+        # Each PR's own commit subject is plain (no ``(#NNN)`` yet) but
+        # cz pulls prior PR entries from history that DO carry the
+        # suffix. Strip it on both sides before diffing so the gate
+        # only fires when the *content* of the entry diverges.
+        run: |
+          sed -i -E 's/ \(#[0-9]+\)$//' CHANGELOG.md.before CHANGELOG.md
       - name: Verify no drift
         run: |
           if ! diff -u CHANGELOG.md.before CHANGELOG.md > /tmp/changelog.diff; then
