@@ -1,26 +1,36 @@
 name: Publish
 
-# Two paths to PyPI:
+# Astral's recommended uv-native publish flow:
 #
-# 1. ``release: types: [published]`` → publishes to **PyPI** when a
-#    GitHub release is created (the same trigger ``sbom.yml`` uses, so
-#    `mise run bump` → push tag → `gh release create vX.Y.Z` produces
-#    both the SBOM and the PyPI upload in one motion).
+#   1. ``uv build`` produces sdist + wheel under ``dist/``.
+#   2. Smoke test BOTH artifacts via ``uv run --isolated --no-project
+#      --with dist/<name>.{whl,tar.gz} claude-sql --version``. The
+#      isolated env catches missing transitive deps (e.g. an import
+#      that worked locally because uv pulled the dep transitively
+#      but isn't declared in [project].dependencies).
+#   3. ``uv publish [--index testpypi]`` uploads via OIDC. uv reads
+#      the GitHub Actions OIDC token automatically when the job has
+#      ``id-token: write`` and an ``environment:`` block — no
+#      explicit ``--token`` flag needed.
 #
-# 2. ``workflow_dispatch`` → publishes to **TestPyPI** for dry-run
-#    verification. Run via the Actions UI or
-#    ``gh workflow run publish.yml`` to validate metadata + the upload
-#    shape before cutting a real release.
+# Two paths:
 #
-# Authentication: Trusted Publishing (OIDC). No API tokens, no
-# repo secrets. The PyPI / TestPyPI publisher entries must list:
+# - ``release: types: [published]`` → publish-pypi job → uploads to
+#   https://pypi.org/p/claude-sql. Same trigger as sbom.yml so a
+#   release publishes the wheel + SBOM in one motion.
+#
+# - ``workflow_dispatch`` with ``target ∈ {testpypi, pypi}`` → either
+#   publish-testpypi (dry-run) or publish-pypi (manual production).
+#
+# Trusted Publisher entries on pypi.org and test.pypi.org must list:
 #   * Owner / repo: theagenticguy / claude-sql
 #   * Workflow filename: publish.yml
-#   * Environment: pypi (production) / testpypi (dry-run)
+#   * Environment name: pypi (production) / testpypi (dry-run)
 #
-# See:
+# References:
+#   * https://docs.astral.sh/uv/guides/integration/github/#publishing-to-pypi
+#   * https://docs.astral.sh/uv/guides/package/#publishing-your-package
 #   * https://docs.pypi.org/trusted-publishers/
-#   * https://github.com/marketplace/actions/pypi-publish
 
 on:
   release:
@@ -45,17 +55,28 @@ permissions:
 
 jobs:
   build:
-    name: Build sdist + wheel
+    name: Build sdist + wheel + smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: jdx/mise-action@v4
-      - name: Sync project (locked)
-        run: uv sync --locked --all-extras --all-groups
-      - name: Build distributions
+      # Astral's first-party setup-uv pinned to v8.1.0 (2026-04 release)
+      # for reproducibility. Bumping this is mechanical when a new
+      # uv comes out — no semver concerns.
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b   # v8.1.0
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Build
         run: uv build
-      - name: Inspect with twine
-        run: uvx twine check dist/*
+      # Smoke-test BOTH artifacts: a missing transitive dep manifests
+      # only on a clean install, not in the dev venv. Running
+      # ``claude-sql --version`` exercises the full import graph
+      # (every CLI command imports the worker modules eagerly), so an
+      # ImportError surfaces here instead of post-publish in user space.
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project --with dist/*.whl claude-sql --version
+      - name: Smoke test (sdist)
+        run: uv run --isolated --no-project --with dist/*.tar.gz claude-sql --version
       - name: Upload dist as artifact
         uses: actions/upload-artifact@v7
         with:
@@ -76,19 +97,18 @@ jobs:
     permissions:
       id-token: write   # Trusted Publishing OIDC
     steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b   # v8.1.0
       - uses: actions/download-artifact@v6
         with:
           name: dist
           path: dist
+      # ``--index testpypi`` resolves to ``[[tool.uv.index]]`` in
+      # pyproject.toml. ``--check-url`` is implicit when an index is
+      # named: uv skips files already at the registry, making
+      # rerun-on-failure idempotent.
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          # TestPyPI has older copies of the same name uploaded by other
-          # users sometimes; skip-existing avoids 400 on re-publish of an
-          # already-uploaded version during dry-run iteration.
-          skip-existing: true
-          print-hash: true
+        run: uv publish --index testpypi
 
   publish-pypi:
     name: Publish to PyPI
@@ -103,11 +123,11 @@ jobs:
     permissions:
       id-token: write   # Trusted Publishing OIDC
     steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b   # v8.1.0
       - uses: actions/download-artifact@v6
         with:
           name: dist
           path: dist
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          print-hash: true
+        run: uv publish

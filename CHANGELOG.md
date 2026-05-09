@@ -6,6 +6,7 @@
 
 ### Fix
 
+- **publish**: switch to uv-native publish + add missing packaging dep
 - **ci**: scope changelog gate to PRs + normalize squash-merge suffix
 - **ci**: correct cyclonedx-py environment flags in SBOM workflow (#20)
 
