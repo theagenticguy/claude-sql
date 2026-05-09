@@ -1,0 +1,43 @@
+name: Bandit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "47 5 * * 3"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install bandit[sarif]
+        run: pip install 'bandit[sarif]>=1.9.4'
+      - name: Run bandit (SARIF)
+        # `--exit-zero` keeps the step green so the SARIF upload runs;
+        # gating happens through GitHub code scanning, not the scan's
+        # exit code.  See .erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md.
+        # `-c pyproject.toml` honors the [tool.bandit] section (excludes,
+        # principled skips matching ruff's S-ignores).
+        run: bandit -r src -f sarif -o bandit.sarif --exit-zero -c pyproject.toml
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: bandit.sarif
+          category: bandit

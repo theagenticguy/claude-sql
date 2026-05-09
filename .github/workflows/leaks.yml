@@ -1,0 +1,49 @@
+name: Betterleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "53 5 * * 4"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  betterleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # `betterleaks git .` scans full commit history; without a deep
+          # checkout the scanner only sees the merge-commit shadow.
+          fetch-depth: 0
+      - name: Install betterleaks
+        # No first-party action exists yet (betterleaks/betterleaks-action
+        # is 404 as of 2026-05-09).  Pin the version so a release surge
+        # doesn't break CI silently; bump in lockstep with the
+        # `aqua:betterleaks/betterleaks` line in mise.toml.
+        run: |
+          curl -sSL -o /tmp/betterleaks.tgz \
+            https://github.com/betterleaks/betterleaks/releases/download/v1.1.2/betterleaks_linux_x64.tar.gz
+          tar -xzf /tmp/betterleaks.tgz -C /tmp betterleaks
+          sudo mv /tmp/betterleaks /usr/local/bin/betterleaks
+      - name: Run betterleaks (SARIF)
+        # `--exit-code=0` keeps the step green so the SARIF upload runs;
+        # findings surface through code scanning UI, not the scan's
+        # exit code.  See .erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md.
+        run: betterleaks git . -f sarif -r betterleaks.sarif --exit-code=0
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: betterleaks.sarif
+          category: betterleaks
