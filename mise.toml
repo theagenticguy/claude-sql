@@ -16,6 +16,15 @@ min_version = "2025.1.0"
 python = "3.13"
 uv = "latest"
 
+# Security scanners installed via mise so contributors don't need brew/dnf.
+# semgrep + osv-scanner ship pre-registered (aqua/pipx); betterleaks is a
+# Go binary distributed via GitHub releases — `ubi:` is mise's universal
+# binary installer.  bandit is a Python dev dep (uv add --group dev) so
+# it lives in `.venv` alongside ruff/ty/pytest, not under [tools].
+osv-scanner = "latest"
+semgrep = "latest"
+"aqua:betterleaks/betterleaks" = "latest"
+
 [settings]
 # uv-aware venv auto-activation.  Replaces the legacy `_.python.venv` block.
 python.uv_venv_auto = "create|source"
@@ -114,6 +123,56 @@ run = "uv run pytest tests/ --no-header -q"
 [tasks.check]
 description = "All quality gates: lint + fmt + typecheck + test"
 depends = ["lint", "fmt", "typecheck", "test"]
+
+# ---------------------------------------------------------------------------
+# Security gates — defense-in-depth SAST/SCA + secrets sweep.  Each emits
+# SARIF under .sarif/ for upload to GitHub code scanning in CI; locally
+# the SARIF lives on disk for manual inspection.  All four run in
+# parallel via `mise run security` and stay green on findings (--exit-zero
+# / --exit-code=0) so the SARIF is always produced; gating happens in
+# code scanning UI via branch protection alerts, not the scanner exit
+# code.  See .erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md
+# for the rationale.
+# ---------------------------------------------------------------------------
+
+[tasks."security:bandit"]
+description = "Python SAST via bandit (defense-in-depth alongside ruff S)"
+sources = ["src/**/*.py", "pyproject.toml"]
+run = """
+mkdir -p .sarif
+uv run bandit -r src -f sarif -o .sarif/bandit.sarif --exit-zero -c pyproject.toml
+"""
+
+[tasks."security:semgrep"]
+description = "Multi-language SAST via Semgrep (p/auto + p/owasp-top-ten)"
+sources = ["src/**/*.py", "pyproject.toml"]
+run = """
+mkdir -p .sarif
+semgrep scan \
+  --config p/auto \
+  --config p/owasp-top-ten \
+  --sarif --output=.sarif/semgrep.sarif \
+  --metrics=off || true
+"""
+
+[tasks."security:osv"]
+description = "Vulnerability scan of uv.lock via osv-scanner"
+sources = ["uv.lock"]
+run = """
+mkdir -p .sarif
+osv-scanner scan source --lockfile=uv.lock --format=sarif --output=.sarif/osv.sarif || true
+"""
+
+[tasks."security:leaks"]
+description = "Secrets sweep over git history via betterleaks (gitleaks successor)"
+run = """
+mkdir -p .sarif
+betterleaks git . -f sarif -r .sarif/betterleaks.sarif --exit-code=0
+"""
+
+[tasks.security]
+description = "All security scanners in parallel: bandit + semgrep + osv + leaks (SARIF under .sarif/)"
+depends = ["security:bandit", "security:semgrep", "security:osv", "security:leaks"]
 
 # ---------------------------------------------------------------------------
 # Build / release
