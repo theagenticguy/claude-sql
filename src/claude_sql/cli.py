@@ -39,6 +39,7 @@ from cyclopts import App, Parameter
 from loguru import logger
 
 from claude_sql import (
+    binding as _binding,
     blind_handover as _blind_handover,
     checkpointer,
     freeze as _freeze,
@@ -1970,6 +1971,216 @@ def kappa_cmd(
         sys.exit(66)
 
 
+@app.command(name="bind")
+def bind_cmd(
+    *,
+    repo: Path | None = None,
+    commit_msg: Path | None = None,
+    dry_run: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Attach the transcript-PR binding (trailers + git-notes JSON) to a commit.
+
+    Pre-commit-hook entry point per RFC 0001 (see
+    ``docs/rfc/0001-transcript-pr-binding.md``).  Wires into a
+    ``prepare-commit-msg`` lefthook job so the trailer lands in the
+    user's editor before they confirm the message.
+
+    Discovery order for the commit-message file:
+
+    1. ``--commit-msg PATH`` flag if set.
+    2. ``GIT_PARAMS`` / ``$1`` from the hook -- we re-read it from
+       the ``CLAUDE_SQL_BIND_COMMIT_MSG`` env var, which is the
+       lefthook-friendly way to pass the hook's ``{0}`` arg through.
+    3. ``<repo>/.git/COMMIT_EDITMSG`` as a last-ditch fallback.
+
+    Resolves the active transcript via
+    :func:`claude_sql.binding.find_active_transcript` (latest mtime
+    under ``~/.claude/projects/<projectified-cwd>/*.jsonl``); when no
+    transcript is found the command exits 0 cleanly without touching
+    the message — bind is best-effort by design.
+
+    With ``--dry-run`` (default ``False``), prints the planned
+    binding as JSON and writes nothing.  Off ``--dry-run``, writes
+    the three trailers in place and a JSON note under
+    ``refs/notes/transcripts``.
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    repo_path = repo.resolve() if repo is not None else _binding._resolve_repo(None)
+    cwd = Path.cwd()
+    transcript = _binding.find_active_transcript(cwd)
+    if transcript is None:
+        emit_json(
+            {
+                "bound": False,
+                "reason": "no-active-transcript",
+                "cwd": str(cwd),
+                "projects_dir": f"~/.claude/projects/{_binding.projectify(cwd)}",
+            },
+            fmt=fmt,
+        )
+        return
+    binding = _binding.build_binding(transcript_path=transcript)
+
+    msg_path: Path | None = commit_msg
+    if msg_path is None:
+        env_path = os.environ.get("CLAUDE_SQL_BIND_COMMIT_MSG")
+        if env_path:
+            msg_path = Path(env_path)
+    if msg_path is None:
+        candidate = repo_path / ".git" / "COMMIT_EDITMSG"
+        if candidate.exists():
+            msg_path = candidate
+
+    if dry_run:
+        emit_json(
+            {
+                "bound": False,
+                "dry_run": True,
+                "transcript_path": str(transcript),
+                "binding": binding.to_dict(),
+                "note_payload": binding.to_note_payload(),
+                "commit_msg_path": str(msg_path) if msg_path else None,
+                "repo": str(repo_path),
+            },
+            fmt=fmt,
+        )
+        return
+
+    if msg_path is None:
+        err = ClassifiedError(
+            kind="invalid_input",
+            exit_code=EXIT_CODES["invalid_input"],
+            message="no commit-message file found; pass --commit-msg or run from a prepare-commit-msg hook",
+            hint="set --commit-msg PATH or CLAUDE_SQL_BIND_COMMIT_MSG=$1 in your hook",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+
+    try:
+        _binding.write_trailer(msg_path, binding)
+    except _binding.GitInvocationError as exc:
+        err = ClassifiedError(
+            kind="runtime_error",
+            exit_code=EXIT_CODES["runtime_error"],
+            message=f"git interpret-trailers failed: {exc.stderr.strip()}",
+            hint=None,
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+
+    # Note write is best-effort: we have a HEAD commit only when bind
+    # runs *after* the commit (e.g., post-commit hook).  In a
+    # prepare-commit-msg flow the commit doesn't exist yet, so we skip
+    # the note here and the integration relies on a separate
+    # post-commit step.  When the caller is invoking us with --commit
+    # already created (e.g., backfill), they pass --no-dry-run with a
+    # repo containing HEAD.
+    head_cp = _binding._run_git(
+        ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+    )
+    if head_cp.returncode == 0:
+        commit_sha = head_cp.stdout.strip()
+        try:
+            _binding.write_note(repo_path, commit_sha, binding)
+        except _binding.GitInvocationError as exc:
+            logger.warning("git notes write failed (non-fatal): {}", exc.stderr.strip())
+            commit_sha = ""
+    else:
+        commit_sha = ""
+
+    emit_json(
+        {
+            "bound": True,
+            "dry_run": False,
+            "transcript_path": str(transcript),
+            "binding": binding.to_dict(),
+            "commit_msg_path": str(msg_path),
+            "repo": str(repo_path),
+            "commit_sha": commit_sha,
+        },
+        fmt=fmt,
+    )
+
+
+@app.command(name="resolve")
+def resolve_cmd(
+    commit_sha: str,
+    /,
+    *,
+    repo: Path | None = None,
+    all_sources: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Resolve a commit's bound transcript per RFC 0001 §Resolution precedence.
+
+    Reads the ``Claude-Transcript-*`` trailers first; falls back to
+    the JSON note under ``refs/notes/transcripts``; raises a loud
+    error (exit 70) when both surfaces disagree on the digest.
+    Returns the parsed binding as JSON.
+
+    Flags
+    -----
+    --repo PATH
+        Repository root.  Defaults to ``git rev-parse --show-toplevel``
+        from the current cwd.
+    --all-sources
+        Return ``{"trailer": ..., "note": ...}`` instead of merging.
+        Diagnostic flow for investigating mismatches; never raises on
+        disagreement.
+
+    Exit codes
+    ----------
+    * 0   binding resolved cleanly (or ``--all-sources`` returned both)
+    * 2   commit has no binding (no trailer, no note)
+    * 65  commit not found / git invocation failed
+    * 70  trailer and note disagree on digest
+    """
+    _configure(common)
+    fmt = _fmt(common)
+    repo_path = repo.resolve() if repo is not None else None
+    try:
+        if all_sources:
+            sources = _binding.resolve_all_sources(commit_sha, repo=repo_path)
+            payload: dict[str, dict[str, str] | None] = {
+                "trailer": sources["trailer"].to_dict() if sources["trailer"] is not None else None,
+                "note": sources["note"].to_dict() if sources["note"] is not None else None,
+            }
+            emit_json(payload, fmt=fmt)
+            return
+        binding = _binding.resolve_commit_to_transcript(commit_sha, repo=repo_path)
+    except _binding.BindingMismatchError as exc:
+        err = ClassifiedError(
+            kind="runtime_error",
+            exit_code=EXIT_CODES["runtime_error"],
+            message=str(exc),
+            hint="run `claude-sql resolve <sha> --all-sources` to see both surfaces",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+    except LookupError as exc:
+        err = ClassifiedError(
+            kind="no_embeddings",  # re-uses the "absent-but-not-broken" kind
+            exit_code=EXIT_CODES["no_embeddings"],
+            message=str(exc),
+            hint="commit has no Claude-Transcript-* trailer and no refs/notes/transcripts entry",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+    except _binding.GitInvocationError as exc:
+        err = ClassifiedError(
+            kind="catalog_error",
+            exit_code=EXIT_CODES["catalog_error"],
+            message=f"git invocation failed: {exc.stderr.strip()}",
+            hint="check that the commit SHA exists in --repo",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+
+    emit_json(binding.to_dict(), fmt=fmt)
+
+
 @app.default
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
@@ -1979,6 +2190,7 @@ def _default(*, common: Common | None = None) -> None:
     print("  embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
+    print("  bind | resolve")
 
 
 # ---------------------------------------------------------------------------
