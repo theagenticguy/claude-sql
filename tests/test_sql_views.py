@@ -168,7 +168,12 @@ def fixtures_dir(tmp_path: Path) -> Path:
         ),
     ]
 
-    # Session 2: Task spawn + forward-compat extra field on a todo.
+    # Session 2: subagent launch (renamed Task→Agent), TaskCreate +
+    # TaskUpdate (the v2.1.16 interactive task family), plus a TodoWrite with
+    # a forward-compat extra field. Together these exercise the post-v2.1.63
+    # taxonomy: Agent → subagent_spawns; TaskCreate/TaskUpdate →
+    # task_creations/task_updates/tasks_state_current; TodoWrite → todo_events
+    # (kept for --print and SDK-py runs).
     file2 = proj / f"{SESSION_IDS[1]}.jsonl"
     records2 = [
         _msg(
@@ -181,11 +186,21 @@ def fixtures_dir(tmp_path: Path) -> Path:
                 {
                     "type": "tool_use",
                     "id": "tu-3",
-                    "name": "Task",
+                    "name": "Agent",
                     "input": {
                         "subagent_type": "Explore",
                         "description": "Scan code",
                         "prompt": "Find all TODOs in the repo",
+                    },
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tu-3a",
+                    "name": "TaskCreate",
+                    "input": {
+                        "subject": "Audit imports",
+                        "description": "Check for unused imports across src/",
+                        "activeForm": "Auditing imports",
                     },
                 },
                 {
@@ -202,6 +217,55 @@ def fixtures_dir(tmp_path: Path) -> Path:
                             },
                         ]
                     },
+                },
+            ],
+        ),
+        # Tool result for the TaskCreate call -- emits the assigned task id
+        # in the runtime-shaped "Task #N created" string. tasks_state_current
+        # parses that to recover task_id since the input doesn't carry it.
+        _msg(
+            "u-3",
+            SESSION_IDS[1],
+            "2026-04-02T11:00:05.000Z",
+            role="user",
+            type_="user",
+            model=None,
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tu-3a",
+                    "content": "Task #1 created successfully",
+                },
+            ],
+        ),
+        # TaskUpdate flips the task to in_progress, then to completed.
+        _msg(
+            "a-3b",
+            SESSION_IDS[1],
+            "2026-04-02T11:01:00.000Z",
+            role="assistant",
+            model="claude-sonnet-4-6",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "tu-3b",
+                    "name": "TaskUpdate",
+                    "input": {"taskId": "1", "status": "in_progress"},
+                },
+            ],
+        ),
+        _msg(
+            "a-3c",
+            SESSION_IDS[1],
+            "2026-04-02T11:02:00.000Z",
+            role="assistant",
+            model="claude-sonnet-4-6",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "tu-3c",
+                    "name": "TaskUpdate",
+                    "input": {"taskId": "1", "status": "completed"},
                 },
             ],
         ),
@@ -348,13 +412,71 @@ def test_todo_events_forward_compat(fixtures_dir: Path) -> None:
     assert rows == [("Explore", "pending")]
 
 
-def test_task_spawns_detected(fixtures_dir: Path) -> None:
+def test_task_spawns_deprecated_alias_unions_both(fixtures_dir: Path) -> None:
+    """The deprecated ``task_spawns`` alias unions subagent_spawns +
+    task_creations. TaskCreate rows have NULL subagent_type/prompt by design.
+    """
     con = _connect(fixtures_dir)
     rows = con.execute(
-        "SELECT spawn_tool, subagent_type, description FROM task_spawns WHERE session_id = ?",
+        "SELECT spawn_tool, subagent_type, description "
+        "FROM task_spawns WHERE session_id = ? "
+        "ORDER BY spawn_tool",
         [SESSION_IDS[1]],
     ).fetchall()
-    assert rows == [("Task", "Explore", "Scan code")]
+    assert rows == [
+        ("Agent", "Explore", "Scan code"),
+        ("TaskCreate", None, "Check for unused imports across src/"),
+    ]
+
+
+def test_subagent_spawns_detected(fixtures_dir: Path) -> None:
+    """``Agent`` (the v2.1.63+ rename of Task) lands in subagent_spawns with
+    subagent_type + prompt populated.
+    """
+    con = _connect(fixtures_dir)
+    rows = con.execute(
+        "SELECT spawn_tool, subagent_type, description, prompt "
+        "FROM subagent_spawns WHERE session_id = ?",
+        [SESSION_IDS[1]],
+    ).fetchall()
+    assert rows == [("Agent", "Explore", "Scan code", "Find all TODOs in the repo")]
+
+
+def test_task_creations_detected(fixtures_dir: Path) -> None:
+    """``TaskCreate`` (v2.1.16+) lands in task_creations with subject +
+    activeForm populated -- distinct from subagent_spawns.
+    """
+    con = _connect(fixtures_dir)
+    rows = con.execute(
+        "SELECT create_tool, subject, active_form FROM task_creations WHERE session_id = ?",
+        [SESSION_IDS[1]],
+    ).fetchall()
+    assert rows == [("TaskCreate", "Audit imports", "Auditing imports")]
+
+
+def test_task_updates_detected(fixtures_dir: Path) -> None:
+    """``TaskUpdate`` rows project task_id + status; both lifecycle events
+    show up in transcript order.
+    """
+    con = _connect(fixtures_dir)
+    rows = con.execute(
+        "SELECT task_id, status FROM task_updates WHERE session_id = ? ORDER BY updated_at",
+        [SESSION_IDS[1]],
+    ).fetchall()
+    assert rows == [("1", "in_progress"), ("1", "completed")]
+
+
+def test_tasks_state_current_latest_status(fixtures_dir: Path) -> None:
+    """``tasks_state_current`` joins task_creations to the latest task_updates
+    row by (session_id, task_id). The runtime emits the assigned task id in
+    the tool_result; the view recovers it via ``Task #N created`` regex.
+    """
+    con = _connect(fixtures_dir)
+    rows = con.execute(
+        "SELECT task_id, subject, status FROM tasks_state_current WHERE session_id = ?",
+        [SESSION_IDS[1]],
+    ).fetchall()
+    assert rows == [("1", "Audit imports", "completed")]
 
 
 def test_subagent_sessions_count(fixtures_dir: Path) -> None:
@@ -435,7 +557,11 @@ def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
         "tool_results",
         "todo_events",
         "todo_state_current",
-        "task_spawns",
+        "subagent_spawns",
+        "task_creations",
+        "task_updates",
+        "tasks_state_current",
+        "task_spawns",  # deprecated alias, still in VIEW_NAMES for one release
         "subagent_sessions",
         "subagent_messages",
     }
