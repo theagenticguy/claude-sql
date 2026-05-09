@@ -390,8 +390,13 @@ def shell(*, common: Common | None = None) -> None:
     _configure(common)
     settings = _resolve_settings(common)
 
-    with tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False) as tf:
-        db_path = tf.name
+    # mkstemp returns a tuple of (fd, path); we want the path only — duckdb
+    # opens its own handle.  Closing the fd immediately keeps the file but
+    # releases the descriptor (mkstemp is preferred over NamedTemporaryFile
+    # here because we never write to the handle; we just need a unique
+    # path that already exists on disk so duckdb can open it).
+    fd, db_path = tempfile.mkstemp(suffix=".duckdb")
+    os.close(fd)
 
     con = duckdb.connect(db_path)
     try:
