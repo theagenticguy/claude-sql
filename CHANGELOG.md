@@ -1,4 +1,4 @@
-## Unreleased
+## v0.4.0 (2026-05-09)
 
 ### Feat
 
@@ -6,7 +6,7 @@
 
 ### Fix
 
-- **publish**: switch to uv-native publish + add missing packaging dep
+- **publish**: switch to uv-native publish + add missing packaging dep (#25)
 - **ci**: scope changelog gate to PRs + normalize squash-merge suffix
 - **ci**: correct cyclonedx-py environment flags in SBOM workflow (#20)
 
