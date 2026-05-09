@@ -42,6 +42,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "bandit[sarif]>=1.9.4",
     "commitizen>=4.13.10",
     "lefthook>=2.1.6",
     "pytest>=9.0.3",
@@ -199,6 +200,32 @@ invalid-argument-type = "ignore"     # test helpers pass looser dict shapes than
 possibly-unresolved-reference = "warn"
 possibly-missing-attribute = "warn"
 unused-ignore-comment = "warn"
+
+[tool.bandit]
+# Defense-in-depth alongside ruff's flake8-bandit (S) selectors. Ruff S is
+# the fast pre-commit gate; bandit -r src is the SARIF-emitting CI gate.
+# Coverage overlap is ~70% — bandit catches AST-heavy detectors ruff S
+# skips (B610 SQL injection, B701 jinja2 autoescape variants, some B102
+# exec_used / B411 xmlrpc forms). Per-scanner SARIF dedups in code
+# scanning UI via category (`bandit` vs `ruff`).
+exclude_dirs = ["tests", ".venv", ".erpaval", "docs"]
+# Principled skips — each ignore here matches an existing ruff S ignore
+# elsewhere in this file. If you ever flip ruff to enforce these, drop
+# the bandit skip too.
+#   B101: `assert` for type-narrowing (binding.py:739 `assert note is not
+#         None`); also used in tests. Production never relies on
+#         assertions for runtime safety; ruff ignores S101 per-test-file.
+#   B404: `import subprocess` is required for binding.py's git plumbing
+#         and freeze.py / hooks tooling.  The subprocess.run() calls
+#         themselves use list-form + check=False + explicit returncode
+#         inspection (no shell=True).
+#   B603/B607: subprocess.run() without shell=True is the read-only
+#         pattern; bandit flags every call.  Ruff ignores S603/S607.
+#   B608: DuckDB SQL via f-strings is the read-only pattern across
+#         sql_views.py / cli.py / freeze.py — DuckDB's table-function
+#         arguments don't accept prepared parameters.  See CLAUDE.md
+#         §"Resilience patterns to preserve" + ruff ignore S608.
+skips = ["B101", "B404", "B603", "B607", "B608"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,3 +16,4 @@ build/
 claude-sql.duckdb
 .gitnexus
 .erpaval/sessions/
+.sarif/

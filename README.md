@@ -395,11 +395,37 @@ CI agrees. On top of the local gate, CI layers in:
 
 - **Semgrep** — `p/auto` + `p/owasp-top-ten` rulesets, SARIF uploaded
   to GitHub code scanning.
+- **Bandit** — Python SAST as defense-in-depth alongside ruff's
+  `flake8-bandit` (`S`) selectors. Principled skips align 1:1 with the
+  ruff S-ignores in `pyproject.toml`. SARIF to code scanning.
 - **CodeQL** — `security-and-quality` query pack, weekly cron.
 - **OSV-Scanner** — known-CVE scan of `uv.lock`, fails on findings.
+- **Betterleaks** — secrets sweep over full git history (gitleaks
+  successor). SARIF to code scanning.
 - **OpenSSF Scorecard** — weekly, SARIF to code scanning.
 - **Codecov** — coverage.xml uploaded via tokenless OIDC.
 - **CycloneDX SBOM** — generated + attached on every release.
+
+### Local security sweep
+
+`mise run security` runs all four SAST/SCA/secrets scanners in parallel
+against the working tree:
+
+```bash
+mise run security              # bandit + semgrep + osv + leaks → .sarif/
+mise run security:bandit       # individual scanners also runnable
+mise run security:semgrep
+mise run security:osv
+mise run security:leaks
+```
+
+Each scanner emits SARIF under `.sarif/` (gitignored). The local sweep
+mirrors what CI uploads to GitHub code scanning, so contributors can
+reproduce findings without waiting on CI. All four use the
+"report, don't gate" pattern (`--exit-zero` / `--exit-code=0`) — gating
+happens through code-scanning branch protection, not the scanner exit.
+See `.erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md`
+for the rationale.
 
 See `docs/adr/0015-stack-modernization.md` and
 `docs/adr/0016-ci-hardening.md` for the full rationale.
