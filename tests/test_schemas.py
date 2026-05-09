@@ -6,10 +6,13 @@ import json
 
 from claude_sql.schemas import (
     MESSAGE_TRAJECTORY_SCHEMA,
+    PR_REVIEW_SHEET_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
     Conflict,
+    Correction,
     MessageTrajectory,
+    PRReviewSheet,
     SessionClassification,
     SessionConflicts,
 )
@@ -89,12 +92,64 @@ def test_all_object_subschemas_forbid_additional() -> None:
         SESSION_CLASSIFICATION_SCHEMA,
         MESSAGE_TRAJECTORY_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
+        PR_REVIEW_SHEET_SCHEMA,
     ):
         for node in _walk(root):
             if node.get("type") == "object":
                 assert node.get("additionalProperties") is False, (
                     f"object node missing additionalProperties: {node}"
                 )
+
+
+def test_pr_review_sheet_schema_flattened() -> None:
+    """PRReviewSheet's nested Correction must inline cleanly with no $ref/$defs.
+
+    Same Bedrock subset rules as the other schemas: no refs, no defs,
+    additionalProperties=false at every object level. Field-level
+    descriptions must survive (the worker prompt relies on them).
+    """
+    s = PR_REVIEW_SHEET_SCHEMA
+    dumped = json.dumps(s)
+    assert "$ref" not in dumped
+    assert "$defs" not in s
+    # Required top-level fields cover the six PRReviewSheet fields.
+    assert set(s["required"]) == {
+        "human_intent",
+        "agent_exploration",
+        "corrections",
+        "tools_used",
+        "tools_refused",
+        "diff_rationale",
+    }
+    # Nested Correction shape.
+    items = s["properties"]["corrections"]["items"]
+    assert items["additionalProperties"] is False
+    assert set(items["required"]) == {"what_agent_did", "correction"}
+    # Descriptions preserved.
+    assert s["properties"]["human_intent"].get("description")
+    assert items["properties"]["correction"].get("description")
+
+
+def test_pr_review_sheet_pydantic_round_trip() -> None:
+    """Happy-path validation: PRReviewSheet accepts a fully-populated dict."""
+    sheet = PRReviewSheet(
+        human_intent="Refactor auth middleware.",
+        agent_exploration=["Read src/auth/middleware.py", "Surveyed call sites"],
+        corrections=[
+            Correction(
+                what_agent_did="Started rewriting from scratch.",
+                correction="Asked to keep existing module and only update rotator.",
+            )
+        ],
+        tools_used=["Read", "Grep", "Edit"],
+        tools_refused=[],
+        diff_rationale=(
+            "Updated the rotator invocation in src/auth/middleware.py to call "
+            "rotate_v2() while preserving surrounding control flow."
+        ),
+    )
+    assert sheet.tools_used == ["Read", "Grep", "Edit"]
+    assert sheet.corrections[0].what_agent_did.startswith("Started")
 
 
 def test_pydantic_models_validate_happy_path() -> None:

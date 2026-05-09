@@ -74,6 +74,8 @@ from claude_sql.parquet_shards import (
     is_sharded_dir,
     iter_part_files,
 )
+from claude_sql.review_sheet_render import render_markdown, render_refusal_markdown
+from claude_sql.review_sheet_worker import generate_review_sheet
 from claude_sql.sql_views import (
     describe_all,
     list_macros,
@@ -2181,6 +2183,136 @@ def resolve_cmd(
     emit_json(binding.to_dict(), fmt=fmt)
 
 
+def _review_sheet_format(common: Common | None) -> OutputFormat:
+    """Pick the review-sheet effective format.
+
+    Default policy diverges from every other subcommand: review-sheet
+    output is human-first prose, so ``AUTO`` resolves to ``MARKDOWN`` on
+    a TTY (override of the global ``TABLE`` default) and ``JSON``
+    off-TTY. Explicit ``--format`` flags pass through unchanged so
+    agents can still pin ``--format json`` regardless of TTY state.
+    """
+    fmt = _fmt(common)
+    if fmt is not OutputFormat.AUTO:
+        return fmt
+    return OutputFormat.MARKDOWN if sys.stdout.isatty() else OutputFormat.JSON
+
+
+@app.command(name="review-sheet")
+def review_sheet_cmd(
+    commit_sha: str,
+    /,
+    *,
+    repo: Path | None = None,
+    no_thinking: bool = False,
+    dry_run: bool = True,
+    common: Common | None = None,
+) -> None:
+    """Render a compressed PR review sheet for a merged commit.
+
+    Resolves the commit's bound transcript via
+    :func:`claude_sql.binding.resolve_commit_to_transcript` (RFC 0001
+    precedence: trailer first, note fallback, loud failure on
+    disagreement), flattens the JSONL into a single review text, and
+    asks Sonnet 4.6 — via ``output_config.format`` structured output —
+    to populate the :class:`PRReviewSheet` schema.
+
+    Defaults to ``--dry-run`` per the project cost-guard convention.
+    Dry-run prints a plan dict (commit_sha, transcript_uri,
+    transcript_digest, model_id, prompt_chars_estimate) and skips the
+    Bedrock call.
+
+    Output format
+    -------------
+    On a TTY ``--format auto`` resolves to ``markdown`` (the
+    human-readable review-sheet shape). Off-TTY it resolves to
+    ``json`` so agents get machine-readable output without a flag. Pass
+    ``--format json`` / ``--format markdown`` explicitly to override.
+    Dry-run always emits JSON regardless of the selected format —
+    plan output is structured by design.
+
+    Exit codes
+    ----------
+    * 0   review sheet rendered (or refused; refusal still exits 0 with
+          ``{"refused": true}`` in the payload).
+    * 2   commit has no binding (no trailer, no note).
+    * 65  commit not found / git invocation failed.
+    * 70  trailer and note disagree on digest.
+    """
+    _configure(common)
+    fmt = _review_sheet_format(common)
+    settings = _resolve_settings(common)
+    repo_path = repo.resolve() if repo is not None else None
+
+    try:
+        # Resolve up-front so the worker's binding lookup uses the same repo
+        # (the worker re-runs resolve internally when ``transcript_uri_override``
+        # is unset; we pre-resolve so we can map LookupError / mismatch errors
+        # to the canonical CLI exit codes before opening a DuckDB connection).
+        binding = _binding.resolve_commit_to_transcript(commit_sha, repo=repo_path)
+    except _binding.BindingMismatchError as exc:
+        err = ClassifiedError(
+            kind="runtime_error",
+            exit_code=EXIT_CODES["runtime_error"],
+            message=str(exc),
+            hint="run `claude-sql resolve <sha> --all-sources` to see both surfaces",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+    except LookupError as exc:
+        err = ClassifiedError(
+            kind="no_embeddings",
+            exit_code=EXIT_CODES["no_embeddings"],
+            message=str(exc),
+            hint="commit has no Claude-Transcript-* trailer and no refs/notes/transcripts entry",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+    except _binding.GitInvocationError as exc:
+        err = ClassifiedError(
+            kind="catalog_error",
+            exit_code=EXIT_CODES["catalog_error"],
+            message=f"git invocation failed: {exc.stderr.strip()}",
+            hint="check that the commit SHA exists in --repo",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+
+    # Hand the resolved URI through the override so the worker doesn't
+    # round-trip to git twice (and so it stays testable without a repo).
+    result = generate_review_sheet(
+        None,
+        settings,
+        commit_sha=commit_sha,
+        transcript_uri_override=binding.uri,
+        dry_run=dry_run,
+        no_thinking=no_thinking,
+    )
+
+    if dry_run:
+        # Plan output is structured regardless of --format choice; users
+        # asking for markdown still get JSON for the plan because there's
+        # no narrative to render yet.
+        plan = result.get("plan", result)
+        emit_json(plan, fmt=OutputFormat.JSON)
+        return
+
+    if result.get("refused"):
+        if fmt is OutputFormat.MARKDOWN:
+            metadata = result.get("metadata") or {"commit_sha": commit_sha}
+            print(render_refusal_markdown(str(result.get("reason", "")), metadata))
+            return
+        emit_json(result, fmt=fmt)
+        return
+
+    sheet = result.get("sheet") or {}
+    metadata = result.get("metadata") or {}
+    if fmt is OutputFormat.MARKDOWN:
+        print(render_markdown(sheet, metadata))
+        return
+    emit_json({"sheet": sheet, "metadata": metadata}, fmt=fmt)
+
+
 @app.default
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
@@ -2190,7 +2322,7 @@ def _default(*, common: Common | None = None) -> None:
     print("  embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
-    print("  bind | resolve")
+    print("  bind | resolve | review-sheet")
 
 
 # ---------------------------------------------------------------------------
