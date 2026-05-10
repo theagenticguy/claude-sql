@@ -243,6 +243,8 @@ def test_load_session_centroids_matches_numpy_reference(
     assert sids == sorted(expected.keys())
     for i, sid in enumerate(sids):
         np.testing.assert_allclose(centroids[i], expected[sid], rtol=1e-5, atol=1e-6)
+
+
 def test_communities_deterministic(
     connected_settings: tuple[duckdb.DuckDBPyConnection, Settings],
 ) -> None:
