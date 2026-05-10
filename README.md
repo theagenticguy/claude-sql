@@ -77,7 +77,7 @@ flowchart LR
     L --> PA["session_classifications/, message_trajectory/,<br/>session_conflicts/, user_friction/<br/>(sharded part-*.parquet)"]
     P --> C["claude-sql cluster<br/>(UMAP + HDBSCAN)"]
     C --> PC["clusters + cluster_terms<br/>(c-TF-IDF)"]
-    P --> CM["claude-sql community<br/>(Louvain over centroids)"]
+    P --> CM["claude-sql community<br/>(Leiden + CPM over mutual-kNN centroids)"]
     CM --> PM["session_communities<br/>parquet"]
     PA --> AV[analytics views + macros]
     PC --> AV
@@ -227,7 +227,7 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `conflicts` | Per-session stance-conflict detection |
 | `friction` | Regex + Sonnet 4.6 → status pings, unmet expectations, confusion, etc. |
 | `cluster` | UMAP → HDBSCAN → c-TF-IDF over message embeddings |
-| `community` | Louvain over session centroids |
+| `community` | Leiden + CPM over mutual-kNN session centroids; emits medoid + coherence + resolution profile + `--neighbors-of` |
 | `skills sync` | Walk `~/.claude/skills/` + `~/.claude/plugins/cache/` → seedable skills catalog |
 | `skills ls` | List catalog entries, filterable by `--kind` and `--plugin` |
 | `analyze` | Run the whole pipeline in dependency order |
@@ -280,7 +280,8 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `session_conflicts` | per-session stance conflicts | `stance_a`, `stance_b`, `resolution` |
 | `message_clusters` | cluster id + 2d viz coords | `cluster_id`, `x`, `y`, `is_noise` |
 | `cluster_terms` | c-TF-IDF top terms per cluster | `cluster_id`, `term`, `weight`, `rank` |
-| `session_communities` | Louvain community per session | `community_id`, `size` |
+| `session_communities` | Leiden+CPM community per session | `community_id`, `size`, `is_medoid`, `coherence`, `gamma_used` |
+| `community_profile` | Resolution-profile sidecar (auto-γ runs only) | `gamma`, `n_communities`, `quality`, `plateau_length` |
 | `user_friction` | one row per classified short user message | `label` (7-way), `rationale`, `source` (`regex` / `llm` / `refused`), `confidence` |
 | `skills_catalog` | one row per known skill / slash command (seed by `claude-sql skills sync`) | `skill_id`, `name`, `plugin`, `plugin_version`, `source_kind` (`user-skill` / `plugin-skill` / `plugin-command` / `builtin`), `description` |
 | `skill_usage` | `skill_invocations` ⟕ `skills_catalog` | `source`, `skill_id`, `skill_name`, `plugin`, `is_builtin`, `description` |
@@ -335,7 +336,15 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `~/.claude/skills_catalog.parquet` | Skills catalog parquet |
 | `CLAUDE_SQL_USER_SKILLS_DIR` | `~/.claude/skills` | Root scanned for user-installed skills |
 | `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `~/.claude/plugins/cache` | Root scanned for plugin skills + commands |
-| `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Louvain determinism |
+| `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Leiden determinism |
+| `CLAUDE_SQL_LEIDEN_KNN_K` | `15` | Mutual-kNN k for the session-centroid graph |
+| `CLAUDE_SQL_LEIDEN_EDGE_FLOOR` | `0.3` | Cosine floor below which edges are dropped |
+| `CLAUDE_SQL_LEIDEN_MIN_COMMUNITY_SIZE` | `3` | Communities below this collapse to noise (`-1`) |
+| `CLAUDE_SQL_LEIDEN_RESOLUTION` | unset (auto) | Explicit CPM γ; skips the resolution profile |
+| `CLAUDE_SQL_LEIDEN_RESOLUTION_RANGE_LO` | `0.05` | Lower bound for `Optimiser.resolution_profile` bisection |
+| `CLAUDE_SQL_LEIDEN_RESOLUTION_RANGE_HI` | `0.95` | Upper bound for the bisection |
+| `CLAUDE_SQL_LEIDEN_N_ITERATIONS` | `-1` | Iterate to convergence; `2` is leidenalg's default |
+| `CLAUDE_SQL_COMMUNITY_PROFILE_PARQUET_PATH` | `~/.claude/community_profile.parquet` | Resolution-profile sidecar path |
 
 ## Development
 
@@ -452,12 +461,25 @@ See `docs/adr/0015-stack-modernization.md` and
   with adaptive thinking on. Pydantic v2 schemas are flattened (inline
   `$ref`, inject `additionalProperties: false`, strip the numeric /
   string constraints the validator rejects from Draft 2020-12).
-- **Determinism.** UMAP, HDBSCAN, and Louvain all seed from
+- **Determinism.** UMAP, HDBSCAN, and Leiden all seed from
   `CLAUDE_SQL_SEED=42` (default) so cluster IDs and community IDs are
-  stable across reruns.
-- **Louvain = `networkx`.** `networkx.community.louvain_communities`,
-  built into `networkx >= 3.4`. The abandoned `python-louvain` package
-  is not used.
+  stable across reruns. The Leiden seed flows into both
+  `leidenalg.find_partition(seed=...)` and `Optimiser.set_rng_seed(...)`
+  for the resolution-profile bisection — same seed + same input ⇒
+  byte-equal parquets across runs.
+- **Communities = `leidenalg` + CPM.** Reference Leiden implementation
+  (`leidenalg>=0.11.0`) over an `igraph>=1.0` mutual-kNN cosine graph
+  (k=15, edge floor 0.3) of session centroids. CPM γ has direct cosine
+  semantics (internal density ≥ γ, external ≤ γ); auto-γ via
+  `Optimiser.resolution_profile` + longest-plateau picker; warn-only
+  connectivity check. Output is signal-rich: `is_medoid`, `coherence`,
+  `gamma_used` per row, plus a `community_profile` sidecar with one row
+  per γ tested, so an LLM agent can ask "what γ would yield 50
+  communities?" without rerunning Leiden. Top terms per community come
+  from the live `community_top_topics(cid, n)` macro composed from
+  `cluster_terms`, not a frozen column. See
+  [`docs/research_notes.md`](docs/research_notes.md) for the
+  Louvain → Leiden+CPM swap rationale.
 - **Hybrid friction pipeline.** A hand-curated regex bank catches the
   unambiguous `status_ping` / `interruption` / `correction` cases at
   zero Bedrock cost; the ambiguous class — especially

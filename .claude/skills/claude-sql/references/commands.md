@@ -183,11 +183,22 @@ No Bedrock cost.
 
 ## `community`
 
-Louvain community detection over session centroids.
+Leiden + CPM community detection over a mutual-kNN cosine graph of session
+centroids. Agent-first: emits medoid + coherence per community, writes a
+resolution-profile sidecar when auto-γ runs, and supports a `--neighbors-of`
+early-return path for "give me sessions near this one" without invoking
+Leiden.
 
 ```bash
-claude-sql community
+claude-sql community                          # auto-γ, writes both parquets
+claude-sql community --resolution coarse      # pick a different γ plateau
+claude-sql community --gamma 0.5 --force      # explicit γ; skips sidecar
+claude-sql community --neighbors-of <sid>     # top-15 cosine neighbors
+claude-sql community --dry-run --format json  # plan-only, agent-readable
 ```
+
+Top terms per community: query `community_top_topics(<cid>, 10)` (live
+macro composed from `cluster_terms` — not snapshotted).
 
 No Bedrock cost.
 
@@ -209,4 +220,7 @@ ones:
 - `CLAUDE_SQL_DEFAULT_GLOB` — main transcript glob
 - `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` — embeddings cache path
 - `CLAUDE_SQL_CONCURRENCY` — parallel Bedrock calls
-- `CLAUDE_SQL_SEED` — determinism for UMAP / HDBSCAN / Louvain
+- `CLAUDE_SQL_SEED` — determinism for UMAP / HDBSCAN / Leiden
+- `CLAUDE_SQL_LEIDEN_KNN_K` — mutual-kNN k for the session-centroid graph (default 15)
+- `CLAUDE_SQL_LEIDEN_EDGE_FLOOR` — cosine floor below which edges are dropped (default 0.3)
+- `CLAUDE_SQL_LEIDEN_RESOLUTION` — explicit CPM γ; unset = auto via resolution profile

@@ -82,7 +82,7 @@ by session.
 
 1. `claude-sql embed --since-days 90 --no-dry-run` (if needed).
 2. `claude-sql cluster` — UMAP + HDBSCAN + c-TF-IDF.
-3. `claude-sql community` — Louvain over session centroids.
+3. `claude-sql community` — Leiden+CPM over mutual-kNN session centroids.
 4. Report top communities with dominant clusters and trend:
 
 ```sql
