@@ -79,6 +79,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "community_profile",
     "user_friction",
     "skills_catalog",
     "skill_usage",
@@ -96,6 +97,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "message_clusters",
     "cluster_terms",
     "session_communities",
+    "community_profile",
     "user_friction",
     "skills_catalog",
 )
@@ -1462,6 +1464,7 @@ def register_analytics(
     clusters_parquet: Path | None = None,
     cluster_terms_parquet: Path | None = None,
     communities_parquet: Path | None = None,
+    community_profile_parquet: Path | None = None,
     user_friction_parquet: Path | None = None,
     skills_catalog_parquet: Path | None = None,
 ) -> None:
@@ -1518,6 +1521,9 @@ def register_analytics(
         "session_communities": communities_parquet
         if communities_parquet is not None
         else resolved.communities_parquet_path,
+        "community_profile": community_profile_parquet
+        if community_profile_parquet is not None
+        else resolved.community_profile_parquet_path,
         "user_friction": user_friction_parquet
         if user_friction_parquet is not None
         else resolved.user_friction_parquet_path,
