@@ -1602,14 +1602,18 @@ def community(
             gamma=gamma,
             resolution=resolution,
         )
+        import math
+
+        quality_val = stats["quality"]
+        quality_log = (
+            quality_val if isinstance(quality_val, float) and not math.isnan(quality_val) else 0.0
+        )
         logger.info(
             "community: {} sessions, {} communities (γ={:.4f}, quality={:.4f})",
             stats["sessions"],
             stats["communities"],
             stats["gamma_used"],
-            stats["quality"]
-            if isinstance(stats["quality"], float) and stats["quality"] == stats["quality"]
-            else 0.0,
+            quality_log,
         )
         _emit_worker_result(stats, common, pipeline="community")
     finally:
