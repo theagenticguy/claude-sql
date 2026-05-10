@@ -63,6 +63,10 @@ def _default_communities_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
 
 
+def _default_community_profile_parquet() -> Path:
+    return Path(os.path.expanduser("~/.claude/community_profile.parquet"))
+
+
 def _default_user_friction_parquet() -> Path:
     return Path(os.path.expanduser("~/.claude/user_friction/"))
 
@@ -228,6 +232,12 @@ class Settings(BaseSettings):
     clusters_parquet_path: Path = Field(default_factory=_default_clusters_parquet)
     cluster_terms_parquet_path: Path = Field(default_factory=_default_cluster_terms_parquet)
     communities_parquet_path: Path = Field(default_factory=_default_communities_parquet)
+    #: Resolution-profile sidecar written when ``community`` runs auto-γ.
+    #: Holds one row per γ tested by ``leidenalg.Optimiser.resolution_profile``
+    #: with columns ``(gamma, n_communities, quality, plateau_length)``. Lets
+    #: an agent preview "what γ would give 50 communities" without rerunning
+    #: Leiden. Conditional: explicit ``--gamma`` runs do not write it.
+    community_profile_parquet_path: Path = Field(default_factory=_default_community_profile_parquet)
     #: Output of the user-friction classifier (see ``friction_worker.py``).
     #: One row per user message flagged as status_ping, unmet_expectation,
     #: confusion, interruption, correction, frustration, or (sentinel) none.
@@ -257,7 +267,7 @@ class Settings(BaseSettings):
     checkpoint_db_path: Path = Field(default_factory=_default_checkpoint_db)
 
     # ------------------------------------------------------------------
-    # v2: UMAP + HDBSCAN + Louvain hyperparameters
+    # v2: UMAP + HDBSCAN + Leiden hyperparameters
     # ------------------------------------------------------------------
     umap_n_components_50: int = 50
     umap_n_components_2: int = 2
@@ -267,22 +277,29 @@ class Settings(BaseSettings):
     umap_metric: str = "cosine"
     hdbscan_min_cluster_size: int = 20
     hdbscan_min_samples: int = 5
-    #: Absolute cosine floor below which a pair is never considered related,
-    #: regardless of the adaptive search.  Kept conservative so the graph
-    #: doesn't collapse into a single giant component on very similar
-    #: corpora.
-    louvain_edge_threshold: float = 0.55
-    #: Target band for the average graph degree.  ``_pick_adaptive_threshold``
-    #: picks the cosine cut that puts average degree in ``[low, high]``.
-    #: 8-15 is the empirically-tested sweet spot for Louvain on session-
-    #: centroid graphs (1K-20K nodes): enough to let community structure
-    #: emerge, not enough to produce a hairball.
-    louvain_target_avg_degree_low: float = 8.0
-    louvain_target_avg_degree_high: float = 15.0
-    #: Louvain communities smaller than this get collapsed into the
-    #: NOISE_COMMUNITY_ID bucket (-1) so reports stay legible.
-    louvain_min_community_size: int = 3
-    louvain_resolution: float = 1.0
+    #: Mutual-kNN k for the session-centroid graph.  k=15 is the Scanpy /
+    #: BERTopic default for embedding-similarity graphs and lands a graph
+    #: density that gives Leiden+CPM clean communities without hairballs.
+    leiden_knn_k: int = 15
+    #: Absolute cosine floor; edges below this are dropped before Leiden.
+    #: Lower than the old louvain_edge_threshold (0.55) because mutual-kNN
+    #: already constrains degree by construction.
+    leiden_edge_floor: float = 0.3
+    #: Communities smaller than this collapse to NOISE_COMMUNITY_ID (-1).
+    leiden_min_community_size: int = 3
+    #: CPM resolution parameter γ.  ``None`` triggers auto-γ via
+    #: ``leidenalg.Optimiser.resolution_profile`` + longest-plateau picker.
+    #: For cosine weights in [edge_floor, 1.0], γ has direct density
+    #: semantics: communities have internal density ≥ γ, external ≤ γ.
+    leiden_resolution: float | None = None
+    #: Bisection search range for ``Optimiser.resolution_profile``.  Stored
+    #: as two scalars rather than a tuple because pydantic-settings env-var
+    #: support for tuple fields is awkward.
+    leiden_resolution_range_lo: float = 0.05
+    leiden_resolution_range_hi: float = 0.95
+    #: Iterations for ``leidenalg.find_partition``.  ``-1`` means iterate
+    #: until no quality improvement; ``2`` is the leidenalg default.
+    leiden_n_iterations: int = -1
     seed: int = 42
 
     # ------------------------------------------------------------------
