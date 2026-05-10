@@ -65,7 +65,16 @@ jobs:
     # for a benign mechanical drift. Restricting to ``pull_request``
     # keeps the gate honest where it matters (PR author forgot to
     # update CHANGELOG) without policing main.
-    if: github.event_name == 'pull_request'
+    #
+    # **Release-PR carve-out.** ``cz bump`` writes a new ``## vX.Y.Z``
+    # header to CHANGELOG.md before the matching tag exists. Running
+    # ``cz changelog --incremental`` on that branch fails with "No
+    # tag found to do an incremental changelog". The release PR's
+    # CHANGELOG was already canonical when cz wrote it; skip the
+    # gate entirely when the PR title starts with ``chore(release):``.
+    if: >-
+      github.event_name == 'pull_request' &&
+      !startsWith(github.event.pull_request.title, 'chore(release):')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
