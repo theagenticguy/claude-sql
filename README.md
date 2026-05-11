@@ -290,6 +290,7 @@ Commands that spend real Bedrock money default to `--dry-run`.
 
 | Macro | Signature | What it does |
 |---|---|---|
+| `ago(interval_text)` | scalar → `TIMESTAMP` | `current_timestamp - INTERVAL <text>` -- e.g. `WHERE ts >= ago('30 days')` |
 | `model_used(sid)` | scalar → `VARCHAR` | Latest `model` observed in the session |
 | `cost_estimate(sid)` | scalar → `DOUBLE` | USD spend (dated model IDs prefix-matched) |
 | `tool_rank(last_n_days)` | table | Tool-use leaderboard over a window |

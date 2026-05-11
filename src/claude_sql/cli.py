@@ -635,15 +635,15 @@ def schema(*, common: Common | None = None) -> None:
                 for col, col_type in cols:
                     print(f"  {col:<28} {col_type}")
             print(f"\n\033[1mMacros\033[0m ({len(macros)})")
-            for macro in macros:
-                print(f"  {macro}")
+            for name, params in macros:
+                print(f"  {name}({', '.join(params)})")
         else:
             payload = {
                 "views": {
                     name: [{"column": c, "type": t} for c, t in cols]
                     for name, cols in views.items()
                 },
-                "macros": list(macros),
+                "macros": [{"name": n, "params": list(p)} for n, p in macros],
             }
             emit_json(payload, fmt)
     finally:
