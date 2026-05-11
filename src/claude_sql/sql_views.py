@@ -85,6 +85,196 @@ VIEW_NAMES: tuple[str, ...] = (
     "skill_usage",
 )
 
+# Hand-maintained column schema for the v1 (transcript-derived) views.
+#
+# Why a static dict, not catalog introspection?
+# ---------------------------------------------
+# ``DESCRIBE`` over every view re-binds ``v_raw_events`` and re-runs JSON
+# schema inference per call -- the dominant cost in ``claude-sql schema``
+# (14.5 s on the live corpus).  Hoisting the schema into a static dict
+# lets the agent-facing ``schema`` command answer in <50 ms with zero
+# DuckDB connection cost.
+#
+# Only v1 views appear here. v2 analytics views
+# (``session_classifications``, ``message_trajectory``, etc.) are backed
+# by parquet files whose schemas live in the parquet metadata itself --
+# they're correctly omitted because the source of truth for those views
+# is the parquet, not this dict.
+#
+# Drift is caught by :func:`tests.test_sql_views.test_view_schema_matches_describe_all`,
+# which registers the v1 views over the fixture corpus, runs
+# :func:`describe_all`, and asserts column-level equality with this dict.
+# A contributor who edits view DDL without updating ``VIEW_SCHEMA`` gets
+# a hard CI failure rather than a runtime mystery.
+VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
+    "sessions": (
+        ("session_id", "VARCHAR"),
+        ("cwd", "VARCHAR"),
+        ("git_branch", "VARCHAR"),
+        ("started_at", "TIMESTAMP"),
+        ("ended_at", "TIMESTAMP"),
+        ("assistant_messages", "BIGINT"),
+        ("record_count", "BIGINT"),
+        ("transcript_path", "VARCHAR"),
+    ),
+    "messages": (
+        ("uuid", "VARCHAR"),
+        ("parent_uuid", "JSON"),
+        ("session_id", "UUID"),
+        ("ts", "TIMESTAMP"),
+        ("type", "VARCHAR"),
+        ("is_sidechain", "BOOLEAN"),
+        ("role", "VARCHAR"),
+        ("model", "VARCHAR"),
+        ("stop_reason", "VARCHAR"),
+        ("input_tokens", "BIGINT"),
+        ("output_tokens", "BIGINT"),
+        ("cache_read", "BIGINT"),
+        ("cache_write", "BIGINT"),
+        ("content_json", "JSON"),
+        ("source_file", "VARCHAR"),
+    ),
+    "content_blocks": (
+        ("session_id", "UUID"),
+        ("message_uuid", "VARCHAR"),
+        ("ts", "TIMESTAMP"),
+        ("role", "VARCHAR"),
+        ("block_type", "VARCHAR"),
+        ("text", "VARCHAR"),
+        ("tool_use_id_field", "VARCHAR"),
+        ("tool_name", "VARCHAR"),
+        ("tool_input", "JSON"),
+        ("tool_use_id", "VARCHAR"),
+        ("tool_result_content", "JSON"),
+        ("thinking", "VARCHAR"),
+    ),
+    "messages_text": (
+        ("uuid", "VARCHAR"),
+        ("session_id", "UUID"),
+        ("ts", "TIMESTAMP"),
+        ("role", "VARCHAR"),
+        ("text_content", "VARCHAR"),
+    ),
+    "tool_calls": (
+        ("message_uuid", "VARCHAR"),
+        ("session_id", "UUID"),
+        ("ts", "TIMESTAMP"),
+        ("tool_name", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+        ("tool_input", "JSON"),
+    ),
+    "tool_results": (
+        ("message_uuid", "VARCHAR"),
+        ("session_id", "UUID"),
+        ("ts", "TIMESTAMP"),
+        ("tool_use_id", "VARCHAR"),
+        ("content", "JSON"),
+    ),
+    "todo_events": (
+        ("session_id", "UUID"),
+        ("written_at", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("subject", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("active_form", "VARCHAR"),
+        ("snapshot_ix", "BIGINT"),
+    ),
+    "todo_state_current": (
+        ("session_id", "UUID"),
+        ("subject", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("active_form", "VARCHAR"),
+        ("written_at", "TIMESTAMP"),
+    ),
+    "subagent_spawns": (
+        ("session_id", "UUID"),
+        ("spawned_at", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+        ("spawn_tool", "VARCHAR"),
+        ("subagent_type", "VARCHAR"),
+        ("description", "VARCHAR"),
+        ("prompt", "VARCHAR"),
+        ("run_in_background", "VARCHAR"),
+    ),
+    "task_creations": (
+        ("session_id", "UUID"),
+        ("created_at", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+        ("create_tool", "VARCHAR"),
+        ("subject", "VARCHAR"),
+        ("description", "VARCHAR"),
+        ("active_form", "VARCHAR"),
+        ("metadata", "JSON"),
+    ),
+    "task_updates": (
+        ("session_id", "UUID"),
+        ("updated_at", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+        ("update_tool", "VARCHAR"),
+        ("task_id", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("add_blocked_by", "JSON"),
+        ("owner", "VARCHAR"),
+    ),
+    "tasks_state_current": (
+        ("session_id", "UUID"),
+        ("task_id", "VARCHAR"),
+        ("subject", "VARCHAR"),
+        ("active_form", "VARCHAR"),
+        ("status", "VARCHAR"),
+        ("created_at", "TIMESTAMP"),
+        ("last_updated_at", "TIMESTAMP"),
+    ),
+    "task_spawns": (
+        ("session_id", "UUID"),
+        ("spawned_at", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+        ("spawn_tool", "VARCHAR"),
+        ("subagent_type", "VARCHAR"),
+        ("description", "VARCHAR"),
+        ("prompt", "VARCHAR"),
+    ),
+    "skill_invocations": (
+        ("session_id", "UUID"),
+        ("ts", "TIMESTAMP"),
+        ("message_uuid", "VARCHAR"),
+        ("source", "VARCHAR"),
+        ("skill_id", "VARCHAR"),
+        ("args", "VARCHAR"),
+        ("tool_use_id", "VARCHAR"),
+    ),
+    "subagent_sessions": (
+        ("parent_session_id", "VARCHAR"),
+        ("agent_hex", "VARCHAR"),
+        ("agent_type", "VARCHAR"),
+        ("description", "VARCHAR"),
+        ("started_at", "TIMESTAMP"),
+        ("ended_at", "TIMESTAMP"),
+        ("message_count", "BIGINT"),
+        ("transcript_path", "VARCHAR"),
+    ),
+    "subagent_messages": (
+        ("uuid", "VARCHAR"),
+        ("parent_uuid", "JSON"),
+        ("session_id", "VARCHAR"),
+        ("parent_session_id", "VARCHAR"),
+        ("agent_hex", "VARCHAR"),
+        ("ts", "TIMESTAMP"),
+        ("type", "VARCHAR"),
+        ("role", "VARCHAR"),
+        ("model", "VARCHAR"),
+        ("input_tokens", "BIGINT"),
+        ("output_tokens", "BIGINT"),
+        ("content_json", "JSON"),
+        ("source_file", "VARCHAR"),
+    ),
+}
+
+
 # Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
 # parquet outputs.  Exported so callers (``claude-sql`` subcommands, smoke
 # tests) can enumerate analytics views without needing to filter out the
@@ -102,11 +292,13 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "skills_catalog",
 )
 
-# Macro names registered by :func:`register_macros`.  The first six are the
-# v1 macros that ship unconditionally; the remaining six are the v2 analytics
-# macros, each registered via :func:`_safe_macro` so a missing backing view
-# downgrades to a warning instead of an exception.
+# Macro names registered by :func:`register_macros`.  ``ago`` is the
+# always-on temporal helper.  The next seven are v1 macros that ship
+# unconditionally; the remaining ten are v2 analytics macros, each
+# registered via :func:`_safe_macro` so a missing backing view downgrades
+# to a warning instead of an exception.
 MACRO_NAMES: tuple[str, ...] = (
+    "ago",
     "model_used",
     "cost_estimate",
     "tool_rank",
@@ -127,6 +319,45 @@ MACRO_NAMES: tuple[str, ...] = (
     "friction_examples",
     "unused_skills",
 )
+
+
+# Hand-maintained signatures for every macro in :data:`MACRO_NAMES`.
+#
+# Why a static dict, not catalog introspection?
+# ---------------------------------------------
+# DuckDB's ``duckdb_functions()`` returns a NULL ``parameters`` column for
+# table macros (those defined as ``CREATE OR REPLACE MACRO foo(args) AS
+# TABLE (...)``), so we can't recover signatures from the catalog at
+# runtime.  The boring engineer's response: extract once into a static
+# dict and gate drift behind a CI test.
+#
+# A regex-based drift test in ``tests/test_sql_views.py``
+# (``test_macro_signatures_match_ddl``) parses the ``CREATE OR REPLACE
+# MACRO <name>(<args>)`` strings out of :func:`register_macros`'s source
+# and asserts equality with this dict, so a contributor who adds or
+# renames a macro arg without updating ``MACRO_SIGNATURES`` gets a hard
+# CI failure.
+MACRO_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "ago": ("interval_text",),
+    "model_used": ("sid",),
+    "cost_estimate": ("sid",),
+    "tool_rank": ("last_n_days",),
+    "todo_velocity": ("sid",),
+    "subagent_fanout": ("sid",),
+    "semantic_search": ("query_vec", "k"),
+    "skill_rank": ("last_n_days",),
+    "skill_source_mix": ("last_n_days",),
+    "autonomy_trend": ("window_days",),
+    "work_mix": ("since_days",),
+    "success_rate_by_work": ("since_days",),
+    "cluster_top_terms": ("cid", "n"),
+    "community_top_topics": ("cid", "n"),
+    "sentiment_arc": ("sid",),
+    "friction_counts": ("since_days",),
+    "friction_rate": ("since_days",),
+    "friction_examples": ("label_name", "n"),
+    "unused_skills": ("last_n_days",),
+}
 
 
 def _sql_str(value: str) -> str:
@@ -836,6 +1067,20 @@ def register_macros(
     pricing = settings.pricing if settings is not None else DEFAULT_PRICING
     pricing_rows = _pricing_values_clause(pricing)
 
+    # ``ago('14 days')`` -> ``current_timestamp - INTERVAL 14 DAY``.  The
+    # CAST handles every interval-unit shape DuckDB recognizes ('30 minutes',
+    # '2 weeks', '6 months', ...), so callers don't need to remember the
+    # bare-INTERVAL syntax for the common ``WHERE ts >= ago('30 days')``
+    # window queries.  Always-on (v1) macro -- no parquet dependency.
+    con.execute(
+        """
+        CREATE OR REPLACE MACRO ago(interval_text) AS (
+            current_timestamp - CAST(interval_text AS INTERVAL)
+        );
+        """
+    )
+    logger.debug("Registered v1 macro: ago")
+
     con.execute(
         """
         CREATE OR REPLACE MACRO model_used(sid) AS (
@@ -959,7 +1204,7 @@ def register_macros(
     )
 
     logger.debug(
-        "Registered macros: model_used, cost_estimate, tool_rank, "
+        "Registered macros: ago, model_used, cost_estimate, tool_rank, "
         "todo_velocity, subagent_fanout, semantic_search, skill_rank, "
         "skill_source_mix"
     )
@@ -1731,8 +1976,19 @@ def describe_all(con: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[str, st
     return out
 
 
-def list_macros(con: duckdb.DuckDBPyConnection) -> list[str]:
-    """Return the macro names defined in this connection's ``main`` schema.
+def list_macros(con: duckdb.DuckDBPyConnection) -> list[tuple[str, tuple[str, ...]]]:
+    """Return ``(name, params)`` for every registered macro.
+
+    Parameter signatures come from :data:`MACRO_SIGNATURES` rather than
+    DuckDB's catalog because ``duckdb_functions()`` returns NULL
+    ``parameters`` for table macros (those defined with ``AS TABLE
+    (...)``).  This function joins the catalog query with our static
+    signature table.
+
+    Macros not in :data:`MACRO_SIGNATURES` get an empty params tuple --
+    they're either ad-hoc test macros or new macros that haven't been
+    registered in the dict yet (the regex drift test in
+    ``test_sql_views.py`` catches the second case in CI).
 
     Parameters
     ----------
@@ -1741,9 +1997,9 @@ def list_macros(con: duckdb.DuckDBPyConnection) -> list[str]:
 
     Returns
     -------
-    list[str]
-        Sorted, deduplicated list of macro function names (includes both
-        scalar and table macros).
+    list[tuple[str, tuple[str, ...]]]
+        Sorted list of ``(macro_name, parameter_names)`` pairs.  Includes
+        both scalar and table macros.
     """
     rows = con.execute(
         """
@@ -1754,4 +2010,4 @@ def list_macros(con: duckdb.DuckDBPyConnection) -> list[str]:
         ORDER BY function_name
         """
     ).fetchall()
-    return [str(r[0]) for r in rows]
+    return [(str(r[0]), MACRO_SIGNATURES.get(str(r[0]), ())) for r in rows]

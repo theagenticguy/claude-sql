@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from claude_sql.sql_views import (
+    MACRO_NAMES,
+    MACRO_SIGNATURES,
+    VIEW_SCHEMA,
     describe_all,
     list_macros,
     register_macros,
@@ -575,8 +580,11 @@ def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
 
 def test_list_macros_includes_all(fixtures_dir: Path) -> None:
     con = _connect(fixtures_dir)
-    macros = set(list_macros(con))
+    # ``list_macros`` returns ``[(name, params_tuple), ...]``; pull just the names
+    # for membership checks.
+    names = {name for name, _params in list_macros(con)}
     expected = {
+        "ago",
         "model_used",
         "cost_estimate",
         "tool_rank",
@@ -584,7 +592,7 @@ def test_list_macros_includes_all(fixtures_dir: Path) -> None:
         "subagent_fanout",
         "semantic_search",
     }
-    assert expected <= macros
+    assert expected <= names
 
 
 def test_register_vss_without_parquet_creates_empty_table(tmp_path: Path) -> None:
@@ -595,3 +603,108 @@ def test_register_vss_without_parquet_creates_empty_table(tmp_path: Path) -> Non
     assert ok is False
     n = con.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
     assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# Static catalog drift + ago() macro coverage
+# ---------------------------------------------------------------------------
+
+
+def test_macro_signatures_match_ddl() -> None:
+    """``MACRO_SIGNATURES`` must equal the args parsed from the DDL strings.
+
+    Parses ``CREATE OR REPLACE MACRO <name>(<args>)`` out of
+    :func:`register_macros`'s source via regex and asserts equality with
+    the static dict.  Catches drift when a contributor edits a macro
+    DDL without updating ``MACRO_SIGNATURES``.
+    """
+    source = inspect.getsource(register_macros)
+    pattern = re.compile(
+        r"CREATE\s+OR\s+REPLACE\s+MACRO\s+(\w+)\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    parsed: dict[str, tuple[str, ...]] = {}
+    for match in pattern.finditer(source):
+        name = match.group(1)
+        raw_args = match.group(2).strip()
+        args: tuple[str, ...] = (
+            tuple(arg.strip() for arg in raw_args.split(",")) if raw_args else ()
+        )
+        parsed[name] = args
+    assert parsed == MACRO_SIGNATURES, (
+        f"DDL-parsed macro signatures diverge from MACRO_SIGNATURES.\n"
+        f"  DDL: {parsed}\n  static: {MACRO_SIGNATURES}"
+    )
+    assert set(MACRO_SIGNATURES) == set(MACRO_NAMES), (
+        f"MACRO_SIGNATURES keys must match MACRO_NAMES.\n"
+        f"  signatures: {set(MACRO_SIGNATURES)}\n  names: {set(MACRO_NAMES)}"
+    )
+
+
+def test_view_schema_matches_describe_all(fixtures_dir: Path) -> None:
+    """Every entry in :data:`VIEW_SCHEMA` must match ``describe_all``'s output.
+
+    Drift catcher: if a contributor edits view DDL (adding a column,
+    renaming, changing types) without updating ``VIEW_SCHEMA``, this
+    assertion fires.  Only views populated in ``VIEW_SCHEMA`` are
+    checked -- v2 analytics views that depend on parquet outputs are
+    correctly skipped because their schema source-of-truth is the
+    parquet, not this dict.
+    """
+    con = _connect(fixtures_dir)
+    observed = describe_all(con)
+    for view_name, expected_cols in VIEW_SCHEMA.items():
+        observed_cols = tuple(observed.get(view_name, []))
+        assert observed_cols == expected_cols, (
+            f"VIEW_SCHEMA[{view_name!r}] diverges from describe_all output.\n"
+            f"  expected: {expected_cols}\n  observed: {observed_cols}"
+        )
+
+
+def _ago_only_connection() -> duckdb.DuckDBPyConnection:
+    """Bare DuckDB connection with only the ``ago`` macro registered.
+
+    ``register_macros`` requires the ``messages`` view (cost_estimate
+    macro body resolves it at creation time on some DuckDB versions),
+    so we re-create just the always-on ``ago`` macro here for unit
+    testing the macro in isolation.
+    """
+    con = duckdb.connect(":memory:")
+    con.execute(
+        """
+        CREATE OR REPLACE MACRO ago(interval_text) AS (
+            current_timestamp - CAST(interval_text AS INTERVAL)
+        );
+        """
+    )
+    return con
+
+
+def test_ago_macro_returns_past_timestamp() -> None:
+    """``ago('14 days')`` must return a timestamp earlier than ``current_timestamp``.
+
+    The comparison context (``< current_timestamp``) sidesteps DuckDB's
+    timezone-conversion fast path that would otherwise need pytz; both
+    sides reduce to the same TIMESTAMP_TZ before the boolean compare,
+    and DuckDB returns a plain ``bool``.
+    """
+    con = _ago_only_connection()
+    row = con.execute("SELECT ago('14 days') < current_timestamp").fetchone()
+    assert row is not None
+    assert row[0] is True
+
+
+def test_ago_macro_accepts_interval_strings() -> None:
+    """``ago()`` must cast '14 days', '2 weeks', '30 minutes' cleanly via DuckDB INTERVAL.
+
+    Verifies the cast doesn't raise -- the comparison context keeps the
+    test Python-side timezone-library-free (no pytz dependency).
+    """
+    con = _ago_only_connection()
+    for interval_str in ("14 days", "2 weeks", "30 minutes"):
+        row = con.execute(
+            "SELECT ago(?) < current_timestamp",
+            [interval_str],
+        ).fetchone()
+        assert row is not None, f"ago({interval_str!r}) returned no row"
+        assert row[0] is True, f"ago({interval_str!r}) was not in the past"
