@@ -219,7 +219,7 @@ def test_describe_checkpoint_entry_existing(tmp_path: Path) -> None:
 
 def test_capture_profile_returns_path(tmp_corpus: dict[str, Any]) -> None:
     settings = cli._resolve_settings(_common(tmp_corpus))
-    con = cli._open_connection(settings)
+    con = cli._open_connection_full(settings)
     try:
         out = cli._capture_profile(con, label="unit-test")
         assert out.parent.exists()
@@ -580,7 +580,7 @@ def test_search_with_mocked_embed(
     dim = int(settings.output_dimension)
 
     # Pull message uuids from the fixture corpus.
-    con = cli._open_connection(settings)
+    con = cli._open_connection_full(settings)
     try:
         rows = con.execute("SELECT uuid FROM messages_text LIMIT 4").fetchall()
     finally:

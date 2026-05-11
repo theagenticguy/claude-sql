@@ -313,11 +313,6 @@ def _sql_uses_catalog(sql: str) -> bool:
     return any(name.lower() in lowered for name in (*VIEW_NAMES, *MACRO_NAMES))
 
 
-# Maintained for backwards compatibility with tests that still call
-# ``cli._open_connection``. New code should pick the explicit variant.
-_open_connection = _open_connection_full
-
-
 def _emit_worker_result(result: int | dict, common: Common | None, pipeline: str) -> None:
     """Normalize worker results for stdout.
 

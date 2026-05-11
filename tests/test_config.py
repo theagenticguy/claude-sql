@@ -1,7 +1,7 @@
 """Tests for :mod:`claude_sql.config`.
 
 Covers the per-pipeline concurrency split, the ``concurrency`` deprecation
-alias, and the DuckDB tuning PRAGMAs that ``cli._open_connection`` applies.
+alias, and the DuckDB tuning PRAGMAs that ``cli._open_connection_full`` applies.
 The PRAGMA test exercises only the snippet that runs before ``register_all``
 so we avoid scanning the live ``~/.claude/projects`` corpus during the unit
 suite. The full integration with ``register_all`` is already covered by
