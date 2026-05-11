@@ -30,6 +30,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -103,12 +104,19 @@ Surfaces at a glance
   cluster / terms / community     UMAP+HDBSCAN, c-TF-IDF, Leiden+CPM
   analyze                         composite pipeline over every stage above
 
-Flag placement (important for agents)
--------------------------------------
-All flags attach to a SUBCOMMAND, not the top-level binary. Correct:
+!! FLAG PLACEMENT — flags attach to a SUBCOMMAND, not the binary !!
+-------------------------------------------------------------------
+Every flag (--format, --quiet, --verbose, --glob, --subagent-glob, and
+every per-command flag) goes AFTER the subcommand name. This applies
+to global-feeling flags too: `--quiet` must come after the subcommand.
+
+OK:
     claude-sql query --format json "SELECT 1"
+    claude-sql schema --quiet --format json
     claude-sql classify --no-dry-run --limit 5
-Incorrect (flag gets swallowed as the subcommand argument):
+FAIL (cyclopts: "Unused Tokens: ['schema']"):
+    claude-sql --quiet schema --format json
+FAIL (flag swallowed as subcommand arg):
     claude-sql --format json query "SELECT 1"
 
 Output & exit codes
@@ -2297,19 +2305,33 @@ def resolve_cmd(
     emit_json(binding.to_dict(), fmt=fmt)
 
 
-def _review_sheet_format(common: Common | None) -> OutputFormat:
-    """Pick the review-sheet effective format.
+class RenderFormat(StrEnum):
+    """``review-sheet`` render targets.
+
+    Local to ``review-sheet`` because no other subcommand emits human prose.
+    Keeping markdown out of the global :class:`OutputFormat` keeps
+    ``--format`` honest on every other subcommand (only renderers that
+    actually support markdown get to advertise it).
+    """
+
+    MARKDOWN = "markdown"
+    JSON = "json"
+
+
+def _review_sheet_format(common: Common | None) -> RenderFormat:
+    """Pick the review-sheet effective render format.
 
     Default policy diverges from every other subcommand: review-sheet
-    output is human-first prose, so ``AUTO`` resolves to ``MARKDOWN`` on
-    a TTY (override of the global ``TABLE`` default) and ``JSON``
-    off-TTY. Explicit ``--format`` flags pass through unchanged so
-    agents can still pin ``--format json`` regardless of TTY state.
+    output is human-first prose, so ``--format auto`` resolves to
+    ``MARKDOWN`` on a TTY (override of the global ``TABLE`` default) and
+    ``JSON`` off-TTY. ``--format json`` always pins JSON; every other
+    ``OutputFormat`` value resolves to ``MARKDOWN`` on a TTY and ``JSON``
+    off-TTY (table/ndjson/csv are not meaningful for the prose shape).
     """
     fmt = _fmt(common)
-    if fmt is not OutputFormat.AUTO:
-        return fmt
-    return OutputFormat.MARKDOWN if sys.stdout.isatty() else OutputFormat.JSON
+    if fmt is OutputFormat.JSON:
+        return RenderFormat.JSON
+    return RenderFormat.MARKDOWN if sys.stdout.isatty() else RenderFormat.JSON
 
 
 @app.command(name="review-sheet")
@@ -2355,6 +2377,9 @@ def review_sheet_cmd(
     """
     _configure(common)
     fmt = _review_sheet_format(common)
+    # Error output follows the global rule (TABLE on TTY, JSON off-TTY) — the
+    # render format is only meaningful for the success-path narrative.
+    error_fmt = _fmt(common)
     settings = _resolve_settings(common)
     repo_path = repo.resolve() if repo is not None else None
 
@@ -2371,7 +2396,7 @@ def review_sheet_cmd(
             message=str(exc),
             hint="run `claude-sql resolve <sha> --all-sources` to see both surfaces",
         )
-        emit_error(err, fmt)
+        emit_error(err, error_fmt)
         sys.exit(err.exit_code)
     except LookupError as exc:
         err = ClassifiedError(
@@ -2380,7 +2405,7 @@ def review_sheet_cmd(
             message=str(exc),
             hint="commit has no Claude-Transcript-* trailer and no refs/notes/transcripts entry",
         )
-        emit_error(err, fmt)
+        emit_error(err, error_fmt)
         sys.exit(err.exit_code)
     except _binding.GitInvocationError as exc:
         err = ClassifiedError(
@@ -2389,7 +2414,7 @@ def review_sheet_cmd(
             message=f"git invocation failed: {exc.stderr.strip()}",
             hint="check that the commit SHA exists in --repo",
         )
-        emit_error(err, fmt)
+        emit_error(err, error_fmt)
         sys.exit(err.exit_code)
 
     # Hand the resolved URI through the override so the worker doesn't
@@ -2412,19 +2437,19 @@ def review_sheet_cmd(
         return
 
     if result.get("refused"):
-        if fmt is OutputFormat.MARKDOWN:
+        if fmt is RenderFormat.MARKDOWN:
             metadata = result.get("metadata") or {"commit_sha": commit_sha}
             print(render_refusal_markdown(str(result.get("reason", "")), metadata))
             return
-        emit_json(result, fmt=fmt)
+        emit_json(result, fmt=OutputFormat.JSON)
         return
 
     sheet = result.get("sheet") or {}
     metadata = result.get("metadata") or {}
-    if fmt is OutputFormat.MARKDOWN:
+    if fmt is RenderFormat.MARKDOWN:
         print(render_markdown(sheet, metadata))
         return
-    emit_json({"sheet": sheet, "metadata": metadata}, fmt=fmt)
+    emit_json({"sheet": sheet, "metadata": metadata}, fmt=OutputFormat.JSON)
 
 
 @app.default

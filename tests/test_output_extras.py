@@ -2,7 +2,6 @@
 
 Targets:
 
-* Line 102 — :func:`emit_dataframe` raises on an unsupported format.
 * Lines 146-147 — :class:`InputValidationError` carries ``hint``.
 * Lines 160-163 — :func:`validate_glob` accepts empty / single-``**``,
   rejects multi-``**`` with hint.
@@ -10,6 +9,12 @@ Targets:
   + ``hint:`` to stderr.
 * Lines 237-244 — :func:`run_or_die` catches ``InputValidationError``,
   exits 64.
+
+The closed-set guard at the end of :func:`emit_dataframe` is now defensive
+code: ``OutputFormat`` covers AUTO/TABLE/JSON/NDJSON/CSV with no member
+that falls through. Reaching it would require dynamic enum injection,
+which doesn't represent any real call path — the guard stays as
+``# pragma: no cover``.
 """
 
 from __future__ import annotations
@@ -17,7 +22,6 @@ from __future__ import annotations
 import json
 import sys
 
-import polars as pl
 import pytest
 
 from claude_sql.output import (
@@ -25,28 +29,10 @@ from claude_sql.output import (
     ClassifiedError as _ClassifiedError,
     InputValidationError,
     OutputFormat,
-    emit_dataframe,
     emit_error,
     run_or_die,
     validate_glob,
 )
-
-# ---------------------------------------------------------------------------
-# emit_dataframe unsupported format (line 102)
-# ---------------------------------------------------------------------------
-
-
-def test_emit_dataframe_raises_on_unknown_format() -> None:
-    """When ``resolve_format`` returns a value outside the closed set, raise.
-
-    ``MARKDOWN`` is a valid ``OutputFormat`` member but ``emit_dataframe``
-    only handles TABLE / JSON / NDJSON / CSV, so it falls through to the
-    closed-set guard at the end of the function.
-    """
-    df = pl.DataFrame({"x": [1]})
-    with pytest.raises(ValueError, match="Unsupported format"):
-        emit_dataframe(df, OutputFormat.MARKDOWN)
-
 
 # ---------------------------------------------------------------------------
 # InputValidationError + validate_glob (lines 146-147, 160-163)

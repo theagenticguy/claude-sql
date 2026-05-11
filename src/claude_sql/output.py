@@ -24,11 +24,17 @@ import polars as pl
 
 
 class OutputFormat(StrEnum):
-    """Supported output formats.
+    """Supported output formats for tabular and structured CLI output.
 
     ``AUTO`` resolves to ``TABLE`` when stdout is a TTY and ``JSON`` otherwise.
     Keeping it a string Enum lets cyclopts parse ``--format json`` without any
     custom converter.
+
+    Markdown rendering is intentionally absent: only ``review-sheet`` emits
+    human prose, and it owns its own ``--render`` flag (see
+    :class:`claude_sql.cli.RenderFormat`). Pulling markdown into this enum
+    advertised the format on every subcommand even though no other command
+    knows how to produce it.
     """
 
     AUTO = "auto"
@@ -36,7 +42,6 @@ class OutputFormat(StrEnum):
     JSON = "json"
     NDJSON = "ndjson"
     CSV = "csv"
-    MARKDOWN = "markdown"
 
 
 # Exit codes that agents can rely on.  Keep them stable -- wire protocols
@@ -98,8 +103,9 @@ def emit_dataframe(
     if resolved is OutputFormat.CSV:
         df.write_csv(sys.stdout)
         return
-    # unreachable if OutputFormat stays closed-set
-    raise ValueError(f"Unsupported format: {resolved}")
+    # Defensive: unreachable while OutputFormat stays closed-set
+    # (auto/table/json/ndjson/csv). Kept as a guard for future enum additions.
+    raise ValueError(f"Unsupported format: {resolved}")  # pragma: no cover
 
 
 def emit_json(payload: Any, fmt: OutputFormat | str = OutputFormat.AUTO) -> None:

@@ -1,8 +1,8 @@
 ## Unreleased
 
-### Fix
+### Feat
 
-- **cli**: use math.isnan for NaN detection in community quality log
+- **cli**: drop --format markdown from public OutputFormat
 
 ## v0.5.0 (2026-05-10)
 
