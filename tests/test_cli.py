@@ -229,14 +229,21 @@ def test_capture_profile_returns_path(tmp_corpus: dict[str, Any]) -> None:
 
 
 def test_review_sheet_format_explicit_json_passes_through() -> None:
-    assert cli._review_sheet_format(Common(format=OutputFormat.JSON)) is OutputFormat.JSON
+    assert cli._review_sheet_format(Common(format=OutputFormat.JSON)) is cli.RenderFormat.JSON
 
 
 def test_review_sheet_format_auto_offtty_resolves_to_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
-    assert cli._review_sheet_format(Common(format=OutputFormat.AUTO)) is OutputFormat.JSON
+    assert cli._review_sheet_format(Common(format=OutputFormat.AUTO)) is cli.RenderFormat.JSON
+
+
+def test_review_sheet_format_auto_tty_resolves_to_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    assert cli._review_sheet_format(Common(format=OutputFormat.AUTO)) is cli.RenderFormat.MARKDOWN
 
 
 # ---------------------------------------------------------------------------
