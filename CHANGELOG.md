@@ -1,8 +1,8 @@
-## Unreleased
+## v0.6.0 (2026-05-11)
 
 ### Feat
 
-- **perf**: two-tier connections + parquet-gated macros + static schema
+- **perf**: two-tier connections + parquet-gated macros + static schema (#31)
 - **sql_views**: static catalog + ago() macro (#30)
 - **cli**: drop --format markdown from public OutputFormat (#29)
 
