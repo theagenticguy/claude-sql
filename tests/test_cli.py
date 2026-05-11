@@ -1090,6 +1090,106 @@ def test_review_sheet_cmd_dry_run(
     assert payload["dry_run"] is True
 
 
+def test_review_sheet_cmd_renders_markdown_on_tty(
+    tmp_corpus: dict[str, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Success path: TTY + AUTO format → render_markdown branch fires."""
+    from claude_sql import binding as _binding_mod
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"sessionId": "s1"}\n', encoding="utf-8")
+    fake_binding = _binding_mod.TranscriptBinding(
+        digest="sha256:" + "0" * 64,
+        uri=transcript.resolve().as_uri(),
+        agent_runtime="claude-code/test",
+        transcript_id="s1",
+        captured_at="2026-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        cli._binding, "resolve_commit_to_transcript", lambda sha, repo=None: fake_binding
+    )
+    # Force MARKDOWN render-format resolution: AUTO + isatty=True.
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    fake_result = {
+        "sheet": {
+            "human_intent": "fix the bug",
+            "agent_exploration": ["read foo.py", "ran pytest"],
+            "corrections": [],
+            "tools_used": ["Read", "Bash"],
+            "tools_refused": [],
+            "diff_rationale": "smallest change that passes tests",
+        },
+        "metadata": {
+            "commit_sha": "abcdef0123456789",
+            "transcript_uri": fake_binding.uri,
+            "transcript_digest": fake_binding.digest,
+            "model_id": "claude-sonnet-4-6",
+            "captured_at": "2026-01-01T00:00:00+00:00",
+        },
+    }
+    monkeypatch.setattr(cli, "generate_review_sheet", lambda *a, **kw: fake_result)
+    cli.review_sheet_cmd(
+        "abcdef0",
+        dry_run=False,
+        common=_common(tmp_corpus, fmt=OutputFormat.AUTO),
+    )
+    out = capsys.readouterr().out
+    # Markdown shape — header from render_markdown, plus body content.
+    assert "# PR Review Sheet" in out
+    assert "abcdef012345" in out
+    assert "fix the bug" in out
+    assert "smallest change that passes tests" in out
+
+
+def test_review_sheet_cmd_renders_refusal_markdown(
+    tmp_corpus: dict[str, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusal path: TTY + AUTO format → render_refusal_markdown branch fires."""
+    from claude_sql import binding as _binding_mod
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"sessionId": "s1"}\n', encoding="utf-8")
+    fake_binding = _binding_mod.TranscriptBinding(
+        digest="sha256:" + "0" * 64,
+        uri=transcript.resolve().as_uri(),
+        agent_runtime="claude-code/test",
+        transcript_id="s1",
+        captured_at="2026-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        cli._binding, "resolve_commit_to_transcript", lambda sha, repo=None: fake_binding
+    )
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    fake_result = {
+        "refused": True,
+        "reason": "test refusal: model declined to summarize",
+        "metadata": {
+            "commit_sha": "abcdef0123456789",
+            "transcript_uri": fake_binding.uri,
+            "transcript_digest": fake_binding.digest,
+            "model_id": "claude-sonnet-4-6",
+            "captured_at": "2026-01-01T00:00:00+00:00",
+        },
+    }
+    monkeypatch.setattr(cli, "generate_review_sheet", lambda *a, **kw: fake_result)
+    cli.review_sheet_cmd(
+        "abcdef0",
+        dry_run=False,
+        common=_common(tmp_corpus, fmt=OutputFormat.AUTO),
+    )
+    out = capsys.readouterr().out
+    # Markdown refusal shape — header + the canonical refusal note + reason.
+    assert "# PR Review Sheet" in out
+    assert "Review sheet refused" in out
+    assert "test refusal: model declined to summarize" in out
+
+
 # ---------------------------------------------------------------------------
 # Default + main entry points
 # ---------------------------------------------------------------------------
