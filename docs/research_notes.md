@@ -2,7 +2,7 @@
 
 > Zero-copy DuckDB engine over `~/.claude/projects/**/*.jsonl` transcripts,
 > with Cohere Embed v4 semantic search via DuckDB VSS, plus a v2 analytics
-> layer (UMAP + HDBSCAN clusters, Louvain communities, Sonnet 4.6
+> layer (UMAP + HDBSCAN clusters, Leiden+CPM communities, Sonnet 4.6
 > classifications / trajectory / conflicts / friction).
 
 This file captures the design decisions that survived into the shipped
@@ -233,19 +233,40 @@ register only the parquets that exist.
   trajectory / conflicts / friction, with a `--no-thinking` CLI escape
   hatch on each command for when the dry-run estimate is uncomfortable.
 
-### Louvain — `networkx` beats `python-louvain`
+### Leiden + CPM — replacing Louvain (May 2026)
 
-`networkx.algorithms.community.louvain_communities` has been built in
-since `networkx >= 3.4` and is the current maintained implementation.
-The old `python-louvain` package is stuck at its 2018 release — no bug
-fixes, no parallel modularity tweaks, and depends on the deprecated
-`community` shim. Switching saved one dependency and delivered a
-measurable speedup on the real graph.
+We replaced `networkx.community.louvain_communities` with
+`leidenalg.find_partition(... CPMVertexPartition ...)` over an `igraph`
+mutual-kNN cosine graph. Leiden strictly dominates Louvain in 2025–2026
+production work (Microsoft GraphRAG, Scanpy, Memgraph, Neo4j GDS,
+LlamaIndex all default to Leiden); its refinement phase guarantees
+γ-connectivity within communities, which Louvain does not. CPM is
+preferred over modularity for cosine-similarity graphs because γ has a
+closed-form interpretation (Traag-Van Dooren-Nesterov 2011): communities
+have internal density ≥ γ and external density ≤ γ in cosine units. This
+gives an LLM agent driving the CLI a directly interpretable "tighter or
+looser clusters" knob, where modularity's resolution parameter has no
+such semantics. CPM is also resolution-limit-free at this scale, where
+modularity is prone to the Fortunato-Barthélemy ceiling.
 
-Pipeline: build a cosine-similarity graph from session centroids, keep
-edges with `sim >= threshold` (default `0.75`), pass to
-`louvain_communities(..., resolution=1.0)`. Seeded by
-`CLAUDE_SQL_SEED=42` so community IDs are stable across runs.
+Pipeline: load message embeddings, average per session and L2-normalize,
+build a mutual-kNN graph (k=15, symmetric by construction), drop edges
+below the cosine floor (0.3 default), feed to `leidenalg.find_partition`
+with `CPMVertexPartition` and `resolution_parameter=γ`. γ is auto-picked
+via `Optimiser.resolution_profile` over `(0.05, 0.95)` + a longest-
+plateau heuristic; the full profile is persisted to a sidecar parquet so
+agents can preview alternate γ without rerunning Leiden. Connectivity
+post-check is warn-only — Park et al. 2024's 16% disconnection rate is
+on biomedical citation graphs, not on symmetric mutual-kNN over
+normalized cosine centroids. Seeded by `CLAUDE_SQL_SEED=42` (flowing into
+both `find_partition(seed=...)` and `Optimiser.set_rng_seed(...)`) so
+community IDs are stable across runs.
+
+The agent-first design contract: this command emits *signals* (medoid
+session, coherence, resolution profile, `--neighbors-of` lookup) — not
+*interpretations* (LLM-named clusters). The calling agent has full
+transcript access and can do the naming itself with much better
+context than a per-command Bedrock pass would have.
 
 ### UMAP → HDBSCAN → c-TF-IDF
 

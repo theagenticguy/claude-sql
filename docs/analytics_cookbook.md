@@ -107,10 +107,13 @@ LIMIT 5;
 ## 3. Community distribution
 
 `session_communities` is a parquet-backed view of session-centroid
-embeddings grouped into Louvain communities via
-`networkx.algorithms.community.louvain_communities` over a
-cosine-similarity session-to-session graph. Every session has exactly
-one row.
+embeddings grouped into Leiden+CPM communities via
+`leidenalg.find_partition(... CPMVertexPartition ...)` over a
+mutual-kNN cosine graph (k=15, edge floor 0.3) of session centroids.
+Every session has exactly one row, plus `is_medoid` (best
+representative), `coherence` (mean intra-community cosine), and the γ
+used. The `community_profile` sidecar reports one row per γ tested by
+`Optimiser.resolution_profile`.
 
 ```sql
 SELECT count(*) AS total_sessions,

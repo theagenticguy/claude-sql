@@ -91,7 +91,7 @@ repo or `uv tool install --from . claude-sql`.
 | `trajectory` | Per-message sentiment + transitions | Yes (defaults to `--dry-run`) |
 | `conflicts` | Per-session stance conflicts | Yes (defaults to `--dry-run`) |
 | `cluster` | UMAP → HDBSCAN → c-TF-IDF | No (CPU only) |
-| `community` | Louvain over session centroids | No (CPU only) |
+| `community` | Leiden + CPM over mutual-kNN session centroids; agent-first signals (medoid, coherence, resolution profile, `--neighbors-of`) | No (CPU only) |
 | `analyze` | Everything above, in order | Yes (defaults to `--dry-run`) |
 
 Full per-command flags and examples are in `references/commands.md`.
@@ -140,7 +140,8 @@ The analytics layer (registered only if the parquet exists):
   session
 - `message_clusters` — cluster_id + 2D UMAP viz coords
 - `cluster_terms` — c-TF-IDF top terms per cluster
-- `session_communities` — Louvain community per session
+- `session_communities` — Leiden+CPM community per session (with `is_medoid`, `coherence`, `gamma_used`)
+- `community_profile` — resolution-profile sidecar (one row per γ tested by `Optimiser.resolution_profile`); written when auto-γ runs
 
 The macro layer (call these like SQL functions):
 
@@ -187,6 +188,7 @@ small, focused, and meant to be read top-to-bottom when you need them.
   explicitly asked or new transcripts were added.
 - **Don't touch cost estimation constants.** They live in `config.py`
   and are kept in sync with Bedrock list prices.
-- **Never replace Louvain with python-louvain or add bertopic.** We
-  use `networkx.community.louvain_communities` and sklearn-based
-  c-TF-IDF on purpose — so the logic stays visible and patchable.
+- **Never reintroduce networkx Louvain, python-louvain, or bertopic.** We
+  use `leidenalg` (CPM) over an `igraph` mutual-kNN graph and sklearn-based
+  c-TF-IDF on purpose — so the logic stays visible and patchable, and γ
+  carries cosine-density semantics for an LLM driver.

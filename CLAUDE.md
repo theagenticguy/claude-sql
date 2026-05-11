@@ -20,8 +20,12 @@ queryable in place. Four analytics layers stack on top of those JSONLs:
    and classifies short user messages for friction signals (status pings,
    unmet expectations, confusion, interruption, correction, frustration).
 4. **Structure** — UMAP + HDBSCAN cluster message embeddings, c-TF-IDF names
-   the clusters, Louvain groups sessions into communities over cosine-
-   similarity session centroids.
+   the clusters, Leiden + CPM groups sessions into communities over a
+   mutual-kNN cosine graph of session centroids. The `community` subcommand
+   is agent-first: it emits *signals* (medoid sessions, coherence,
+   resolution-profile sidecar, `--neighbors-of` lookup) so a calling LLM
+   can do progressive disclosure into the corpus before reading specific
+   transcripts.
 
 Every expensive output (embeddings, classifications, clusters, communities,
 friction) is cached in parquet under `~/.claude/`. Views register only the
@@ -332,14 +336,56 @@ topic question. The LLM does this right; regex can't.
 
 ## Analytics pipeline determinism
 
-`CLAUDE_SQL_SEED=42` (default) seeds UMAP, HDBSCAN, and Louvain so cluster
+`CLAUDE_SQL_SEED=42` (default) seeds UMAP, HDBSCAN, and Leiden so cluster
 IDs and community IDs are stable across reruns. Don't reach for different
-seeds without a reason.
+seeds without a reason. The Leiden seed flows into both
+`leidenalg.find_partition(seed=...)` and `Optimiser.set_rng_seed(...)` for
+the resolution-profile bisection, so same-seed reruns produce byte-equal
+parquets.
 
-## Louvain note
+## Leiden+CPM note
 
-We use `networkx.community.louvain_communities` (built into networkx ≥3.4).
-Do not reintroduce the abandoned `python-louvain` / `community` package.
+We use `leidenalg.find_partition(... CPMVertexPartition ...)` over an
+`igraph` mutual-kNN graph (k=15, edge floor 0.3 by default) of session
+centroids. **Do not reintroduce networkx Louvain** or the abandoned
+`python-louvain` / `community` package. CPM is chosen over modularity
+because for cosine-similarity edges γ has a closed-form interpretation
+(Traag-Van Dooren-Nesterov 2011): communities have internal density ≥ γ
+and external density ≤ γ, both expressed in cosine units. Modularity's
+resolution parameter has no such semantics on weighted graphs and is
+prone to the Fortunato-Barthélemy resolution limit; CPM is
+resolution-limit-free for the dense-centroid scale claude-sql operates at.
+
+Auto-γ runs `Optimiser.resolution_profile` over `(0.05, 0.95)` and picks
+the longest-plateau γ — this is a free byproduct that produces a
+sidecar parquet (`community_profile.parquet`) so an agent can ask "what γ
+would give 50 communities?" without rerunning Leiden. Override the auto
+pick with `community --gamma <float>` (skips the profile + sidecar) or
+with `--resolution {coarse, medium, fine}` (picks alternate plateaus
+from the same profile — no extra Leiden runs).
+
+Connectivity post-check is **warn-only**. Park et al. (2024) reported up
+to 16% of Leiden communities disconnected on biomedical citation graphs;
+on symmetric mutual-kNN over normalized cosine centroids the rate is
+materially lower. We log a warning if any community's induced subgraph
+has multiple weakly-connected components but do NOT split. If the
+warning ever fires on the live corpus regularly, file an issue and we'll
+add the Park et al. Connectivity Modifier as a focused follow-up — but
+don't pre-emptively land 30+ LOC of split + relabel logic that might
+never run.
+
+Top terms per community come from the existing `community_top_topics(cid, n)`
+macro at `sql_views.py:898`, which composes from the message-level
+`cluster_terms` parquet on demand. We do **not** snapshot per-community
+top terms into `session_communities.parquet` — the macro is live and the
+parquet column would freeze a derivation that should update whenever
+clusters re-run.
+
+The edge attribute on the igraph graph MUST be named exactly `"weight"`;
+`leidenalg` looks it up by string when `find_partition(weights="weight",
+...)` is called. Versions are pinned `leidenalg>=0.11.0,<0.12` and
+`igraph>=1.0.0,<2.0` — both are reference-grade and the pin protects us
+from determinism drift across patch versions.
 
 ## c-TF-IDF note
 

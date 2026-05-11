@@ -50,7 +50,11 @@ from claude_sql import (
     ungrounded_worker as _ungrounded_worker,
 )
 from claude_sql.cluster_worker import run_clustering
-from claude_sql.community_worker import run_communities
+from claude_sql.community_worker import (
+    ResolutionLevel,
+    neighbors_of,
+    run_communities,
+)
 from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.friction_worker import detect_user_friction
@@ -96,7 +100,7 @@ Surfaces at a glance
   embed / search                  Cohere Embed v4 + HNSW cosine search
   classify / trajectory /         Sonnet 4.6 analytics -- each defaults to
   conflicts / friction            --dry-run; pass --no-dry-run to spend
-  cluster / terms / community     UMAP+HDBSCAN, c-TF-IDF, Louvain
+  cluster / terms / community     UMAP+HDBSCAN, c-TF-IDF, Leiden+CPM
   analyze                         composite pipeline over every stage above
 
 Flag placement (important for agents)
@@ -678,6 +682,7 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("message_clusters", settings.clusters_parquet_path),
         _describe_cache_entry("cluster_terms", settings.cluster_terms_parquet_path),
         _describe_cache_entry("session_communities", settings.communities_parquet_path),
+        _describe_cache_entry("community_profile", settings.community_profile_parquet_path),
         _describe_cache_entry("user_friction", settings.user_friction_parquet_path),
         _describe_cache_entry("skills_catalog", settings.skills_catalog_parquet_path),
         _describe_checkpoint_entry(settings.checkpoint_db_path),
@@ -1480,33 +1485,137 @@ def terms(*, force: bool = False, common: Common | None = None) -> None:
 
 
 @app.command
-def community(*, force: bool = False, common: Common | None = None) -> None:
-    """Session-level Louvain community detection over a cosine-similarity graph.
+def community(
+    *,
+    force: bool = False,
+    gamma: float | None = None,
+    resolution: ResolutionLevel = "medium",
+    neighbors_of_session: Annotated[str | None, Parameter(name=["--neighbors-of"])] = None,
+    top_k: int = 15,
+    dry_run: bool = False,
+    common: Common | None = None,
+) -> None:
+    """Session-level Leiden+CPM community detection over a mutual-kNN cosine graph.
 
     Prereq: ``embed`` (needs the embeddings parquet).
 
     Output columns (``session_communities`` view)
     ---------------------------------------------
-    session_id, community_id (int; -1 = isolated).
+    session_id, community_id (int; -1 = noise / sub-min-size),
+    size (int), is_medoid (bool — best representative session of its
+    community), coherence (float — mean intra-community cosine),
+    gamma_used (float — the CPM γ used at run time).
 
-    Method: build a session-centroid-cosine KNN graph, then run
-    ``networkx.community.louvain_communities`` (networkx ≥3.4).
-    Cost: zero. Seeded by ``CLAUDE_SQL_SEED=42``.
+    Sidecar (``community_profile`` view, written when auto-γ runs)
+    --------------------------------------------------------------
+    gamma, n_communities, quality, plateau_length — one row per γ tested
+    by ``leidenalg.Optimiser.resolution_profile``.  Lets the agent ask
+    "what γ would yield 50 communities?" without rerunning Leiden.
+
+    Method: build a session-centroid mutual-kNN graph (k=15, edge floor 0.3
+    by default), then ``leidenalg.find_partition`` with
+    ``CPMVertexPartition``.  CPM γ is auto-picked from the resolution
+    profile via the longest-plateau heuristic (Traag et al.); the
+    ``--resolution {coarse, medium, fine}`` flag picks alternate plateaus
+    of the same profile (no extra Leiden runs).
+
+    Cost: zero (CPU only).  Seeded by ``CLAUDE_SQL_SEED=42``.  For top
+    terms per community, run
+    ``claude-sql query "SELECT * FROM community_top_topics(<cid>, 10)"``.
 
     Flags
     -----
-    --force   Re-detect even if session_communities.parquet exists.
+    --force                 Re-detect even if session_communities.parquet exists.
+    --gamma FLOAT           Explicit CPM γ; skips the resolution profile + sidecar.
+                            Mutually exclusive with --resolution / --force / --neighbors-of.
+    --resolution {coarse,medium,fine}
+                            Pick a γ plateau without specifying a value.
+                            Default 'medium' = longest plateau.  Ignored if --gamma set.
+    --neighbors-of SID      Early-return path: skip Leiden, return top-k cosine
+                            neighbors of SID.  Reads centroids on the fly +
+                            joins session_communities.parquet if it exists.
+    --top-k N               Used with --neighbors-of (default 15).
+    --dry-run               Plan-only: count candidate sessions via SQL, do not
+                            run Leiden.  Honors agent JSON output for free.
+
+    Exit codes
+    ----------
+    0   success
+    64  invalid input (e.g., --neighbors-of combined with partition flags)
     """
     _configure(common)
     settings = _resolve_settings(common)
+    fmt = _fmt(common)
+
+    if neighbors_of_session is not None and (gamma is not None or force or dry_run):
+        err = ClassifiedError(
+            kind="invalid_input",
+            exit_code=EXIT_CODES["invalid_input"],
+            message=(
+                "--neighbors-of is mutually exclusive with --gamma, --force, "
+                "and --dry-run; pass only --neighbors-of and --top-k."
+            ),
+            hint="Run `claude-sql community --neighbors-of <sid> --top-k 15` alone.",
+        )
+        emit_error(err, fmt)
+        sys.exit(err.exit_code)
+
     con = _open_connection(settings)
     try:
-        stats = run_communities(con, settings, force=force)
+        if neighbors_of_session is not None:
+            df = neighbors_of(con, settings, neighbors_of_session, top_k=top_k)
+            emit_dataframe(df, fmt, table_rows=top_k)
+            return
+
+        if dry_run:
+            row = con.execute(
+                """
+                SELECT COUNT(DISTINCT m.session_id) AS candidate_sessions
+                  FROM read_parquet(?) e
+                  JOIN messages m
+                    ON CAST(m.uuid AS VARCHAR) = e.uuid
+                """,
+                [str(settings.embeddings_parquet_path)],
+            ).fetchone()
+            n = int(row[0]) if row else 0
+            plan: dict[str, object] = {
+                "pipeline": "community",
+                "candidate_sessions": n,
+                "knn_k": settings.leiden_knn_k,
+                "edge_floor": settings.leiden_edge_floor,
+                "min_community_size": settings.leiden_min_community_size,
+                "gamma": gamma if gamma is not None else "auto",
+                "resolution": resolution,
+                "would_write": [
+                    str(settings.communities_parquet_path),
+                ]
+                + ([] if gamma is not None else [str(settings.community_profile_parquet_path)]),
+                "dry_run": True,
+            }
+            emit_json(plan, fmt)
+            return
+
+        stats = run_communities(
+            con,
+            settings,
+            force=force,
+            gamma=gamma,
+            resolution=resolution,
+        )
+        import math
+
+        quality_val = stats["quality"]
+        quality_log = (
+            quality_val if isinstance(quality_val, float) and not math.isnan(quality_val) else 0.0
+        )
         logger.info(
-            "community: {} sessions grouped into {} communities",
+            "community: {} sessions, {} communities (γ={:.4f}, quality={:.4f})",
             stats["sessions"],
             stats["communities"],
+            stats["gamma_used"],
+            quality_log,
         )
+        _emit_worker_result(stats, common, pipeline="community")
     finally:
         con.close()
 
@@ -1538,7 +1647,7 @@ def analyze(
     1. embed        (Bedrock Cohere Embed v4; honors --dry-run)
     2. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
     3. terms        (c-TF-IDF labels for clusters; zero-cost)
-    4. community    (Louvain; zero-cost; --force_community to rebuild)
+    4. community    (Leiden+CPM; zero-cost; --force-community to rebuild)
     5. classify     (Sonnet 4.6; honors --dry-run)
     6. trajectory   (Sonnet 4.6; honors --dry-run)
     7. conflicts    (Sonnet 4.6; honors --dry-run)

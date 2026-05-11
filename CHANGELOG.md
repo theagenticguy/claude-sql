@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Fix
+
+- **cli**: use math.isnan for NaN detection in community quality log
+
+## v0.5.0 (2026-05-10)
+
+### BREAKING CHANGE
+
+- Settings field rename — every louvain_* config knob and
+CLAUDE_SQL_LOUVAIN_* env var is gone. Replace with leiden_* equivalents.
+Parquet schema gains is_medoid, coherence, gamma_used columns; removes
+nothing. New community_profile.parquet sidecar appears at
+~/.claude/community_profile.parquet on auto-γ runs.
+
+### Feat
+
+- **sql_views**: register community_profile view + thread parquet path
+- **cli**: agent-first community subcommand with --gamma, --resolution, --neighbors-of, --dry-run
+
+### Refactor
+
+- **communities**: replace Louvain with Leiden+CPM
+
 ## v0.4.0 (2026-05-09)
 
 ### Feat

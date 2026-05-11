@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql"
-version = "0.4.0"
+version = "0.5.0"
 description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -33,8 +33,9 @@ dependencies = [
     "cyclopts>=4.10.2",
     "duckdb>=1.5.2",
     "hdbscan>=0.8.40",
+    "igraph>=1.0.0,<2.0",
+    "leidenalg>=0.11.0,<0.12",
     "loguru>=0.7.3",
-    "networkx>=3.4",
     "numpy>=2.4.4",
     "packaging>=26.2",
     "polars>=1.40.0",
