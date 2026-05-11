@@ -1,22 +1,8 @@
 ## Unreleased
 
-### BREAKING CHANGE
+### Feat
 
-- **cli**: `--format markdown` is removed from the global `OutputFormat`
-  choices. Only `review-sheet` ever rendered markdown; the other commands
-  raised `ValueError` when called with `--format markdown`. `review-sheet`
-  now uses its own `RenderFormat` (markdown/json) — `--format auto` still
-  resolves to markdown on a TTY and JSON off-TTY for `review-sheet`. Pin
-  with `--format json` to force JSON. No callers of other commands break:
-  `--format markdown` against `query`/`schema`/etc. previously failed with
-  a runtime error and now fails at parse time with a cleaner message.
-
-### Fix
-
-- **cli**: visible flag-placement warning in `--help` covers `--quiet` /
-  `--verbose` explicitly so `claude-sql --quiet schema` (which fails with
-  `Unused Tokens: ['schema']`) is documented honestly.
-- **cli**: use math.isnan for NaN detection in community quality log
+- **cli**: drop --format markdown from public OutputFormat
 
 ## v0.5.0 (2026-05-10)
 
