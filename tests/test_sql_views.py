@@ -551,7 +551,10 @@ def test_explain_has_pushdown_markers(fixtures_dir: Path) -> None:
 
 def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
     con = _connect(fixtures_dir)
-    views = describe_all(con)
+    # describe_all is deprecated in favor of VIEW_SCHEMA; the test still
+    # exercises it as a behavioral regression for the v1 view set.
+    with pytest.warns(DeprecationWarning, match=r"describe_all is deprecated"):
+        views = describe_all(con)
     # v1 business views must always be present with at least one column.
     v1_views = {
         "sessions",
@@ -652,7 +655,8 @@ def test_view_schema_matches_describe_all(fixtures_dir: Path) -> None:
     parquet, not this dict.
     """
     con = _connect(fixtures_dir)
-    observed = describe_all(con)
+    with pytest.warns(DeprecationWarning, match=r"describe_all is deprecated"):
+        observed = describe_all(con)
     for view_name, expected_cols in VIEW_SCHEMA.items():
         observed_cols = tuple(observed.get(view_name, []))
         assert observed_cols == expected_cols, (

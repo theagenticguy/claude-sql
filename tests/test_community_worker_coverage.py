@@ -552,5 +552,10 @@ def connected_corpus(
     def _open(_settings: Any) -> duckdb.DuckDBPyConnection:
         return con
 
+    # PR 3 split the helper into ``_open_connection_full`` (the call site)
+    # and ``_open_connection_introspect``; the legacy alias stays for
+    # back-compat but the call sites this test exercises (cli.community)
+    # use the explicit ``_full`` name.
+    monkeypatch.setattr(cli, "_open_connection_full", _open)
     monkeypatch.setattr(cli, "_open_connection", _open)
     return con, settings, common

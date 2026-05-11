@@ -1006,16 +1006,60 @@ def _pricing_values_clause(pricing: dict[str, tuple[float, float]]) -> str:
     return ", ".join(rows)
 
 
-def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
-    """Execute a ``CREATE OR REPLACE MACRO`` DDL, downgrading failures to warnings.
+# Per-macro parquet dependencies: each analytics macro is only registered
+# when EVERY listed Settings ``*_parquet_path`` is populated on disk.
+# Encoding the invariant here -- in the registration code, not in a log
+# level on the failure path -- means a fresh install never flirts with
+# ``CREATE OR REPLACE MACRO`` against a missing view.  ``_safe_macro``
+# stays as defensive backstop for the rare gate-check / DDL-bind race.
+#
+# Drift catcher: ``test_register_macros_skips_friction_when_parquet_missing``
+# checks that fresh-install registration produces zero analytics-macro
+# entries in :func:`list_macros`.  When you add a new analytics macro,
+# update this dict alongside :data:`MACRO_NAMES` and :data:`MACRO_SIGNATURES`
+# (the existing drift tests catch those two).
+_ANALYTICS_MACRO_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "autonomy_trend": ("classifications_parquet_path",),
+    "work_mix": ("classifications_parquet_path",),
+    "success_rate_by_work": ("classifications_parquet_path",),
+    "cluster_top_terms": ("cluster_terms_parquet_path",),
+    "community_top_topics": (
+        "cluster_terms_parquet_path",
+        "communities_parquet_path",
+        "clusters_parquet_path",
+    ),
+    "sentiment_arc": ("trajectory_parquet_path",),
+    "friction_counts": ("user_friction_parquet_path",),
+    "friction_rate": ("user_friction_parquet_path",),
+    "friction_examples": ("user_friction_parquet_path",),
+    "unused_skills": ("skills_catalog_parquet_path",),
+}
 
-    Analytics macros reference views (``session_classifications``,
-    ``cluster_terms``, etc.) that only materialize once the corresponding
-    parquet has been produced.  Wrapping creation in ``try/except
-    duckdb.Error`` means a fresh install (pre-``claude-sql classify``) can
-    still call :func:`register_macros` without blowing up: the macro simply
-    doesn't get created and the caller gets a ``logger.warning`` pointing at
-    the missing backing view.
+
+def _analytics_macro_ready(settings: Settings, macro_name: str) -> bool:
+    """Return True when every parquet the macro binds against is populated.
+
+    Looked up from :data:`_ANALYTICS_MACRO_REQUIREMENTS`. Macros not in the
+    map (i.e. v1 always-on macros) return ``True`` -- they have no parquet
+    dependency.
+    """
+    fields = _ANALYTICS_MACRO_REQUIREMENTS.get(macro_name)
+    if not fields:
+        return True
+    return all(_parquet_is_populated(getattr(settings, field)) for field in fields)
+
+
+def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
+    """Execute a ``CREATE OR REPLACE MACRO`` DDL, swallowing bind failures.
+
+    Defense in depth -- the parquet gate inside :func:`register_macros`
+    (see :data:`_ANALYTICS_MACRO_REQUIREMENTS`) already prevents this code
+    path from firing in normal operation. ``_safe_macro`` only catches the
+    rare race where a parquet vanishes between gate-check and DDL-bind, or
+    a future macro adds a different failure mode. The duckdb.Error is
+    silently demoted to DEBUG so a routine read-only command never floods
+    stderr with WARNING lines about analytics work the user hasn't yet
+    asked for.
 
     Parameters
     ----------
@@ -1030,7 +1074,7 @@ def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
         con.execute(ddl)
         logger.debug("Registered analytics macro: {}", name)
     except duckdb.Error as exc:
-        logger.warning("Skipped macro {} (backing view missing): {}", name, exc)
+        logger.debug("Skipped macro {} (backing view missing): {}", name, exc)
 
 
 def register_macros(
@@ -1210,249 +1254,245 @@ def register_macros(
     )
 
     # ------------------------------------------------------------------
-    # v2 analytics macros -- each wrapped in _safe_macro so a missing
-    # backing view (pre-``claude-sql classify`` run) is a warning, not an
-    # exception.
+    # v2 analytics macros -- gated on parquet existence via
+    # :data:`_ANALYTICS_MACRO_REQUIREMENTS`.  When a backing parquet is
+    # missing, the macro DDL never runs, so a fresh install never
+    # accidentally binds against a non-existent view.  ``_safe_macro``
+    # remains the defensive backstop for the gate-check / DDL-bind race.
     # ------------------------------------------------------------------
 
-    # Time series: autonomy tier mix over rolling windows.
-    _safe_macro(
-        con,
-        "autonomy_trend",
-        """
-        CREATE OR REPLACE MACRO autonomy_trend(window_days) AS TABLE (
-            SELECT
-                date_trunc('week', classified_at) AS week,
-                autonomy_tier,
-                count(*) AS n
-            FROM session_classifications
-            WHERE classified_at >= current_timestamp - (window_days * INTERVAL 1 DAY)
-            GROUP BY 1, 2
-            ORDER BY 1, 2
-        );
-        """,
-    )
-
-    # Work-category mix in the last N days.
-    _safe_macro(
-        con,
-        "work_mix",
-        """
-        CREATE OR REPLACE MACRO work_mix(since_days) AS TABLE (
-            SELECT work_category, count(*) AS n
-            FROM session_classifications
-            WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
-            GROUP BY 1
-            ORDER BY n DESC
-        );
-        """,
-    )
-
-    # Success / failure / partial rate broken down by work category.
-    _safe_macro(
-        con,
-        "success_rate_by_work",
-        """
-        CREATE OR REPLACE MACRO success_rate_by_work(since_days) AS TABLE (
-            SELECT
-                work_category,
-                count(*) AS sessions,
-                count(*) FILTER (WHERE success = 'success')::DOUBLE
-                    / NULLIF(count(*), 0) AS success_rate,
-                count(*) FILTER (WHERE success = 'failure')::DOUBLE
-                    / NULLIF(count(*), 0) AS failure_rate,
-                count(*) FILTER (WHERE success = 'partial')::DOUBLE
-                    / NULLIF(count(*), 0) AS partial_rate
-            FROM session_classifications
-            WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
-            GROUP BY 1
-            ORDER BY sessions DESC
-        );
-        """,
-    )
-
-    # Top-N TF-IDF terms for a single cluster.
-    _safe_macro(
-        con,
-        "cluster_top_terms",
-        """
-        CREATE OR REPLACE MACRO cluster_top_terms(cid, n) AS TABLE (
-            SELECT term, weight, rank
-            FROM cluster_terms
-            WHERE cluster_id = cid
-            ORDER BY rank
-            LIMIT n
-        );
-        """,
-    )
-
-    # Top cluster_ids within a given community, ranked by the number of
-    # messages each cluster contributes to the community.  Each row carries
-    # its top 5 TF-IDF terms for human-readable context.
-    _safe_macro(
-        con,
-        "community_top_topics",
-        """
-        CREATE OR REPLACE MACRO community_top_topics(cid, n) AS TABLE (
-            WITH community_msgs AS (
-                SELECT CAST(m.uuid AS VARCHAR) AS uuid
+    settings_for_gate = settings if settings is not None else Settings()
+    analytics_macros: list[tuple[str, str]] = [
+        # Time series: autonomy tier mix over rolling windows.
+        (
+            "autonomy_trend",
+            """
+            CREATE OR REPLACE MACRO autonomy_trend(window_days) AS TABLE (
+                SELECT
+                    date_trunc('week', classified_at) AS week,
+                    autonomy_tier,
+                    count(*) AS n
+                FROM session_classifications
+                WHERE classified_at >= current_timestamp - (window_days * INTERVAL 1 DAY)
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            );
+            """,
+        ),
+        # Work-category mix in the last N days.
+        (
+            "work_mix",
+            """
+            CREATE OR REPLACE MACRO work_mix(since_days) AS TABLE (
+                SELECT work_category, count(*) AS n
+                FROM session_classifications
+                WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
+                GROUP BY 1
+                ORDER BY n DESC
+            );
+            """,
+        ),
+        # Success / failure / partial rate broken down by work category.
+        (
+            "success_rate_by_work",
+            """
+            CREATE OR REPLACE MACRO success_rate_by_work(since_days) AS TABLE (
+                SELECT
+                    work_category,
+                    count(*) AS sessions,
+                    count(*) FILTER (WHERE success = 'success')::DOUBLE
+                        / NULLIF(count(*), 0) AS success_rate,
+                    count(*) FILTER (WHERE success = 'failure')::DOUBLE
+                        / NULLIF(count(*), 0) AS failure_rate,
+                    count(*) FILTER (WHERE success = 'partial')::DOUBLE
+                        / NULLIF(count(*), 0) AS partial_rate
+                FROM session_classifications
+                WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
+                GROUP BY 1
+                ORDER BY sessions DESC
+            );
+            """,
+        ),
+        # Top-N TF-IDF terms for a single cluster.
+        (
+            "cluster_top_terms",
+            """
+            CREATE OR REPLACE MACRO cluster_top_terms(cid, n) AS TABLE (
+                SELECT term, weight, rank
+                FROM cluster_terms
+                WHERE cluster_id = cid
+                ORDER BY rank
+                LIMIT n
+            );
+            """,
+        ),
+        # Top cluster_ids within a given community, ranked by the number
+        # of messages each cluster contributes to the community.  Each
+        # row carries its top 5 TF-IDF terms for human-readable context.
+        (
+            "community_top_topics",
+            """
+            CREATE OR REPLACE MACRO community_top_topics(cid, n) AS TABLE (
+                WITH community_msgs AS (
+                    SELECT CAST(m.uuid AS VARCHAR) AS uuid
+                      FROM messages m
+                      JOIN session_communities sc
+                        ON CAST(m.session_id AS VARCHAR) = sc.session_id
+                     WHERE sc.community_id = cid
+                ),
+                cluster_counts AS (
+                    SELECT mc.cluster_id, count(*) AS n_msgs
+                      FROM message_clusters mc
+                      JOIN community_msgs cm USING (uuid)
+                     WHERE mc.cluster_id >= 0
+                     GROUP BY mc.cluster_id
+                )
+                SELECT cc.cluster_id, cc.n_msgs,
+                       (SELECT string_agg(term, ', ' ORDER BY rank)
+                          FROM cluster_terms ct
+                         WHERE ct.cluster_id = cc.cluster_id
+                           AND ct.rank <= 5) AS top_terms
+                  FROM cluster_counts cc
+                  ORDER BY n_msgs DESC
+                  LIMIT n
+            );
+            """,
+        ),
+        # Sentiment arc for a single session: per-message (ts, role,
+        # delta, transition flag, confidence) in chronological order.
+        (
+            "sentiment_arc",
+            """
+            CREATE OR REPLACE MACRO sentiment_arc(sid) AS TABLE (
+                SELECT m.ts, m.role, mt.sentiment_delta, mt.is_transition, mt.confidence
                   FROM messages m
-                  JOIN session_communities sc
-                    ON CAST(m.session_id AS VARCHAR) = sc.session_id
-                 WHERE sc.community_id = cid
-            ),
-            cluster_counts AS (
-                SELECT mc.cluster_id, count(*) AS n_msgs
-                  FROM message_clusters mc
-                  JOIN community_msgs cm USING (uuid)
-                 WHERE mc.cluster_id >= 0
-                 GROUP BY mc.cluster_id
-            )
-            SELECT cc.cluster_id, cc.n_msgs,
-                   (SELECT string_agg(term, ', ' ORDER BY rank)
-                      FROM cluster_terms ct
-                     WHERE ct.cluster_id = cc.cluster_id
-                       AND ct.rank <= 5) AS top_terms
-              FROM cluster_counts cc
-              ORDER BY n_msgs DESC
-              LIMIT n
-        );
-        """,
-    )
-
-    # Sentiment arc for a single session: per-message (ts, role, delta,
-    # transition flag, confidence) in chronological order.
-    _safe_macro(
-        con,
-        "sentiment_arc",
-        """
-        CREATE OR REPLACE MACRO sentiment_arc(sid) AS TABLE (
-            SELECT m.ts, m.role, mt.sentiment_delta, mt.is_transition, mt.confidence
-              FROM messages m
-              JOIN message_trajectory mt
-                ON CAST(m.uuid AS VARCHAR) = mt.uuid
-             WHERE CAST(m.session_id AS VARCHAR) = sid
-             ORDER BY m.ts
-        );
-        """,
-    )
-
-    # Counts per friction label, scoped to the last N days by message ``ts``
-    # (the user's actual utterance time, not detected_at).  Pass ``NULL`` to
-    # include the full corpus.  Excludes label='none' because that is the
-    # majority sentinel class and would swamp the output.
-    _safe_macro(
-        con,
-        "friction_counts",
-        """
-        CREATE OR REPLACE MACRO friction_counts(since_days) AS TABLE (
-            SELECT label,
-                   count(*)                       AS n,
-                   count(DISTINCT session_id)     AS sessions,
-                   avg(confidence)                AS avg_confidence,
-                   sum(CASE WHEN source='regex' THEN 1 ELSE 0 END) AS n_regex,
-                   sum(CASE WHEN source='llm'   THEN 1 ELSE 0 END) AS n_llm
-              FROM user_friction
-             WHERE label != 'none'
-               AND (since_days IS NULL
-                    OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
-             GROUP BY label
-             ORDER BY n DESC
-        );
-        """,
-    )
-
-    # Per-session friction pressure: how many non-'none' friction messages
-    # fired vs the total user message count.  A high rate is a strong proxy
-    # for a session where the agent repeatedly fell short of what the user
-    # expected.
-    _safe_macro(
-        con,
-        "friction_rate",
-        """
-        CREATE OR REPLACE MACRO friction_rate(since_days) AS TABLE (
-            WITH hits AS (
-                SELECT session_id,
-                       count(*) FILTER (WHERE label != 'none') AS n_friction,
-                       count(*) FILTER (WHERE label = 'status_ping')        AS n_status,
-                       count(*) FILTER (WHERE label = 'unmet_expectation')  AS n_unmet,
-                       count(*) FILTER (WHERE label = 'confusion')          AS n_confusion,
-                       count(*) FILTER (WHERE label = 'interruption')       AS n_interruption,
-                       count(*) FILTER (WHERE label = 'correction')         AS n_correction,
-                       count(*) FILTER (WHERE label = 'frustration')        AS n_frustration
+                  JOIN message_trajectory mt
+                    ON CAST(m.uuid AS VARCHAR) = mt.uuid
+                 WHERE CAST(m.session_id AS VARCHAR) = sid
+                 ORDER BY m.ts
+            );
+            """,
+        ),
+        # Counts per friction label, scoped to the last N days by message
+        # ``ts`` (the user's actual utterance time, not detected_at).
+        # Pass ``NULL`` to include the full corpus.  Excludes label='none'
+        # because that is the majority sentinel class and would swamp the
+        # output.
+        (
+            "friction_counts",
+            """
+            CREATE OR REPLACE MACRO friction_counts(since_days) AS TABLE (
+                SELECT label,
+                       count(*)                       AS n,
+                       count(DISTINCT session_id)     AS sessions,
+                       avg(confidence)                AS avg_confidence,
+                       sum(CASE WHEN source='regex' THEN 1 ELSE 0 END) AS n_regex,
+                       sum(CASE WHEN source='llm'   THEN 1 ELSE 0 END) AS n_llm
                   FROM user_friction
-                 WHERE since_days IS NULL
-                    OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY)
-                 GROUP BY session_id
-            ),
-            user_msgs AS (
-                SELECT CAST(mt.session_id AS VARCHAR) AS session_id,
-                       count(*) AS n_user_msgs
-                  FROM messages_text mt
-                 WHERE mt.role = 'user'
+                 WHERE label != 'none'
                    AND (since_days IS NULL
-                        OR mt.ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
-                 GROUP BY 1
+                        OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
+                 GROUP BY label
+                 ORDER BY n DESC
+            );
+            """,
+        ),
+        # Per-session friction pressure: how many non-'none' friction
+        # messages fired vs the total user message count.  A high rate is
+        # a strong proxy for a session where the agent repeatedly fell
+        # short of what the user expected.
+        (
+            "friction_rate",
+            """
+            CREATE OR REPLACE MACRO friction_rate(since_days) AS TABLE (
+                WITH hits AS (
+                    SELECT session_id,
+                           count(*) FILTER (WHERE label != 'none') AS n_friction,
+                           count(*) FILTER (WHERE label = 'status_ping')        AS n_status,
+                           count(*) FILTER (WHERE label = 'unmet_expectation')  AS n_unmet,
+                           count(*) FILTER (WHERE label = 'confusion')          AS n_confusion,
+                           count(*) FILTER (WHERE label = 'interruption')       AS n_interruption,
+                           count(*) FILTER (WHERE label = 'correction')         AS n_correction,
+                           count(*) FILTER (WHERE label = 'frustration')        AS n_frustration
+                      FROM user_friction
+                     WHERE since_days IS NULL
+                        OR ts >= current_timestamp - (since_days * INTERVAL 1 DAY)
+                     GROUP BY session_id
+                ),
+                user_msgs AS (
+                    SELECT CAST(mt.session_id AS VARCHAR) AS session_id,
+                           count(*) AS n_user_msgs
+                      FROM messages_text mt
+                     WHERE mt.role = 'user'
+                       AND (since_days IS NULL
+                            OR mt.ts >= current_timestamp - (since_days * INTERVAL 1 DAY))
+                     GROUP BY 1
+                )
+                SELECT h.session_id,
+                       h.n_friction,
+                       h.n_status, h.n_unmet, h.n_confusion,
+                       h.n_interruption, h.n_correction, h.n_frustration,
+                       COALESCE(um.n_user_msgs, 0)                              AS n_user_msgs,
+                       h.n_friction::DOUBLE / NULLIF(um.n_user_msgs, 0)         AS rate
+                  FROM hits h
+                  LEFT JOIN user_msgs um USING (session_id)
+                 WHERE h.n_friction > 0
+                 ORDER BY h.n_friction DESC
+            );
+            """,
+        ),
+        # Top-N example user messages for a given friction label, highest
+        # confidence first.  ``label_name`` is a VARCHAR so DuckDB
+        # callers don't have to quote-escape through the macro boundary.
+        (
+            "friction_examples",
+            """
+            CREATE OR REPLACE MACRO friction_examples(label_name, n) AS TABLE (
+                SELECT session_id, ts, text_snippet, rationale, source, confidence
+                  FROM user_friction
+                 WHERE label = label_name
+                 ORDER BY confidence DESC, ts DESC
+                 LIMIT n
+            );
+            """,
+        ),
+        # Catalog entries the user has NOT invoked in the last N days.
+        # Pure catalog lookup; ``skills_catalog`` may be missing pre-sync.
+        # ``source_kind`` filter keeps out the 'builtin' rows (users
+        # don't install or uninstall ``/clear``).
+        (
+            "unused_skills",
+            """
+            CREATE OR REPLACE MACRO unused_skills(last_n_days) AS TABLE (
+                SELECT cat.skill_id,
+                       cat.name,
+                       cat.plugin,
+                       cat.plugin_version,
+                       cat.source_kind,
+                       cat.description
+                  FROM skills_catalog cat
+                  LEFT JOIN (
+                      SELECT DISTINCT skill_id
+                        FROM skill_invocations
+                       WHERE ts >= current_timestamp - (last_n_days * INTERVAL 1 DAY)
+                  ) used USING (skill_id)
+                 WHERE used.skill_id IS NULL
+                   AND cat.source_kind IN ('user-skill', 'plugin-skill', 'plugin-command')
+                 ORDER BY cat.plugin NULLS FIRST, cat.name
+            );
+            """,
+        ),
+    ]
+
+    for macro_name, ddl in analytics_macros:
+        if not _analytics_macro_ready(settings_for_gate, macro_name):
+            logger.debug(
+                "Skipped analytics macro {} (parquet missing for {})",
+                macro_name,
+                _ANALYTICS_MACRO_REQUIREMENTS.get(macro_name, ()),
             )
-            SELECT h.session_id,
-                   h.n_friction,
-                   h.n_status, h.n_unmet, h.n_confusion,
-                   h.n_interruption, h.n_correction, h.n_frustration,
-                   COALESCE(um.n_user_msgs, 0)                              AS n_user_msgs,
-                   h.n_friction::DOUBLE / NULLIF(um.n_user_msgs, 0)         AS rate
-              FROM hits h
-              LEFT JOIN user_msgs um USING (session_id)
-             WHERE h.n_friction > 0
-             ORDER BY h.n_friction DESC
-        );
-        """,
-    )
-
-    # Top-N example user messages for a given friction label, highest
-    # confidence first.  ``label_name`` is a VARCHAR so DuckDB callers
-    # don't have to quote-escape through the macro boundary.
-    _safe_macro(
-        con,
-        "friction_examples",
-        """
-        CREATE OR REPLACE MACRO friction_examples(label_name, n) AS TABLE (
-            SELECT session_id, ts, text_snippet, rationale, source, confidence
-              FROM user_friction
-             WHERE label = label_name
-             ORDER BY confidence DESC, ts DESC
-             LIMIT n
-        );
-        """,
-    )
-
-    # Catalog entries the user has NOT invoked in the last N days.  Pure
-    # catalog lookup; ``skills_catalog`` may be missing pre-sync, so this
-    # is wrapped in ``_safe_macro`` and skipped cleanly in that case.
-    # ``source_kind`` filter keeps out the 'builtin' rows (users don't
-    # install or uninstall ``/clear``).
-    _safe_macro(
-        con,
-        "unused_skills",
-        """
-        CREATE OR REPLACE MACRO unused_skills(last_n_days) AS TABLE (
-            SELECT cat.skill_id,
-                   cat.name,
-                   cat.plugin,
-                   cat.plugin_version,
-                   cat.source_kind,
-                   cat.description
-              FROM skills_catalog cat
-              LEFT JOIN (
-                  SELECT DISTINCT skill_id
-                    FROM skill_invocations
-                   WHERE ts >= current_timestamp - (last_n_days * INTERVAL 1 DAY)
-              ) used USING (skill_id)
-             WHERE used.skill_id IS NULL
-               AND cat.source_kind IN ('user-skill', 'plugin-skill', 'plugin-command')
-             ORDER BY cat.plugin NULLS FIRST, cat.name
-        );
-        """,
-    )
+            continue
+        _safe_macro(con, macro_name, ddl)
 
 
 # ---------------------------------------------------------------------------
@@ -1953,6 +1993,15 @@ def register_all(
 def describe_all(con: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[str, str]]]:
     """Return the column schema of every business-level view.
 
+    .. deprecated::
+        Use :data:`VIEW_SCHEMA` for static introspection.  ``describe_all``
+        opens a DuckDB connection and runs ``DESCRIBE`` per view, which on
+        the live corpus takes ~14 s -- prohibitive for the agent-facing
+        ``schema`` command.  Kept for one release as a fallback and as the
+        ground truth used by the ``test_view_schema_matches_describe_all``
+        drift test; it will be removed once that test moves to a different
+        introspection path.
+
     Parameters
     ----------
     con
@@ -1965,6 +2014,14 @@ def describe_all(con: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[str, st
         describe (e.g. missing because ``register_views`` was not called) map
         to an empty list and emit a warning.
     """
+    import warnings
+
+    warnings.warn(
+        "describe_all is deprecated; use VIEW_SCHEMA for static "
+        "introspection. Will be removed in a future release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     out: dict[str, list[tuple[str, str]]] = {}
     for name in VIEW_NAMES:
         try:
