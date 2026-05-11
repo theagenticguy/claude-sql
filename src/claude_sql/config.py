@@ -312,7 +312,8 @@ class Settings(BaseSettings):
     tfidf_top_n_terms: int = 10
 
     # ------------------------------------------------------------------
-    # DuckDB engine tuning — applied as PRAGMAs in cli._open_connection.
+    # DuckDB engine tuning — applied as PRAGMAs in cli._open_connection_full
+    # and cli._open_connection_introspect.
     # ------------------------------------------------------------------
     #: Worker threads. Defaults to ``os.cpu_count()`` so DuckDB uses every
     #: core; agents and CI runners with limited parallelism can override.

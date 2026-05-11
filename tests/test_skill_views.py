@@ -16,6 +16,7 @@ import duckdb
 import polars as pl
 import pytest
 
+from claude_sql.config import Settings
 from claude_sql.sql_views import (
     register_analytics,
     register_macros,
@@ -385,7 +386,14 @@ def test_unused_skills_with_catalog(skills_fixture: Path) -> None:
     register_views(con)
     register_vss(con, embeddings_parquet=proj / "__none__.parquet")
     register_analytics(con, skills_catalog_parquet=catalog_path)
-    register_macros(con)
+    # ``register_macros`` reads :data:`Settings.skills_catalog_parquet_path`
+    # for the parquet gate -- without a Settings override it falls back to
+    # ~/.claude/skills_catalog.parquet which doesn't exist under pytest, so
+    # ``unused_skills`` would be skipped.
+    register_macros(
+        con,
+        settings=Settings(skills_catalog_parquet_path=catalog_path),
+    )
 
     rows = con.execute("SELECT skill_id FROM unused_skills(10000) ORDER BY skill_id").fetchall()
     assert rows == [("browser-automation",)]

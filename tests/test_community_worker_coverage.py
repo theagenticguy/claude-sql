@@ -299,7 +299,7 @@ def test_community_dry_run_emits_plan(
 ) -> None:
     """--dry-run emits a JSON plan and never calls run_communities."""
     _con, settings, common = connected_corpus
-    # Make _resolve_settings + _open_connection see our temp settings.
+    # Make _resolve_settings + _open_connection_full see our temp settings.
     monkeypatch.setattr(cli, "_resolve_settings", lambda c: settings)
     cli.community(
         force=False,
@@ -543,7 +543,7 @@ def connected_corpus(
     connected_settings_module: tuple[duckdb.DuckDBPyConnection, Settings],
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[duckdb.DuckDBPyConnection, Settings, Common]:
-    """Adds a Common dataclass + monkey-patches ``cli._open_connection`` to use the fixture's con."""
+    """Adds a Common dataclass + monkey-patches ``cli._open_connection_full`` to use the fixture's con."""
     con, settings = connected_settings_module
     common = Common(
         verbose=False, quiet=True, glob=None, subagent_glob=None, format=OutputFormat.JSON
@@ -552,5 +552,9 @@ def connected_corpus(
     def _open(_settings: Any) -> duckdb.DuckDBPyConnection:
         return con
 
-    monkeypatch.setattr(cli, "_open_connection", _open)
+    # cli.community calls ``_open_connection_full`` directly; the legacy
+    # ``_open_connection`` alias is no longer needed for tests now that
+    # PR 3 has split the helper into ``_open_connection_full`` and
+    # ``_open_connection_introspect``.
+    monkeypatch.setattr(cli, "_open_connection_full", _open)
     return con, settings, common

@@ -82,8 +82,11 @@ from claude_sql.parquet_shards import (
 from claude_sql.review_sheet_render import render_markdown, render_refusal_markdown
 from claude_sql.review_sheet_worker import generate_review_sheet
 from claude_sql.sql_views import (
-    describe_all,
-    list_macros,
+    MACRO_NAMES,
+    MACRO_SIGNATURES,
+    VIEW_NAMES,
+    VIEW_SCHEMA,
+    _parquet_is_populated,
     register_all,
     register_raw,
     register_views,
@@ -252,7 +255,25 @@ def _resolve_memory_limit(limit: str) -> str:
     return f"{target_mib}MiB"
 
 
-def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
+def _apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Set the tuning PRAGMAs both connection helpers share.
+
+    Centralized so :func:`_open_connection_full` and
+    :func:`_open_connection_introspect` stay in sync. Threads, memory_limit,
+    and temp_directory all come from ``settings``; the spill directory is
+    materialized on disk before DuckDB sees the path because DuckDB will
+    happily fail later when it tries to write a spill file.
+    """
+    settings.duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+    memory_limit = _resolve_memory_limit(settings.duckdb_memory_limit)
+    con.execute(f"SET threads = {int(settings.duckdb_threads)}")
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET temp_directory = '{settings.duckdb_temp_dir}'")
+    con.execute("SET enable_object_cache = true")
+    con.execute("SET preserve_insertion_order = false")
+
+
+def _open_connection_full(settings: Settings) -> duckdb.DuckDBPyConnection:
     """Open an in-memory DuckDB connection with every claude-sql object wired.
 
     Tuning PRAGMAs are set before view registration so the registration
@@ -261,15 +282,35 @@ def _open_connection(settings: Settings) -> duckdb.DuckDBPyConnection:
     4 GB tmpfs that thrashes once a clustering run starts spilling).
     """
     con = duckdb.connect(":memory:")
-    settings.duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
-    memory_limit = _resolve_memory_limit(settings.duckdb_memory_limit)
-    con.execute(f"SET threads = {int(settings.duckdb_threads)}")
-    con.execute(f"SET memory_limit = '{memory_limit}'")
-    con.execute(f"SET temp_directory = '{settings.duckdb_temp_dir}'")
-    con.execute("SET enable_object_cache = true")
-    con.execute("SET preserve_insertion_order = false")
+    _apply_duckdb_pragmas(con, settings)
     register_all(con, settings=settings)
     return con
+
+
+def _open_connection_introspect(settings: Settings) -> duckdb.DuckDBPyConnection:
+    """Bare DuckDB connection — PRAGMAs only, no view/macro registration.
+
+    For commands that don't need the catalog (``schema`` reads the static
+    :data:`VIEW_SCHEMA` dict; trivial scalar queries like ``SELECT 1`` or
+    ``SELECT current_timestamp`` don't reference any view). Returning a
+    bare connection avoids the ~25 s :func:`register_all` chain entirely.
+    """
+    con = duckdb.connect(":memory:")
+    _apply_duckdb_pragmas(con, settings)
+    return con
+
+
+def _sql_uses_catalog(sql: str) -> bool:
+    """Cheap pre-flight: does ``sql`` reference any registered view/macro?
+
+    Substring-matches against ``VIEW_NAMES + MACRO_NAMES`` (case-insensitive).
+    False positives (a string literal containing ``'sessions'``) just trigger
+    the slow path — no correctness regression. False negatives can't happen
+    if the user genuinely references a view: the name has to appear in the
+    SQL text.
+    """
+    lowered = sql.lower()
+    return any(name.lower() in lowered for name in (*VIEW_NAMES, *MACRO_NAMES))
 
 
 def _emit_worker_result(result: int | dict, common: Common | None, pipeline: str) -> None:
@@ -523,7 +564,11 @@ def query(
     _configure(common)
     settings = _resolve_settings(common)
     fmt = _fmt(common)
-    con = _open_connection(settings)
+    con = (
+        _open_connection_full(settings)
+        if _sql_uses_catalog(sql)
+        else _open_connection_introspect(settings)
+    )
     try:
         profile_path: Path | None = None
         if profile_json:
@@ -569,7 +614,11 @@ def explain(
     _configure(common)
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
-    con = _open_connection(settings)
+    con = (
+        _open_connection_full(settings)
+        if _sql_uses_catalog(sql)
+        else _open_connection_introspect(settings)
+    )
     try:
         profile_path: Path | None = None
         if profile_json:
@@ -593,9 +642,58 @@ def explain(
         con.close()
 
 
+def _compute_cached_map(settings: Settings) -> dict[str, bool]:
+    """Map analytics view + analytics macro names to parquet-existence.
+
+    A name appears in this map when its data lives in a parquet that may
+    or may not exist on disk (the v2 analytics surface). v1 views always
+    have data (the transcript globs are always present), so they don't
+    appear here. Use ``list-cache`` for byte counts / mtimes / row counts.
+    """
+    # Analytics view → backing parquet path on Settings.
+    view_paths: dict[str, Path] = {
+        "session_classifications": settings.classifications_parquet_path,
+        "session_goals": settings.classifications_parquet_path,
+        "message_trajectory": settings.trajectory_parquet_path,
+        "session_conflicts": settings.conflicts_parquet_path,
+        "message_clusters": settings.clusters_parquet_path,
+        "cluster_terms": settings.cluster_terms_parquet_path,
+        "session_communities": settings.communities_parquet_path,
+        "community_profile": settings.community_profile_parquet_path,
+        "user_friction": settings.user_friction_parquet_path,
+        "skills_catalog": settings.skills_catalog_parquet_path,
+        "skill_usage": settings.skills_catalog_parquet_path,
+    }
+    cached: dict[str, bool] = {
+        name: _parquet_is_populated(path) for name, path in view_paths.items()
+    }
+    # Analytics macros depend on the same parquets as their backing views;
+    # surface them too so an agent asking "is friction_rate ready?" gets a
+    # direct yes/no without re-deriving the dependency.
+    macro_paths: dict[str, tuple[Path, ...]] = {
+        "autonomy_trend": (settings.classifications_parquet_path,),
+        "work_mix": (settings.classifications_parquet_path,),
+        "success_rate_by_work": (settings.classifications_parquet_path,),
+        "cluster_top_terms": (settings.cluster_terms_parquet_path,),
+        "community_top_topics": (
+            settings.cluster_terms_parquet_path,
+            settings.communities_parquet_path,
+            settings.clusters_parquet_path,
+        ),
+        "sentiment_arc": (settings.trajectory_parquet_path,),
+        "friction_counts": (settings.user_friction_parquet_path,),
+        "friction_rate": (settings.user_friction_parquet_path,),
+        "friction_examples": (settings.user_friction_parquet_path,),
+        "unused_skills": (settings.skills_catalog_parquet_path,),
+    }
+    for macro_name, paths in macro_paths.items():
+        cached[macro_name] = all(_parquet_is_populated(p) for p in paths)
+    return cached
+
+
 @app.command
 def schema(*, common: Common | None = None) -> None:
-    """List every registered view (with columns) and every macro in one pass.
+    """List every registered view (with columns) and every macro signature.
 
     When to use
     -----------
@@ -603,6 +701,15 @@ def schema(*, common: Common | None = None) -> None:
     catalog. Use it to discover column names before composing ``query``
     calls -- e.g., ``session_classifications`` uses both ``autonomy_tier``
     (canonical) and ``autonomy`` (alias), and the schema lists both.
+
+    Implementation
+    --------------
+    Reads the static :data:`VIEW_SCHEMA` and :data:`MACRO_SIGNATURES`
+    dicts -- no DuckDB connection, no JSON schema inference, no view
+    registration. Sub-50ms even on large corpora. The ``cached`` map is
+    keyed by analytics view + analytics macro names so an agent can tell
+    which parquet-backed entries are populated; use ``list-cache`` for
+    byte counts and mtimes.
 
     Output shape (non-TTY / JSON)
     -----------------------------
@@ -612,42 +719,39 @@ def schema(*, common: Common | None = None) -> None:
           "views": {
             "sessions": [{"column": "session_id", "type": "VARCHAR"}, ...],
             "messages": [...],
-            "session_classifications": [...],   // only if parquet exists
             ...
           },
-          "macros": ["autonomy_trend", "conflict_rate", ...]
+          "macros": [{"name": "ago", "params": ["interval_text"]}, ...],
+          "cached": {"user_friction": false, "friction_rate": false, ...}
         }
 
-    Missing analytics parquets are silently omitted (register_analytics
-    skips them). Use ``list-cache`` to see which generators still need to
-    run.
+    Only v1 (transcript-derived) views appear under ``views`` -- v2
+    analytics views are parquet-backed; their schema source-of-truth is
+    the parquet metadata. Use ``cached`` to see which v2 views can be
+    queried right now.
     """
     _configure(common)
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
-    con = _open_connection(settings)
-    try:
-        views = describe_all(con)
-        macros = list_macros(con)
-        if fmt is OutputFormat.TABLE:
-            for name, cols in views.items():
-                print(f"\n\033[1m{name}\033[0m ({len(cols)} cols)")
-                for col, col_type in cols:
-                    print(f"  {col:<28} {col_type}")
-            print(f"\n\033[1mMacros\033[0m ({len(macros)})")
-            for name, params in macros:
-                print(f"  {name}({', '.join(params)})")
-        else:
-            payload = {
-                "views": {
-                    name: [{"column": c, "type": t} for c, t in cols]
-                    for name, cols in views.items()
-                },
-                "macros": [{"name": n, "params": list(p)} for n, p in macros],
-            }
-            emit_json(payload, fmt)
-    finally:
-        con.close()
+    cached = _compute_cached_map(settings)
+    payload = {
+        "views": {
+            name: [{"column": c, "type": t} for c, t in cols] for name, cols in VIEW_SCHEMA.items()
+        },
+        "macros": [{"name": n, "params": list(p)} for n, p in MACRO_SIGNATURES.items()],
+        "cached": cached,
+    }
+    if fmt is OutputFormat.TABLE:
+        for name, cols in VIEW_SCHEMA.items():
+            print(f"\n\033[1m{name}\033[0m ({len(cols)} cols)")
+            for col, col_type in cols:
+                print(f"  {col:<28} {col_type}")
+        print(f"\n\033[1mMacros\033[0m ({len(MACRO_SIGNATURES)})")
+        for n, params in MACRO_SIGNATURES.items():
+            tag = "" if cached.get(n, True) else "  [cache empty]"
+            print(f"  {n}({', '.join(params)}){tag}")
+        return
+    emit_json(payload, fmt)
 
 
 @app.command(name="list-cache")
@@ -1181,7 +1285,7 @@ def search(
     _configure(common)
     settings = _resolve_settings(common)
     fmt = _fmt(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         row = con.execute("SELECT count(*) FROM message_embeddings").fetchone()
         count = int(row[0]) if row else 0
@@ -1271,7 +1375,7 @@ def classify(
     """
     _configure(common)
     settings = _resolve_settings(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         result = classify_sessions(
             con,
@@ -1319,7 +1423,7 @@ def trajectory(
     """
     _configure(common)
     settings = _resolve_settings(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         result = trajectory_messages(
             con,
@@ -1363,7 +1467,7 @@ def conflicts(
     """
     _configure(common)
     settings = _resolve_settings(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         result = detect_conflicts(
             con,
@@ -1413,7 +1517,7 @@ def friction(
     """
     _configure(common)
     settings = _resolve_settings(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         result = detect_user_friction(
             con,
@@ -1480,7 +1584,7 @@ def terms(*, force: bool = False, common: Common | None = None) -> None:
     """
     _configure(common)
     settings = _resolve_settings(common)
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         tstats = run_terms(con, settings, force=force)
         logger.info(
@@ -1568,7 +1672,7 @@ def community(
         emit_error(err, fmt)
         sys.exit(err.exit_code)
 
-    con = _open_connection(settings)
+    con = _open_connection_full(settings)
     try:
         if neighbors_of_session is not None:
             df = neighbors_of(con, settings, neighbors_of_session, top_k=top_k)
@@ -1712,7 +1816,7 @@ def analyze(
 
     # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
     if not skip_embed:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             n = asyncio.run(
                 run_backfill(
@@ -1736,7 +1840,7 @@ def analyze(
             stats["clusters"],
             stats["noise"],
         )
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             tstats = run_terms(con, settings, force=force_cluster)
             logger.info(
@@ -1749,7 +1853,7 @@ def analyze(
 
     # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
     if not skip_community:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             cstats = run_communities(con, settings, force=force_community)
             logger.info(
@@ -1762,7 +1866,7 @@ def analyze(
 
     # 4. Session classification (LLM).
     if not skip_classify:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             n = classify_sessions(
                 con,
@@ -1778,7 +1882,7 @@ def analyze(
 
     # 5. Trajectory (LLM).
     if not skip_trajectory:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             n = trajectory_messages(
                 con,
@@ -1794,7 +1898,7 @@ def analyze(
 
     # 6. Conflicts (LLM, requires full session context).
     if not skip_conflicts:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             n = detect_conflicts(
                 con,
@@ -1810,7 +1914,7 @@ def analyze(
 
     # 7. Friction (LLM, short-message scope).
     if not skip_friction:
-        con = _open_connection(settings)
+        con = _open_connection_full(settings)
         try:
             n = detect_user_friction(
                 con,
