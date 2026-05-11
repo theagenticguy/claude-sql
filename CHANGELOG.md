@@ -2,7 +2,8 @@
 
 ### Feat
 
-- **cli**: drop --format markdown from public OutputFormat
+- **sql_views**: static catalog + ago() macro
+- **cli**: drop --format markdown from public OutputFormat (#29)
 
 ## v0.5.0 (2026-05-10)
 
