@@ -2,7 +2,8 @@
 
 ### Feat
 
-- **sql_views**: static catalog + ago() macro
+- **perf**: two-tier connections + parquet-gated macros + static schema
+- **sql_views**: static catalog + ago() macro (#30)
 - **cli**: drop --format markdown from public OutputFormat (#29)
 
 ## v0.5.0 (2026-05-10)
