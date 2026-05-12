@@ -92,6 +92,7 @@ from claude_sql.sql_views import (
     register_all,
     register_raw,
     register_views,
+    register_vss,
 )
 from claude_sql.terms_worker import run_terms
 
@@ -331,6 +332,51 @@ def _refresh_analytics_views(con: duckdb.DuckDBPyConnection, settings: Settings)
     from claude_sql.sql_views import register_analytics
 
     register_analytics(con, settings=settings)
+
+
+def _rebind_vss(con: duckdb.DuckDBPyConnection, settings: Settings, *, stage: str) -> None:
+    """Re-bind ``message_embeddings`` against the (possibly mutated) Lance namespace.
+
+    The ``analyze`` chain shares one DuckDB connection across stages (T1.3).
+    ``register_vss`` runs once at connection-open time and binds
+    ``message_embeddings`` against whatever Lance namespace state exists then.
+    After ``embed`` populates LanceDB the previously-bound view still points at
+    the empty namespace -- subsequent stages (``community`` is the load-bearing
+    one) read 0 rows. RFC §9.6 names this as the analyze stale-connection bug.
+
+    Calling :func:`register_vss` again issues a ``CREATE OR REPLACE VIEW``
+    against the live Lance dataset, which is the cheap fix.
+
+    Drops any prior ``message_embeddings`` object first so the second bind is
+    free to switch type. The first :func:`register_vss` call against an empty
+    Lance namespace creates a fallback **table**; the second call (after embed
+    populates Lance) wants to bind a **view** -- DuckDB rejects
+    ``CREATE OR REPLACE VIEW`` over an existing table of the same name, so we
+    drop both shapes proactively. ``DETACH lance_store`` clears any prior
+    ``ATTACH`` so :func:`register_vss` can reissue it without an alias clash.
+    """
+    # Drop whichever shape (TABLE or VIEW) the prior register_vss created.
+    # DuckDB's ``DROP VIEW IF EXISTS`` still errors if the existing object is a
+    # Table (and vice versa) -- ``IF EXISTS`` only suppresses the not-found
+    # error, not the type-mismatch error. Try VIEW first; on type mismatch fall
+    # through to dropping the TABLE shape.
+    try:
+        con.execute("DROP VIEW IF EXISTS message_embeddings;")
+    except duckdb.Error:
+        # Existing object is a TABLE, not a VIEW -- drop it as TABLE.
+        con.execute("DROP TABLE IF EXISTS message_embeddings;")
+    # No prior ATTACH on this connection (first rebind, or skip_vss path) -->
+    # DETACH against a missing alias raises; nothing to clean up.
+    with contextlib.suppress(duckdb.Error):
+        con.execute("DETACH lance_store;")
+    register_vss(
+        con,
+        embeddings_parquet=settings.embeddings_parquet_path,
+        lance_uri=settings.lance_uri,
+        dim=int(settings.output_dimension),
+        metric=settings.hnsw_metric,
+    )
+    logger.debug("register_vss re-bind after {}", stage)
 
 
 # Tokens that imply a SQL statement needs the VSS extension and the
@@ -1953,8 +1999,12 @@ def analyze(
                 )
             )
             logger.info("analyze/embed: {} new embeddings (dry_run={})", n, dry_run)
-            # New embeddings/part-*.parquet shards may have landed; re-bind
-            # the analytics views so cluster/terms/community see them.
+            # New embeddings landed in the Lance namespace; the
+            # ``message_embeddings`` view was bound at connection-open against
+            # the (possibly empty) prior state and is now stale. Re-bind VSS
+            # FIRST so subsequent stages see the fresh vectors, then refresh
+            # analytics so the parquet-existence gates re-evaluate (RFC §9.6).
+            _rebind_vss(con, settings, stage="embed")
             _refresh_analytics_views(con, settings)
 
         # 2. Cluster (reads embeddings parquet, writes clusters.parquet).  Non-LLM.
@@ -1977,7 +2027,14 @@ def analyze(
             )
 
         # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
+        # RFC §9.6: this is THE explicitly-named bug location -- community
+        # reads message_embeddings (via the session-centroid build) and would
+        # see an empty view if embed populated Lance after connection-open
+        # without an intervening rebind. Re-bind VSS + refresh analytics so
+        # both the Lance dataset and the cluster_terms parquet land cleanly.
         if not skip_community:
+            _rebind_vss(con, settings, stage="cluster_terms")
+            _refresh_analytics_views(con, settings)
             cstats = run_communities(con, settings, force=force_community)
             logger.info(
                 "analyze/community: {} sessions, {} communities",
@@ -1996,6 +2053,9 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/classify: {} sessions (dry_run={})", n, dry_run)
+            # Refresh so any subsequent dashboard query in the same session
+            # sees the fresh classifications parquet shard.
+            _refresh_analytics_views(con, settings)
 
         # 5. Trajectory (LLM).
         if not skip_trajectory:
@@ -2008,6 +2068,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/trajectory: {} messages (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
 
         # 6. Conflicts (LLM, requires full session context).
         if not skip_conflicts:
@@ -2020,6 +2081,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/conflicts: {} sessions (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
 
         # 7. Friction (LLM, short-message scope).
         if not skip_friction:
@@ -2032,6 +2094,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/friction: {} rows (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
     finally:
         con.close()
 
