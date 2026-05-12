@@ -64,6 +64,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "messages",
     "content_blocks",
     "messages_text",
+    "turn_window",
     "tool_calls",
     "tool_results",
     "todo_events",
@@ -129,6 +130,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("ts", "TIMESTAMP"),
         ("type", "VARCHAR"),
         ("is_sidechain", "BOOLEAN"),
+        ("is_compact_summary", "BOOLEAN"),
         ("role", "VARCHAR"),
         ("model", "VARCHAR"),
         ("stop_reason", "VARCHAR"),
@@ -144,6 +146,8 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("message_uuid", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
+        ("message_type", "VARCHAR"),
+        ("is_compact_summary", "BOOLEAN"),
         ("block_type", "VARCHAR"),
         ("text", "VARCHAR"),
         ("tool_use_id_field", "VARCHAR"),
@@ -158,7 +162,19 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
+        ("is_compact_summary", "BOOLEAN"),
         ("text_content", "VARCHAR"),
+    ),
+    "turn_window": (
+        ("session_id", "VARCHAR"),
+        ("prev_uuid", "VARCHAR"),
+        ("prev_role", "VARCHAR"),
+        ("prev_ts", "TIMESTAMP"),
+        ("curr_uuid", "VARCHAR"),
+        ("curr_role", "VARCHAR"),
+        ("curr_ts", "TIMESTAMP"),
+        ("gap_ms", "BIGINT"),
+        ("window_idx", "BIGINT"),
     ),
     "tool_calls": (
         ("message_uuid", "VARCHAR"),
@@ -431,6 +447,7 @@ _RAW_EVENT_COLUMNS: dict[str, str] = {
     "type": "VARCHAR",
     "timestamp": "TIMESTAMP",
     "isSidechain": "BOOLEAN",
+    "isCompactSummary": "BOOLEAN",
     "cwd": "VARCHAR",
     "gitBranch": "VARCHAR",
     "message": _MESSAGE_STRUCT_TYPE,
@@ -656,6 +673,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 timestamp::TIMESTAMP                      AS ts,
                 type,
                 isSidechain                               AS is_sidechain,
+                coalesce(isCompactSummary, false)         AS is_compact_summary,
                 message.role                              AS role,
                 message.model                             AS model,
                 message.stop_reason                       AS stop_reason,
@@ -679,6 +697,8 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 m.uuid                                      AS message_uuid,
                 m.ts,
                 m.role,
+                m.type                                      AS message_type,
+                m.is_compact_summary,
                 json_extract_string(block, '$.type')        AS block_type,
                 json_extract_string(block, '$.text')        AS text,
                 json_extract_string(block, '$.id')          AS tool_use_id_field,
@@ -706,16 +726,47 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 any_value(cb.session_id) AS session_id,
                 any_value(cb.ts)         AS ts,
                 any_value(cb.role)       AS role,
+                any_value(cb.is_compact_summary) AS is_compact_summary,
                 string_agg(cb.text, '\n\n')  AS text_content
             FROM content_blocks cb
             WHERE cb.block_type = 'text'
               AND cb.text IS NOT NULL
               AND length(cb.text) > 0
+              AND cb.message_type != 'attachment'
             GROUP BY cb.message_uuid
             HAVING length(string_agg(cb.text, '\n\n')) >= 32;
             """
         )
         logger.debug("Registered view: messages_text")
+
+        # Adjacent-turn window over ``messages_text`` per session, ordered by
+        # (ts, uuid) for stable tie-break.  Compact-summary rows are excluded
+        # so the LAG() previous-turn pointer never lands on a synthetic
+        # checkpoint row injected by Claude Code's own context-compaction
+        # path.  ``gap_ms`` is the millisecond delta between turn timestamps,
+        # NULL on the first row of each session (LAG() yields NULL there).
+        # Used by v1.0 friction / trajectory pipelines that need adjacent
+        # (prev, curr) pairs without re-deriving the LAG window in every
+        # caller.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW turn_window AS
+            SELECT
+                session_id,
+                LAG(uuid) OVER w  AS prev_uuid,
+                LAG(role) OVER w  AS prev_role,
+                LAG(ts)   OVER w  AS prev_ts,
+                uuid              AS curr_uuid,
+                role              AS curr_role,
+                ts                AS curr_ts,
+                date_diff('millisecond', LAG(ts) OVER w, ts) AS gap_ms,
+                row_number() OVER w AS window_idx
+            FROM messages_text
+            WHERE is_compact_summary = false
+            WINDOW w AS (PARTITION BY session_id ORDER BY ts, uuid);
+            """
+        )
+        logger.debug("Registered view: turn_window")
 
         con.execute(
             """
