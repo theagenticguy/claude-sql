@@ -78,7 +78,7 @@ def test_connect_handles_concurrent_writers(tmp_path: Path) -> None:
     transparently — both writers complete without raising.
     """
     db = tmp_path / "state.db"
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def writer(pipeline: str, n: int) -> None:
         try:
@@ -88,7 +88,7 @@ def test_connect_handles_concurrent_writers(tmp_path: Path) -> None:
                     pipeline=pipeline,
                     rows=[(f"sess-{pipeline}-{i}", datetime.now(UTC), datetime.now(UTC))],
                 )
-        except BaseException as exc:  # noqa: BLE001 — capture for assertion below
+        except Exception as exc:  # noqa: BLE001 — capture worker-thread failures for the main thread to assert on; KeyboardInterrupt/SystemExit must still propagate
             errors.append(exc)
 
     t1 = threading.Thread(target=writer, args=("classify", 20))
@@ -163,13 +163,13 @@ def test_concurrent_readers_under_writer(tmp_path: Path) -> None:
         rows=[("seed", datetime.now(UTC), datetime.now(UTC))],
     )
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def reader() -> None:
         try:
             checkpointer.load_as_map(db, "classify")
             checkpointer.count_rows(db)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — capture worker-thread failures; KeyboardInterrupt/SystemExit must still propagate
             errors.append(exc)
 
     def writer() -> None:
@@ -180,7 +180,7 @@ def test_concurrent_readers_under_writer(tmp_path: Path) -> None:
                     pipeline="classify",
                     rows=[(f"w-{i}", datetime.now(UTC), datetime.now(UTC))],
                 )
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — capture worker-thread failures; KeyboardInterrupt/SystemExit must still propagate
             errors.append(exc)
 
     threads = [threading.Thread(target=reader) for _ in range(8)]

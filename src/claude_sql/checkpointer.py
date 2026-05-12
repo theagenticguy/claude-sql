@@ -231,29 +231,26 @@ def _connect(path: Path, *, max_attempts: int = 20) -> sqlite3.Connection:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     _migrate_from_duckdb_if_present(path)
-    # Connect in autocommit (isolation_level=None) so PRAGMAs run outside a
-    # transaction (``PRAGMA journal_mode=WAL`` can't be set from within one)
-    # and so concurrent writers serialize through ``busy_timeout`` rather
-    # than tripping Python's implicit-transaction wrapping. Each `execute`
-    # is then its own atomic statement; ``executemany`` is wrapped in an
-    # implicit BEGIN/COMMIT by SQLite. WAL guarantees readers never block.
-    # Open in autocommit for PRAGMA setup (WAL can't be set inside a
-    # transaction), then switch to deferred mode so subsequent writes wrap
-    # in implicit BEGIN/COMMIT and respect ``timeout=`` when waiting on the
-    # writer lock.
+    # Connect in autocommit (isolation_level=None) so the per-connection
+    # ``busy_timeout`` PRAGMA runs outside a transaction. Switch to deferred
+    # mode at the end so writes wrap in implicit BEGIN/COMMIT.
     con = sqlite3.connect(str(path), isolation_level=None, timeout=30.0)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
+    # Per-connection PRAGMAs (must run every open).
     con.execute("PRAGMA busy_timeout=10000")
     con.execute("PRAGMA foreign_keys=ON")
-    # Bootstrap schema only once per process per path — running the DDL on
-    # every open serializes concurrent writers on the writer lock even with
-    # ``CREATE TABLE IF NOT EXISTS``, which is the contention pattern that
-    # made this whole module move off DuckDB. Cached set keeps the hot path
-    # single-statement.
+    # File-level setup runs exactly once per (process, path) under a lock.
+    # ``PRAGMA journal_mode=WAL`` and ``synchronous=NORMAL`` persist in the
+    # DB header; running them on every open races concurrent cold-start
+    # writers (the WAL transition acquires the writer lock and the loser
+    # raises ``OperationalError: database is locked``). ``CREATE TABLE IF
+    # NOT EXISTS`` has the same race even though it is conceptually
+    # idempotent — the DDL still grabs the writer lock under contention.
+    # Caching the bootstrap behind ``_SCHEMA_BOOTSTRAPPED`` removes both.
     key = str(path.resolve())
     with _SCHEMA_BOOTSTRAP_LOCK:
         if key not in _SCHEMA_BOOTSTRAPPED:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
             con.execute(_CREATE_TABLES_SQL)
             _SCHEMA_BOOTSTRAPPED.add(key)
     con.isolation_level = (
