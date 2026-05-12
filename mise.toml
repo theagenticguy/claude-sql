@@ -86,10 +86,6 @@ run = "uv run cz bump"
 description = "Preview what `cz bump` would do without changing anything"
 run = "uv run cz bump --dry-run"
 
-[tasks.changelog]
-description = "Regenerate CHANGELOG.md from commit history"
-run = "uv run cz changelog"
-
 # ---------------------------------------------------------------------------
 # Quality gates (run in parallel inside `mise run check`)
 # `sources = [...]` makes each task skip when the source tree hasn't moved
