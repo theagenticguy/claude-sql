@@ -891,9 +891,20 @@ You analyze a complete Claude Code coding session for STANCE CONFLICTS —
 moments where the user and the agent (or the agent's own reasoning) hold
 mutually-exclusive positions on the same substantive question.
 
-Emit exactly one JSON object with a conflicts array. Each conflict has
-three fields: stance_a, stance_b (one-sentence summaries) and resolution
-(resolved / unresolved / abandoned). An empty list is valid and common.
+Emit exactly one JSON object with a conflicts array. Each entry has SEVEN
+fields:
+- turn_a_uuid (string) — UUID of one of the turns whose stance clashes,
+  copied verbatim from the ``[uuid=...]`` headers in the bound transcript.
+- turn_b_uuid (string) — UUID of the opposing turn. Must differ from
+  turn_a_uuid. Same verbatim-copy rule.
+- conflict_kind (enum: disagreement | correction | reversal | impasse).
+- severity (enum: low | medium | high).
+- agent_position (one-sentence summary in the agent's own framing).
+- user_position (one-sentence summary in the user's own framing).
+- confidence (0.0-1.0).
+
+An empty conflicts array is valid and common — sessions with no
+conflicts produce zero rows downstream.
 
 Output JSON only. No surrounding prose, no markdown fences.
 </instructions>
@@ -910,26 +921,43 @@ What counts as a conflict:
   "split into three". "Fix it on this branch" vs "open a follow-up".
 - The conflict must be SUBSTANTIVE — measurable consequences, not style.
 
-Resolution semantics:
+conflict_kind semantics:
 
-- resolved: the session converged on one stance with explicit agreement.
-  Look for "ok let's do that", "you're right", "going with X".
-- unresolved: both stances were still live at session end. User punted,
-  agent didn't pick, or session ran out of time.
-- abandoned: topic was dropped without a decision. Different from
-  unresolved — abandoned means the conversation moved on, not that they
-  failed to decide.
+- disagreement: two parties hold opposing positions and discuss them
+  without one explicitly telling the other they're wrong. The
+  prototypical "stance A vs stance B" debate.
+- correction: one party explicitly tells the other their answer or
+  action was wrong ("no, not that, do X instead", "that's not what I
+  asked for"). Different from disagreement: the corrector treats the
+  other's stance as a mistake to be overwritten, not a position to
+  argue against.
+- reversal: the SAME party flips their own earlier position ("actually
+  let's NOT do X", "scratch that, going the other way"). Both turns
+  are spoken by the same role.
+- impasse: both sides restate their positions across multiple exchanges
+  without converging, and the topic stalls. Distinct from "unresolved":
+  impasse implies repeated re-statement, not just running out of time.
+
+severity semantics:
+
+- low: a minor course nudge with little downstream impact.
+- medium: changes the implementation approach or scope but stays inside
+  the original goal.
+- high: blocks progress, reverses a major decision, or fundamentally
+  changes the goal.
 
 Identification heuristics:
 
-1. Strongest signal is structural: stance A proposed, counter-stance B
-   raised explicitly, then a decision made (or not). Without an explicit
-   counter-stance, you don't have a conflict.
+1. Strongest signal is structural: stance A proposed at one turn,
+   counter-stance B held at another turn. Without two distinct turns
+   holding opposing positions, you don't have a conflict.
 2. Verbal markers: "but I think", "actually I'd argue", "I disagree",
-   "the other side of that is", "alternatively", "or we could".
+   "the other side of that is", "alternatively", "no, not that".
 3. Skip agent's internal monologue ("on one hand X, on the other Y") when
    the agent immediately picks one — that's deliberation. Only count when
-   the user (or another party) holds the other stance.
+   two distinct turns hold the opposing stances.
+4. Pull turn_a_uuid / turn_b_uuid from the literal ``[uuid=...]`` headers
+   in the transcript — never invent or paraphrase.
 </context>
 
 <calibration>
@@ -945,13 +973,15 @@ double-check your output if you're emitting that many.
 
 <examples>
 <example>
-<input>User wants to optimize a slow query. Agent proposes denormalizing
-the table. User counters: "no, let's add a covering index instead — I
-don't want to touch the schema". Agent accepts the index approach and
-ships it.</input>
-<output>conflicts=[{stance_a: "Denormalize the table to make the query
-faster.", stance_b: "Keep the schema; add a covering index instead.",
-resolution: "resolved"}]</output>
+<input>User wants to optimize a slow query. At [uuid=t1] agent proposes
+"denormalize the table". At [uuid=t2] user counters: "no, let's add a
+covering index instead — I don't want to touch the schema". Agent
+accepts the index approach.</input>
+<output>conflicts=[{turn_a_uuid: "t1", turn_b_uuid: "t2",
+conflict_kind: "correction", severity: "medium",
+agent_position: "Denormalize the table to make the query faster.",
+user_position: "Keep the schema; add a covering index instead.",
+confidence: 0.9}]</output>
 </example>
 <example>
 <input>User proposes a 3-step plan. Agent says "I think step 2 is risky
@@ -961,31 +991,54 @@ becomes 4 steps. Both proceed.</input>
 counter-stance held.</output>
 </example>
 <example>
-<input>Agent's reasoning shows "I could use approach A or approach B,
-but A is simpler so I'll go with A". User says "ok".</input>
-<output>conflicts=[]. Agent considered alternatives in its own
-thinking. User didn't hold a counter-stance.</output>
+<input>At [uuid=u1] user leans toward "ship simple version now". At
+[uuid=a1] agent leans toward "wait for architectural cleanup". They
+go back and forth multiple times without converging; session ends
+with user saying "let me think about it".</input>
+<output>conflicts=[{turn_a_uuid: "u1", turn_b_uuid: "a1",
+conflict_kind: "impasse", severity: "high",
+agent_position: "Wait for the architectural cleanup so we don't ship debt.",
+user_position: "Ship the simple version now to unblock users.",
+confidence: 0.85}]</output>
 </example>
 <example>
-<input>User says "wait, isn't that going to break X?" Agent explains
-why not. User: "oh you're right, never mind."</input>
-<output>conflicts=[]. Question surfaced, answered, retracted. No
-sustained position.</output>
+<input>At [uuid=u3] user says "let's go with GitHub Actions". At
+[uuid=u9] same user later says "actually scratch that, stick with
+CodeBuild — Actions doesn't have the IAM role we need".</input>
+<output>conflicts=[{turn_a_uuid: "u3", turn_b_uuid: "u9",
+conflict_kind: "reversal", severity: "medium",
+agent_position: "Switch to GitHub Actions.",
+user_position: "Stick with CodeBuild for the IAM role.",
+confidence: 0.9}]</output>
 </example>
 <example>
-<input>User leans toward "ship simple version now", agent leans toward
-"wait for architectural cleanup". Session ends without a decision; user
-says "let me think about it".</input>
-<output>conflicts=[{stance_a: "Ship the simple version now to unblock
-users.", stance_b: "Wait for the architectural cleanup so we don't ship
-debt.", resolution: "unresolved"}]</output>
+<input>At [uuid=a4] agent says "I'll use cosine similarity for the
+nearest-neighbor lookup". At [uuid=u5] user objects: "no, use dot
+product — the embeddings are already L2-normalized so it's the same
+math but cheaper". Agent agrees, switches to dot product.</input>
+<output>conflicts=[{turn_a_uuid: "a4", turn_b_uuid: "u5",
+conflict_kind: "correction", severity: "low",
+agent_position: "Use cosine similarity for the nearest-neighbor lookup.",
+user_position: "Use dot product since embeddings are L2-normalized.",
+confidence: 0.85}]</output>
+</example>
+<example>
+<input>At [uuid=u2] user says "let's deprecate the v1 API endpoint". At
+[uuid=a3] agent pushes back: "we still have customers on v1; we should
+co-exist for at least one quarter". User considers it but doesn't
+agree or disagree — pivots to a different topic. Topic never returns.</input>
+<output>conflicts=[{turn_a_uuid: "u2", turn_b_uuid: "a3",
+conflict_kind: "disagreement", severity: "medium",
+agent_position: "Keep v1 alive for one quarter to avoid customer impact.",
+user_position: "Deprecate the v1 API endpoint.",
+confidence: 0.7}]</output>
 </example>
 <example>
 <input>Brief disagreement about which CI config to use. User pivots to
-a different topic. Never returns to the CI question.</input>
-<output>conflicts=[{stance_a: "Use GitHub Actions for the new pipeline.",
-stance_b: "Stick with the existing CodeBuild setup.",
-resolution: "abandoned"}]</output>
+a different topic without engaging. Never returns to the CI question
+and the agent doesn't restate its position either.</input>
+<output>conflicts=[]. A single unreciprocated remark is not enough —
+need two distinct turns each holding their position.</output>
 </example>
 </examples>
 
@@ -996,15 +1049,63 @@ resolution: "abandoned"}]</output>
   own reasoning, then picks one with the user's blessing. That's
   deliberation, not conflict.
 - Don't count surface-level pushback that the user immediately retracts.
+  ("wait, isn't that broken? — oh you're right, never mind") is not a
+  conflict; it's a question the agent satisfied.
 - Don't count style / formatting disagreements ("I'd phrase that
-  differently", "use semicolons not commas").
+  differently", "use semicolons not commas", "this comment should be
+  one line"). Style preferences with no consequence to behaviour are
+  not conflicts.
 - Don't count accepted risk. Agent flags risk, user accepts it. That's
-  a noted caveat, not a conflict.
+  a noted caveat, not a conflict — both parties end up agreeing on the
+  same plan, they just acknowledge the risk.
 - Don't count iteration. Two failed attempts at the same task (agent
-  tried X, then Y). That's iteration, not conflict.
+  tried X, then Y, both failed) are iteration, not conflict — neither
+  attempt represents a held stance the other side opposed.
 - Don't count tooling preferences without consequence ("I'd use jq here"
-  vs "I'd use python -c").
+  vs "I'd use python -c"). If the underlying behaviour is identical,
+  the choice is bikeshed, not stance.
+- Don't count the agent's hedging as a stance. "I could do X, but Y is
+  also reasonable" is not a position the agent committed to. A real
+  agent_position is a sentence the agent would defend if challenged.
+- Don't count clarifying questions as conflicts. The user asking "why
+  did you choose X?" is gathering context, not opposing X — unless the
+  agent's answer fails to land and the user then explicitly disagrees.
+- Don't count one-off tone slips. A single curt user message ("no, do
+  it the other way") with no prior agent stance to oppose is just a
+  command, not a conflict pair.
+- Don't manufacture a conflict to fill the array. If the session is a
+  smooth collaboration with no opposing stances, return [] confidently.
+  Empty arrays are the correct answer for the majority of sessions.
+- Never invent turn UUIDs. If you cannot identify two specific turns
+  in the bound transcript whose stances clash, return an empty array.
+  An invented UUID is worse than a missed conflict.
+- Never use a turn UUID twice in the same conflict pair. turn_a_uuid
+  and turn_b_uuid must always differ — even in a reversal, the two
+  flips are at distinct turns.
+- Never set confidence > 0.5 when the rationale relies on inferring
+  unstated positions. If you have to read between the lines, the cue
+  is too weak to claim high confidence.
 </anti_patterns>
+
+<calibration_notes>
+The downstream conflicts_summary view counts rows per session; a single
+inflated row drowns the signal more than a missed pair would. False
+negatives are recoverable (the pair-scanner pass in v1.1 will catch
+them); false positives are not. When in genuine doubt between
+"borderline conflict at confidence 0.4" and "no conflict", prefer the
+empty array.
+
+severity is also calibration-sensitive:
+- 'low' is the right call when the conflict is purely about *how* to
+  achieve an agreed-upon outcome and either approach would land the
+  same goal.
+- 'medium' applies when the choice changes the implementation shape
+  (different file structure, different dependency, different schema).
+- 'high' is reserved for conflicts that change *what* gets shipped or
+  block the session from progressing. If you find yourself stamping
+  'high' on more than one pair per session, double-check both — that
+  density of high-severity conflict is genuinely rare.
+</calibration_notes>
 """
 
 
