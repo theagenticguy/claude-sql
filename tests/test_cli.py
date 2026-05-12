@@ -343,7 +343,8 @@ def test_list_cache_json(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixtu
     cli.list_cache(common=_common(tmp_corpus))
     payload = json.loads(capsys.readouterr().out)
     names = {entry["name"] for entry in payload}
-    assert "embeddings" in names
+    assert "embeddings_lance" in names
+    assert "embeddings_legacy" in names
     assert "session_checkpoint" in names
 
 
@@ -351,12 +352,12 @@ def test_list_cache_ndjson(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFix
     cli.list_cache(common=_common(tmp_corpus, fmt=OutputFormat.NDJSON))
     out = capsys.readouterr().out.strip().splitlines()
     parsed = [json.loads(line) for line in out]
-    assert any(entry["name"] == "embeddings" for entry in parsed)
+    assert any(entry["name"] == "embeddings_lance" for entry in parsed)
 
 
 def test_list_cache_csv(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
     cli.list_cache(common=_common(tmp_corpus, fmt=OutputFormat.CSV))
-    assert "embeddings" in capsys.readouterr().out
+    assert "embeddings_lance" in capsys.readouterr().out
 
 
 def test_list_cache_table(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
@@ -587,28 +588,29 @@ def test_search_with_mocked_embed(
         con.close()
     assert rows, "fixture must produce at least one message"
 
-    embed_dir = settings.embeddings_parquet_path
-    embed_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import UTC, datetime as _dt
+
+    from claude_sql import lance_store
+
     df = pl.DataFrame(
         {
             "uuid": [str(r[0]) for r in rows],
             "model": [settings.active_model_id] * len(rows),
             "dim": [dim] * len(rows),
             "embedding": [[float(i % 5) for i in range(dim)] for _ in range(len(rows))],
+            "embedded_at": [_dt.now(UTC)] * len(rows),
         },
         schema={
             "uuid": pl.String,
             "model": pl.String,
-            "dim": pl.UInt16,
+            "dim": pl.Int32,
             "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
         },
     )
-    df.write_parquet(embed_dir / "part-1.parquet")
-
-    # Drop any pre-built HNSW store from the first connection — the
-    # subsequent ``search`` call rebuilds against the parquet we just wrote.
-    if settings.hnsw_db_path.exists():
-        settings.hnsw_db_path.unlink()
+    db = lance_store.connect_db(settings.lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    lance_store.add_chunk(tbl, df)
 
     fake_qv = [float(i % 3) for i in range(dim)]
     monkeypatch.setattr(cli, "embed_query", lambda text, *, settings: fake_qv)

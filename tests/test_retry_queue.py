@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import duckdb
 import pytest
 
 from claude_sql.retry_queue import (
@@ -43,7 +43,7 @@ def test_enqueue_backoff_increases(tmp_path: Path) -> None:
     t0 = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
     enqueue(db, pipeline="classify", unit_id="s1", error="e", now=t0)
     enqueue(db, pipeline="classify", unit_id="s1", error="e", now=t0)
-    con = duckdb.connect(str(db))
+    con = sqlite3.connect(str(db))
     try:
         row = con.execute(
             "SELECT attempts, next_attempt_at FROM retry_queue WHERE unit_id = 's1'"
@@ -51,11 +51,11 @@ def test_enqueue_backoff_increases(tmp_path: Path) -> None:
     finally:
         con.close()
     assert row is not None
-    attempts, next_at = row
+    attempts, next_at_iso = row
     # Second failure → next_attempt = t0 + 2^2 min = t0 + 4 min.
-    expected = t0.replace(tzinfo=None) + timedelta(minutes=4)
+    expected = (t0 + timedelta(minutes=4)).isoformat()
     assert attempts == 2
-    assert next_at == expected
+    assert next_at_iso == expected
 
 
 def test_drain_respects_next_attempt_at(tmp_path: Path) -> None:
@@ -119,9 +119,13 @@ def test_enqueue_coexists_with_checkpoint_table(tmp_path: Path) -> None:
     t0 = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
     mark_completed(db, pipeline="classify", rows=[("s1", t0, t0)])
     enqueue(db, pipeline="classify", unit_id="s1", error="e", now=t0)
-    con = duckdb.connect(str(db), read_only=True)
+    con = sqlite3.connect(str(db))
     try:
-        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        tables = {
+            r[0]
+            for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
     finally:
         con.close()
-    assert tables == {"session_checkpoint", "retry_queue"}
+    # Both core tables present; sqlite may also create internal pages.
+    assert {"session_checkpoint", "retry_queue"}.issubset(tables)

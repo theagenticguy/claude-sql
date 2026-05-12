@@ -151,16 +151,17 @@ def test_run_communities_cache_hit_returns_summary(tmp_path: Path) -> None:
 
 
 def test_run_communities_missing_embeddings_raises(tmp_path: Path) -> None:
-    """Empty embeddings dir -> iter_part_files returns [] -> RuntimeError."""
+    """Missing Lance dataset -> RuntimeError surfaced from the catalog wrap."""
     settings = Settings(
-        embeddings_parquet_path=tmp_path / "no-such-dir",
+        lance_uri=tmp_path / "no-such-dir",
         communities_parquet_path=tmp_path / "communities.parquet",
         community_profile_parquet_path=tmp_path / "profile.parquet",
     )
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE messages (uuid VARCHAR, session_id VARCHAR)")
     try:
-        with pytest.raises(RuntimeError, match="No embeddings parquet"):
+        # ``message_embeddings`` view is not registered → CatalogException → RuntimeError wrap.
+        with pytest.raises(RuntimeError, match="No embeddings"):
             run_communities(con, settings, force=True)
     finally:
         con.close()
@@ -168,29 +169,39 @@ def test_run_communities_missing_embeddings_raises(tmp_path: Path) -> None:
 
 def test_run_communities_empty_join_raises(tmp_path: Path) -> None:
     """Embeddings exist but no uuid matches messages -> RuntimeError."""
-    emb_dir = tmp_path / "embeddings"
-    emb_dir.mkdir()
-    pl.DataFrame(
+    from datetime import UTC, datetime as _dt
+
+    from claude_sql import lance_store
+    from claude_sql.sql_views import register_vss
+
+    lance_uri = tmp_path / "embeddings_lance"
+    df = pl.DataFrame(
         {
             "uuid": ["unrelated-uuid"],
             "model": ["test"],
             "dim": [4],
             "embedding": [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)],
+            "embedded_at": [_dt.now(UTC)],
         },
         schema={
             "uuid": pl.Utf8,
             "model": pl.Utf8,
-            "dim": pl.UInt16,
+            "dim": pl.Int32,
             "embedding": pl.Array(pl.Float32, 4),
+            "embedded_at": pl.Datetime("us", "UTC"),
         },
-    ).write_parquet(emb_dir / "part-0001.parquet")
+    )
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=4)
+    lance_store.add_chunk(tbl, df)
     settings = Settings(
-        embeddings_parquet_path=emb_dir,
+        lance_uri=lance_uri,
         communities_parquet_path=tmp_path / "communities.parquet",
         community_profile_parquet_path=tmp_path / "profile.parquet",
     )
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE messages AS SELECT 'other-uuid' AS uuid, 's1' AS session_id")
+    register_vss(con, lance_uri=lance_uri, dim=4)
     try:
         with pytest.raises(RuntimeError, match="No rows returned"):
             run_communities(con, settings, force=True)
@@ -401,7 +412,10 @@ def connected_settings_module(
     tmp_path: Path,
 ) -> tuple[duckdb.DuckDBPyConnection, Settings]:
     """Mirror of the smoke test fixture; 4 sessions, 2 orthogonal centroid groups."""
-    from claude_sql.sql_views import register_raw, register_views
+    from datetime import UTC, datetime as _dt
+
+    from claude_sql import lance_store
+    from claude_sql.sql_views import register_raw, register_views, register_vss
 
     proj = tmp_path / "projects" / "-home-x-proj"
     proj.mkdir(parents=True)
@@ -460,15 +474,27 @@ def connected_settings_module(
         e[r] = b_dir + 0.01 * rng.normal(size=dim).astype(np.float32)
     e /= np.linalg.norm(e, axis=1, keepdims=True)
     msg_uuids = [f"u{i}-1" if k == 0 else f"a{i}-1" for i in range(4) for k in range(2)]
-    pl.DataFrame(
-        {"uuid": msg_uuids, "model": ["test"] * 8, "dim": [dim] * 8, "embedding": e},
+    now = _dt.now(UTC)
+    emb_df = pl.DataFrame(
+        {
+            "uuid": msg_uuids,
+            "model": ["test"] * 8,
+            "dim": [dim] * 8,
+            "embedding": e,
+            "embedded_at": [now] * 8,
+        },
         schema={
             "uuid": pl.Utf8,
             "model": pl.Utf8,
-            "dim": pl.UInt16,
+            "dim": pl.Int32,
             "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
         },
-    ).write_parquet(tmp_path / "embeddings.parquet")
+    )
+    lance_uri = tmp_path / "embeddings_lance"
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    lance_store.add_chunk(tbl, emb_df)
 
     parent_uuid = "99999999-9999-9999-9999-999999999999"
     sub_dir = tmp_path / "projects" / "-x" / parent_uuid / "subagents"
@@ -513,7 +539,7 @@ def connected_settings_module(
     )
 
     settings = Settings(
-        embeddings_parquet_path=tmp_path / "embeddings.parquet",
+        lance_uri=lance_uri,
         communities_parquet_path=tmp_path / "communities.parquet",
         community_profile_parquet_path=tmp_path / "community_profile.parquet",
         default_glob=str(proj / "*.jsonl"),
@@ -533,6 +559,7 @@ def connected_settings_module(
         subagent_meta_glob=settings.subagent_meta_glob,
     )
     register_views(con)
+    register_vss(con, lance_uri=lance_uri, dim=dim)
     # Pre-populate the communities parquet so neighbors_of's join branch can hit.
     run_communities(con, settings, force=True)
     return con, settings

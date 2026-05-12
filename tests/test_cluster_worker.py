@@ -2,28 +2,29 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 import pytest
 
+from claude_sql import lance_store
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.config import Settings
 
 
 def _make_synthetic_embeddings(
-    path: Path,
+    lance_uri: Path,
     *,
     n_clusters: int = 5,
     per_cluster: int = 50,
     dim: int = 64,
     seed: int = 0,
 ) -> None:
-    """Write a synthetic embeddings parquet with obvious cluster structure."""
+    """Seed a Lance dataset with obvious cluster structure."""
     rng = np.random.default_rng(seed)
     centers = rng.normal(size=(n_clusters, dim)).astype(np.float32)
-    # Normalize centers and spread points around each
     centers = centers / np.linalg.norm(centers, axis=1, keepdims=True)
     vectors: list[np.ndarray] = []
     ids: list[str] = []
@@ -34,29 +35,34 @@ def _make_synthetic_embeddings(
         vectors.append(pts)
         ids.extend(f"cluster-{i:02d}-pt-{j:03d}" for j in range(per_cluster))
     e = np.vstack(vectors)
+    now = datetime.now(UTC)
     df = pl.DataFrame(
         {
             "uuid": ids,
             "model": ["test"] * len(ids),
             "dim": [dim] * len(ids),
             "embedding": e,
+            "embedded_at": [now] * len(ids),
         },
         schema={
             "uuid": pl.Utf8,
             "model": pl.Utf8,
-            "dim": pl.UInt16,
+            "dim": pl.Int32,
             "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
         },
     )
-    df.write_parquet(path)
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    lance_store.add_chunk(tbl, df)
 
 
 @pytest.fixture
 def synthetic_settings(tmp_path: Path) -> Settings:
-    emb = tmp_path / "embeddings.parquet"
-    _make_synthetic_embeddings(emb, n_clusters=5, per_cluster=50, dim=64, seed=42)
+    lance_uri = tmp_path / "embeddings_lance"
+    _make_synthetic_embeddings(lance_uri, n_clusters=5, per_cluster=50, dim=64, seed=42)
     return Settings(
-        embeddings_parquet_path=emb,
+        lance_uri=lance_uri,
         clusters_parquet_path=tmp_path / "clusters.parquet",
         # Shrink UMAP for speed -- n_neighbors must be < n_samples
         umap_n_components_50=10,
@@ -64,7 +70,7 @@ def synthetic_settings(tmp_path: Path) -> Settings:
         umap_n_neighbors=15,
         hdbscan_min_cluster_size=10,
         hdbscan_min_samples=3,
-        output_dimension=1024,  # not used by clustering; keep default-shaped
+        output_dimension=1024,  # not used by clustering; lance schema dim is set explicitly
     )
 
 
@@ -88,7 +94,7 @@ def test_clustering_skips_when_parquet_exists(synthetic_settings: Settings) -> N
 
 def test_clustering_errors_when_input_missing(tmp_path: Path) -> None:
     s = Settings(
-        embeddings_parquet_path=tmp_path / "nope.parquet",
+        lance_uri=tmp_path / "missing_lance",
         clusters_parquet_path=tmp_path / "clusters.parquet",
     )
     with pytest.raises(FileNotFoundError):
@@ -133,16 +139,15 @@ def test_clustering_rebuilds_when_embeddings_mtime_changes(
     )
     pre = sidecar.read_text()
 
-    # Bump every part-file (or the legacy single file) past the sidecar's mtime.
-    embeddings_path = synthetic_settings.embeddings_parquet_path
-    targets = (
-        list(embeddings_path.glob("part-*.parquet"))
-        if embeddings_path.is_dir()
-        else [embeddings_path]
-    )
+    # Bump every file under the Lance directory tree past the sidecar's mtime.
+    lance_uri = synthetic_settings.lance_uri
+    targets = [p for p in lance_uri.rglob("*") if p.is_file()]
+    assert targets, "expected Lance dataset files under the synthetic uri"
     bumped_ns = max(p.stat().st_mtime_ns for p in targets) + 5_000_000_000
     for p in targets:
         _os.utime(p, ns=(bumped_ns, bumped_ns))
+    # Also touch the directory itself so the cluster worker's max-mtime walk picks it up.
+    _os.utime(lance_uri, ns=(bumped_ns, bumped_ns))
 
     run_clustering(synthetic_settings, force=False)
     post = sidecar.read_text()

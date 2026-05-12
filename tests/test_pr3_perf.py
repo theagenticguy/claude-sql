@@ -179,7 +179,6 @@ def test_register_macros_skips_friction_when_parquet_missing(
         user_friction_parquet_path=cache / "user_friction",
         skills_catalog_parquet_path=cache / "skills_catalog.parquet",
         checkpoint_db_path=cache / "claude_sql.duckdb",
-        hnsw_db_path=cache / "hnsw.duckdb",
         duckdb_temp_dir=cache / "duckdb_tmp",
         user_skills_dir=cache / "skills",
         plugins_cache_dir=cache / "plugins_cache",
@@ -212,7 +211,6 @@ def test_register_macros_skips_friction_when_parquet_missing(
             sql_views.register_vss(
                 con,
                 embeddings_parquet=settings.embeddings_parquet_path,
-                hnsw_db_path=None,
                 dim=int(settings.output_dimension),
             )
             sql_views.register_macros(con, settings=settings)
@@ -292,12 +290,14 @@ def test_schema_includes_cached_field(
 # ---------------------------------------------------------------------------
 
 
-def test_schema_under_500ms(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
-    """``cli.schema`` should complete well under 500ms once warm.
+def test_schema_under_100ms(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    """``cli.schema`` should complete well under 100ms once warm.
 
-    Budget is generous (the static-dict read itself is single-digit ms;
-    the rest is settings parsing + json.dumps). A regression here means
-    something started reaching back into DuckDB.
+    Budget tightened from 500ms to 100ms after T1.1 + T1.2 connection-helper
+    refactors verified the schema path stays out of DuckDB entirely
+    (static-dict read + settings parsing + json.dumps lands in ~10ms on a
+    warm interpreter). A regression here means something started reaching
+    back into DuckDB or the settings parse blew up.
     """
     # Warm any imports / lazy initialization first.
     cli.schema(common=_common(tmp_corpus))
@@ -307,7 +307,7 @@ def test_schema_under_500ms(tmp_corpus: dict[str, Any], capsys: pytest.CaptureFi
     cli.schema(common=_common(tmp_corpus))
     elapsed = time.perf_counter() - start
     capsys.readouterr()
-    assert elapsed < 0.5, f"schema took {elapsed:.3f}s (budget 0.5s)"
+    assert elapsed < 0.1, f"schema took {elapsed:.3f}s (budget 0.1s)"
 
 
 # ---------------------------------------------------------------------------

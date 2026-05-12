@@ -22,25 +22,27 @@ import numpy as np
 import polars as pl
 from loguru import logger
 
+from claude_sql import lance_store
 from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files
 
 
 def _load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
-    """Read parquet → (uuid_list, embedding_matrix[float32]).  Matrix shape (N, dim).
+    """Read the LanceDB embeddings table → (uuid_list, embedding_matrix[float32]).
 
-    Accepts either a legacy single-file ``embeddings.parquet`` or a sharded
-    directory containing ``part-*.parquet`` files; the union of all parts is
-    materialized in scan order.
+    Matrix shape (N, dim). Reads via the LanceDB Python API directly (not
+    through the DuckDB ``message_embeddings`` view) so this worker can run
+    independently of view registration on the calling connection.
     """
-    parts = iter_part_files(path)
-    df = pl.read_parquet([str(p) for p in parts]) if parts else pl.read_parquet(path)
+    db = lance_store.connect_db(path)
+    if not lance_store._has_table(db, lance_store.TABLE_NAME):
+        return [], np.zeros((0, 0), dtype=np.float32)
+    tbl = db.open_table(lance_store.TABLE_NAME)
+    arrow = tbl.to_arrow().select(["uuid", "embedding"])
+    raw = pl.from_arrow(arrow)
+    df = raw if isinstance(raw, pl.DataFrame) else raw.to_frame()
     uuids = df["uuid"].to_list()
-    # polars Array[Float32, dim] → 2D numpy (N, dim).  to_numpy() on an Array column
-    # returns 2D when the element type is fixed-size Array; fall back to vstack if not.
     emb = df["embedding"].to_numpy()
     if emb.ndim == 1:
-        # Object array of 1D arrays (ragged container); stack into a 2D matrix.
         emb = np.stack(list(emb))
     return uuids, np.ascontiguousarray(emb, dtype=np.float32)
 
@@ -64,23 +66,28 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
         noise cluster (label -1).
     """
     out_path = settings.clusters_parquet_path
-    in_path = settings.embeddings_parquet_path
+    in_path = settings.lance_uri
 
-    # Sharded directory or legacy single file: insist on at least one part
-    # whose footer is plausibly populated (>16 bytes).
-    in_parts = [p for p in iter_part_files(in_path) if p.stat().st_size > 16]
-    if not in_parts:
+    if lance_store.count_rows(in_path) == 0:
         raise FileNotFoundError(
-            f"Embeddings parquet missing at {in_path}.  Run `claude-sql embed` first."
+            f"LanceDB embeddings missing at {in_path}. Run `claude-sql embed` first."
         )
 
-    # Mtime-sidecar fast path: if the embeddings haven't moved since the
+    # Mtime-sidecar fast path: if the Lance dataset hasn't moved since the
     # last successful clustering, skip the ~40 s UMAP+HDBSCAN refit. The
-    # sidecar lives next to the output parquet and stores the latest
-    # part-file's nanosecond mtime; coarse hand-edits of clusters.parquet
-    # alone won't bust the cache (use ``force=True`` for that).
+    # sidecar lives next to the output parquet and stores the dataset
+    # directory's nanosecond mtime; hand-edits to clusters.parquet alone
+    # won't bust the cache (use ``force=True`` for that).
     sidecar = out_path.with_suffix(out_path.suffix + ".embeddings_mtime")
-    in_mtime_ns = max(p.stat().st_mtime_ns for p in in_parts)
+    # Walk the Lance directory tree once and take the max mtime — Lance
+    # writes new fragments to disk, so the deepest mtime tracks the data.
+    import contextlib
+
+    candidate_mtimes = [in_path.stat().st_mtime_ns]
+    for child in in_path.rglob("*"):
+        with contextlib.suppress(OSError):
+            candidate_mtimes.append(child.stat().st_mtime_ns)
+    in_mtime_ns = max(candidate_mtimes)
     if (
         not force
         and out_path.exists()

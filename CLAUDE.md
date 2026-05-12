@@ -305,6 +305,28 @@ for the lesson capturing this; the cyclonedx-py flag-shape fix is in
   path uses a pure-SQL count, not a full materialization, so it stays fast
   on large corpora.
 
+## DuckDB
+
+- **Version floor: ≥1.5.1** — the `lance` core extension (used by the
+  embeddings store) became core in 1.5.1. Below that, the extension has
+  to be installed from the community repo and pin churn breaks the
+  embeddings cache. Pinned `>=1.5.2,<2` in `pyproject.toml`; upper bound
+  keeps us inside the 1.x train through any 2.0 surprise.
+- **Non-blocking checkpointing** — 1.5.x replaces the old stop-the-world
+  checkpoint with a concurrent path: reads, writes, inserts, and deletes
+  proceed during checkpoint flushes. Matters less now that the embeddings
+  store moved to LanceDB (no DuckDB writer-lock storms), but still
+  benefits the analytics views that read JSONL transcripts in place.
+- **Throughput** — 1.5.2 is ~17% faster on TPC-H than 1.4.x in upstream
+  benchmarks. Our analytics views (mostly aggregate-heavy SQL over the
+  JSONL corpus) sit in the same shape, so the improvement carries over.
+- **`date_trunc(DATE)` returns TIMESTAMP in 1.5.0+** (was DATE). Audit
+  result: only one usage in `sql_views.py` (`autonomy_trend` macro) and
+  it operates on `classified_at` which is TIMESTAMP-typed in the parquet
+  schema, so no breaking change for us. Future `date_trunc` calls on
+  DATE-typed columns that feed DATE-expecting downstream consumers must
+  add an explicit `::DATE` cast.
+
 ## Structured output (Sonnet classification)
 
 - Uses Bedrock's GA `output_config.format` field (not tool_use/tool_choice).
@@ -417,15 +439,25 @@ math (per-class TF, IDF, L1 norm, ngram (1,2), min_df=2). Do not pull in
 - `BedrockRefusalError` is terminal: the LLM pipelines stamp a neutral
   placeholder row and clear the retry queue so refused messages don't
   cycle forever.
-- **Persistent HNSW (`~/.claude/hnsw.duckdb`).** Built lazily on first
-  command and reused across runs via DuckDB's
-  `hnsw_enable_experimental_persistence` flag. `register_vss` ATTACHes
-  it as `hnsw_store`, mtime-checks against the embeddings parquet, and
-  rebuilds when the parquet is newer or the catalog comes back empty.
-  ATTACH on a corrupt file is caught and the store is unlinked +
-  rebuilt from parquet automatically. Recovery for the user:
-  `rm ~/.claude/hnsw.duckdb`. Do NOT couple this with
-  `claude_sql.duckdb` — separate file per state surface.
+- **LanceDB embeddings store (`~/.claude/embeddings_lance/`).** Replaces
+  the prior `embeddings/part-*.parquet` + `~/.claude/hnsw.duckdb` combo.
+  Lance holds the FLOAT[1024] vectors AND the IVF_HNSW_SQ index in one
+  versioned directory; DuckDB reads it back via the `lance` core
+  extension (`INSTALL lance; LOAD lance; ATTACH '<dir>' AS lance_store
+  (TYPE LANCE)`). `register_vss` probes the LanceDB namespace via
+  `lance_store._has_table`; if the embeddings table is absent (fresh
+  install), it creates an empty `message_embeddings` DuckDB table so
+  the `semantic_search` macro still binds. Recovery for the user:
+  `rm -rf ~/.claude/embeddings_lance/` then `claude-sql embed`. The
+  legacy `embeddings/part-*.parquet` directory is left in place for
+  rollback; one-time migration is automatic on first connect (idempotent
+  via row-count check).
+- **Empty-namespace gate.** DuckDB's `ATTACH (TYPE LANCE)` succeeds on
+  any path — even a directory without a Lance dataset. The catalog
+  error fires later at SELECT/CREATE-VIEW time. Always probe via
+  `lance_store._has_table(db, TABLE_NAME)` before binding the view, NOT
+  via filesystem heuristics like `any(dir.iterdir())`. This is
+  pinned by `tests/test_lance_store.py`.
 - **Sharded parquet caches.** Workers (`embed`, `classify`, `trajectory`,
   `conflicts`, `friction`) write each chunk as a fresh
   `<cache>/part-<ts_ns>.parquet` instead of read-concat-rewrite. Readers
@@ -490,13 +522,15 @@ for the full table. The common overrides:
   also accepts absolute units like `'4GB'`
 - `CLAUDE_SQL_DUCKDB_TEMP_DIR` — spill directory; default
   `~/.claude/duckdb_tmp`
-- `CLAUDE_SQL_HNSW_DB_PATH` — persistent HNSW store; default
-  `~/.claude/hnsw.duckdb`
+- `CLAUDE_SQL_LANCE_URI` — LanceDB embeddings store; default
+  `~/.claude/embeddings_lance`
 
 ## Operational rollback paths
 
-- HNSW corruption / version mismatch — `rm ~/.claude/hnsw.duckdb`. Next
-  command rebuilds the index from `embeddings/`.
+- LanceDB corruption / version mismatch — `rm -rf ~/.claude/embeddings_lance/`,
+  then `claude-sql embed --since-days 14 --no-dry-run` (or just `analyze`).
+  The legacy parquet shards remain at `~/.claude/embeddings/` and re-migrate
+  automatically on the next connect.
 - Sharded parquet directory grows large — `claude-sql cache compact
   --no-dry-run` consolidates `<cache>/part-*.parquet` into a single
   consolidated file.

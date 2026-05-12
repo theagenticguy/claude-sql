@@ -35,7 +35,7 @@ from botocore.exceptions import (
     SSLError,
 )
 
-from claude_sql import embed_worker
+from claude_sql import embed_worker, lance_store
 from claude_sql.embed_worker import (
     MAX_CHARS_PER_TEXT,
     _build_bedrock_client,
@@ -46,9 +46,32 @@ from claude_sql.embed_worker import (
     embed_query,
     run_backfill,
 )
-from claude_sql.parquet_shards import iter_part_files, write_part
 from claude_sql.sql_views import register_raw, register_views
 from conftest import FakeBedrockClient, make_user_msg, write_session_jsonl
+
+
+def _seed_lance_uuids(lance_uri: Path, uuids: list[str], dim: int = 4) -> None:
+    """Helper for tests: write a tiny Lance dataset claiming ``uuids`` are embedded."""
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    df = pl.DataFrame(
+        {
+            "uuid": uuids,
+            "model": ["test"] * len(uuids),
+            "dim": [dim] * len(uuids),
+            "embedding": [[0.0] * dim for _ in uuids],
+            "embedded_at": [datetime.now(UTC)] * len(uuids),
+        },
+        schema={
+            "uuid": pl.Utf8,
+            "model": pl.Utf8,
+            "dim": pl.Int32,
+            "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
+        },
+    )
+    lance_store.add_chunk(tbl, df)
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -135,25 +158,24 @@ def test_is_retryable_random_runtime_error() -> None:
 
 def test_discover_unembedded_no_parquet_returns_all(views_con: Any, tmp_path: Path) -> None:
     """First-ever run: nothing is embedded, every messages_text row is returned."""
-    cache_dir = tmp_path / "embeddings"
-    rows = discover_unembedded(views_con, embeddings_parquet=cache_dir)
+    lance_uri = tmp_path / "embeddings_lance"
+    rows = discover_unembedded(views_con, lance_uri=lance_uri)
     uuids = {r[0] for r in rows}
     # The fixture corpus has user messages u1, u3, v1 with text >= 32 chars.
     assert {"u1", "u3", "v1"} <= uuids
 
 
 def test_discover_unembedded_anti_join_filters_existing(views_con: Any, tmp_path: Path) -> None:
-    """After writing a shard with one uuid, that uuid must drop out."""
-    cache_dir = tmp_path / "embeddings"
-    initial = discover_unembedded(views_con, embeddings_parquet=cache_dir)
+    """After seeding a Lance row claiming one uuid is embedded, it must drop out."""
+    lance_uri = tmp_path / "embeddings_lance"
+    initial = discover_unembedded(views_con, lance_uri=lance_uri)
     initial_uuids = {r[0] for r in initial}
     assert "u1" in initial_uuids
 
-    # Persist a tiny shard claiming u1 is embedded.
-    df = pl.DataFrame({"uuid": ["u1"]}, schema={"uuid": pl.Utf8})
-    write_part(cache_dir, df)
+    # Seed Lance with u1 only.
+    _seed_lance_uuids(lance_uri, ["u1"])
 
-    after = discover_unembedded(views_con, embeddings_parquet=cache_dir)
+    after = discover_unembedded(views_con, lance_uri=lance_uri)
     after_uuids = {r[0] for r in after}
     assert "u1" not in after_uuids
     # Anti-join must not nuke unrelated rows.
@@ -179,8 +201,20 @@ def test_discover_unembedded_since_days_filters_recent(
             )
         ],
     )
-    cache_dir = tmp_path / "embeddings"
-    rows = discover_unembedded(views_con, embeddings_parquet=cache_dir, since_days=1)
+    # T1.1: ``v_raw_events`` is now materialized as a TEMP TABLE, so a JSONL
+    # written *after* fixture setup is invisible until we re-register the
+    # raw readers. Re-run register_raw + register_views to pick up the new
+    # file. Mirrors the production flow where the CLI calls register_raw on
+    # every invocation.
+    register_raw(
+        views_con,
+        glob=tmp_corpus["glob"],
+        subagent_glob=tmp_corpus["subagent_glob"],
+        subagent_meta_glob=tmp_corpus["subagent_meta_glob"],
+    )
+    register_views(views_con)
+    lance_uri = tmp_path / "embeddings_lance"
+    rows = discover_unembedded(views_con, lance_uri=lance_uri, since_days=1)
     uuids = {r[0] for r in rows}
     # 2026-04-01 / 2026-04-02 fixture rows are ancient relative to "today";
     # ``since_days=1`` filters them out and keeps only the fresh one.
@@ -190,8 +224,8 @@ def test_discover_unembedded_since_days_filters_recent(
 
 
 def test_discover_unembedded_limit_cap(views_con: Any, tmp_path: Path) -> None:
-    cache_dir = tmp_path / "embeddings"
-    rows = discover_unembedded(views_con, embeddings_parquet=cache_dir, limit=1)
+    lance_uri = tmp_path / "embeddings_lance"
+    rows = discover_unembedded(views_con, lance_uri=lance_uri, limit=1)
     assert len(rows) == 1
 
 
@@ -346,11 +380,13 @@ def test_run_backfill_dry_run_no_candidates(
     views_con: Any, tmp_settings: Any, tmp_path: Path
 ) -> None:
     """Dry-run on an empty corpus path: candidates=0, dry_run=True."""
-    # Pre-seed an embeddings shard listing every messages_text uuid so the
-    # candidate set is empty.
+    # Pre-seed Lance with every messages_text uuid so the candidate set is empty.
     rows = views_con.execute("SELECT CAST(uuid AS VARCHAR) FROM messages_text").fetchall()
-    df = pl.DataFrame({"uuid": [r[0] for r in rows]}, schema={"uuid": pl.Utf8})
-    write_part(tmp_settings.embeddings_parquet_path, df)
+    _seed_lance_uuids(
+        tmp_settings.lance_uri,
+        [r[0] for r in rows],
+        dim=tmp_settings.output_dimension,
+    )
 
     plan = asyncio.run(run_backfill(con=views_con, settings=tmp_settings, dry_run=True))
     assert isinstance(plan, dict)
@@ -390,13 +426,13 @@ def test_run_backfill_real_run_writes_shards(
     written = asyncio.run(run_backfill(con=views_con, settings=tmp_settings))
     assert written == pending
 
-    parts = iter_part_files(tmp_settings.embeddings_parquet_path)
-    assert len(parts) >= 1
-    # Read it back and verify the persisted schema looks right.
-    df = pl.read_parquet(parts[0])
-    assert "uuid" in df.columns
-    assert "embedding" in df.columns
-    assert df.height == pending
+    # Verify Lance now holds the expected rows.
+    db = lance_store.connect_db(tmp_settings.lance_uri)
+    tbl = db.open_table(lance_store.TABLE_NAME)
+    assert tbl.count_rows() == pending
+    arrow = tbl.to_arrow()
+    assert "uuid" in arrow.column_names
+    assert "embedding" in arrow.column_names
 
 
 def test_run_backfill_no_pending_returns_zero(
@@ -406,8 +442,11 @@ def test_run_backfill_no_pending_returns_zero(
 ) -> None:
     """Pre-embedded uuids => returns 0 and never calls invoke_model."""
     rows = views_con.execute("SELECT CAST(uuid AS VARCHAR) FROM messages_text").fetchall()
-    df = pl.DataFrame({"uuid": [r[0] for r in rows]}, schema={"uuid": pl.Utf8})
-    write_part(tmp_settings.embeddings_parquet_path, df)
+    _seed_lance_uuids(
+        tmp_settings.lance_uri,
+        [r[0] for r in rows],
+        dim=tmp_settings.output_dimension,
+    )
 
     def _explode(_settings: Any) -> Any:  # pragma: no cover - failure trap
         raise AssertionError("Bedrock client must not be built when nothing pends")

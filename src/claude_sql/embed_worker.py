@@ -20,10 +20,9 @@ import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import boto3
-import duckdb
 import polars as pl
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
@@ -41,9 +40,12 @@ from tenacity import (
     wait_exponential,
 )
 
+from claude_sql import lance_store
 from claude_sql.config import Settings
 from claude_sql.logging_setup import loguru_before_sleep
-from claude_sql.parquet_shards import iter_part_files, write_part
+
+if TYPE_CHECKING:
+    import duckdb
 
 #: Conservative per-text character cap before sending to Bedrock.  The real
 #: model limit is 128K tokens per text; this cap keeps total payload below
@@ -79,7 +81,7 @@ def _is_retryable(exc: BaseException) -> bool:
 def discover_unembedded(
     con: duckdb.DuckDBPyConnection,
     *,
-    embeddings_parquet: Path,
+    lance_uri: Path,
     since_days: int | None = None,
     limit: int | None = None,
 ) -> list[tuple[str, str]]:
@@ -89,8 +91,9 @@ def discover_unembedded(
     ----------
     con
         An open DuckDB connection with the ``messages_text`` view registered.
-    embeddings_parquet
-        Path to the parquet of already-embedded rows; may not exist yet.
+    lance_uri
+        Path to the LanceDB local dataset directory backing the embeddings.
+        May not exist yet — empty Lance == "no embeddings".
     since_days
         If given, only include messages with ``ts >= now() - since_days``.
     limit
@@ -101,40 +104,31 @@ def discover_unembedded(
     list of (uuid, text) tuples
         Messages needing embedding, in DuckDB's scan order.
     """
-    # Treat missing / truncated parquet files (or empty shard directories) as
-    # "no embeddings yet" so an aborted previous run doesn't lock discovery
-    # into "skip all" via a corrupt index.  Sharded directories are scanned
-    # via the part-file glob; legacy single files keep their original path.
-    parts = iter_part_files(embeddings_parquet)
-    parts = [p for p in parts if p.stat().st_size > 16]
-    if parts:
-        # CREATE VIEW doesn't accept prepared parameters in DuckDB; escape
-        # each part path inline as a SQL string literal and pass them all
-        # to ``read_parquet`` as a list.
-        path_literals = ", ".join(f"'{str(p).replace(chr(39), chr(39) * 2)}'" for p in parts)
-        con.execute(
-            "CREATE OR REPLACE TEMP VIEW _embedded AS "
-            f"SELECT uuid FROM read_parquet([{path_literals}]);"
-        )
-        # mt.uuid is typed UUID; parquet uuid column is VARCHAR. Cast to match.
-        anti = "AND CAST(mt.uuid AS VARCHAR) NOT IN (SELECT uuid FROM _embedded)"
-    else:
-        anti = ""
+    # Read the already-embedded uuids straight from Lance via its Python API.
+    # We don't go through the DuckDB ``message_embeddings`` view here because
+    # the embed command runs with ``register_vss`` skipped (cli.py:1205-1213),
+    # so the view isn't registered on this connection.
+    # Materialise the anti-join in Python — at 22k rows the set fits
+    # comfortably in memory, and DuckDB's NOT IN against a literal VALUES
+    # list of that size is far slower than a Python set diff.
+    embedded = lance_store.get_embedded_uuids(lance_uri)
+    anti_in_python = bool(embedded)
 
     where = ["mt.text_content IS NOT NULL", "length(mt.text_content) > 0"]
     if since_days is not None:
         # DuckDB refuses to prepare an INTERVAL parameter; inline the coerced int.
         where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
 
-    sql = (
-        f"SELECT mt.uuid, mt.text_content FROM messages_text mt WHERE {' AND '.join(where)} {anti}"
-    )
+    sql = f"SELECT mt.uuid, mt.text_content FROM messages_text mt WHERE {' AND '.join(where)}"
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
 
     rows = con.execute(sql).fetchall()
     # DuckDB returns UUIDs as uuid.UUID objects; polars wants str for pl.Utf8.
-    return [(str(r[0]), r[1]) for r in rows]
+    pairs = [(str(r[0]), r[1]) for r in rows]
+    if anti_in_python:
+        pairs = [(u, t) for u, t in pairs if u not in embedded]
+    return pairs
 
 
 def _build_bedrock_client(settings: Settings) -> Any:
@@ -378,7 +372,7 @@ async def run_backfill(
     """
     pending = discover_unembedded(
         con,
-        embeddings_parquet=settings.embeddings_parquet_path,
+        lance_uri=settings.lance_uri,
         since_days=since_days,
         limit=limit,
     )
@@ -421,11 +415,13 @@ async def run_backfill(
         }
 
     # Checkpoint every N messages so a throttling-induced timeout doesn't
-    # discard work already embedded.  chunk must be a multiple of batch_size.
+    # discard work already embedded. chunk must be a multiple of batch_size.
     chunk_size = max(settings.batch_size * 4, 256)
-    path = settings.embeddings_parquet_path
     total_t0 = time.monotonic()
     written = 0
+    db = lance_store.connect_db(settings.lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=settings.output_dimension)
+    chunks_since_optimize = 0
     for i in range(0, len(pending), chunk_size):
         slice_ = pending[i : i + chunk_size]
         logger.info(
@@ -445,9 +441,9 @@ async def run_backfill(
         )
 
         now = datetime.now(UTC)
-        # Polars infers nested list[float] as Object when the batch is small or
-        # when rows are handed in as Python lists; force a fixed-size Array so
-        # write_parquet succeeds and DuckDB VSS sees FLOAT[dim] on read.
+        # Force a fixed-size Array so to_arrow() produces pa.list_(pa.float32, dim)
+        # which is what Lance requires for vector columns. A regular pl.List
+        # becomes a variable-size list and Lance rejects it for indexing.
         df = pl.DataFrame(
             {
                 "uuid": [p[0] for p in slice_],
@@ -459,18 +455,25 @@ async def run_backfill(
             schema={
                 "uuid": pl.Utf8,
                 "model": pl.Utf8,
-                "dim": pl.UInt16,
+                "dim": pl.Int32,
                 "embedding": pl.Array(pl.Float32, settings.output_dimension),
                 "embedded_at": pl.Datetime("us", "UTC"),
             },
         )
-        # Sharded write: drop a fresh ``part-<ts_ns>.parquet`` into the
-        # embeddings directory.  Legacy single-file caches still rewrite the
-        # whole file (handled inside ``write_part``) so existing installs
-        # keep working until they're migrated.
-        written_path = write_part(path, df)
+        lance_store.add_chunk(tbl, df)
         written += len(slice_)
-        logger.info("Checkpoint: {} rows -> {}", len(df), written_path)
+        chunks_since_optimize += 1
+        logger.info("Checkpoint: {} rows -> {}", len(df), settings.lance_uri)
+
+        # Compact periodically so fragment count stays bounded during long backfills.
+        if chunks_since_optimize >= 8:
+            lance_store.optimize_if_needed(tbl)
+            chunks_since_optimize = 0
+
+    # Final compaction + index ensure on the way out so the search command
+    # sees an up-to-date index without paying brute-force scan latency.
+    lance_store.optimize_if_needed(tbl)
+    lance_store.ensure_index(tbl, metric=settings.hnsw_metric)
 
     total_elapsed = time.monotonic() - total_t0
     logger.info(

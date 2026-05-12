@@ -21,9 +21,11 @@ drag extra modules into startup.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -273,17 +275,28 @@ def _apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection, settings: Settings) ->
     con.execute("SET preserve_insertion_order = false")
 
 
-def _open_connection_full(settings: Settings) -> duckdb.DuckDBPyConnection:
+def _open_connection_full(settings: Settings, *, sql: str = "") -> duckdb.DuckDBPyConnection:
     """Open an in-memory DuckDB connection with every claude-sql object wired.
 
     Tuning PRAGMAs are set before view registration so the registration
     queries themselves benefit from the higher thread count and the spill
     directory pointed at real disk (Amazon devboxes ship ``/tmp`` as a
     4 GB tmpfs that thrashes once a clustering run starts spilling).
+
+    When ``sql`` is provided we substring-scan it via :func:`_sql_uses_vss`
+    and skip ``register_vss`` (plus the ``semantic_search`` macro) when no
+    vector tokens appear -- the common ``query``/``explain`` path then
+    avoids the ``INSTALL vss; LOAD vss; ATTACH hnsw.duckdb`` round-trips
+    that otherwise dominate a cold start. The default ``sql=""`` keeps the
+    legacy behavior (register everything) for callers that don't know what
+    SQL is coming -- ``shell``, ``analyze`` stages, and the ``search``
+    command which builds its own VSS-bearing SQL after the connection is
+    already open.
     """
     con = duckdb.connect(":memory:")
     _apply_duckdb_pragmas(con, settings)
-    register_all(con, settings=settings)
+    skip_vss = bool(sql) and not _sql_uses_vss(sql)
+    register_all(con, settings=settings, skip_vss=skip_vss)
     return con
 
 
@@ -300,17 +313,69 @@ def _open_connection_introspect(settings: Settings) -> duckdb.DuckDBPyConnection
     return con
 
 
+def _refresh_analytics_views(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
+    """Re-register analytics views after a stage produced new parquet shards.
+
+    The analytics views (``message_clusters``, ``message_embeddings``, etc.)
+    are bound at :func:`register_all` time as ``read_parquet([list of
+    paths])`` -- the path list is captured then and frozen. New shards
+    written mid-run by ``embed`` (new ``embeddings/part-*.parquet``) or
+    ``cluster`` (a refreshed ``clusters.parquet``) are invisible until the
+    views are re-bound, which is what this helper does.
+
+    Pure DDL: re-runs :func:`register_analytics` against the same connection.
+    No ``v_raw_events`` rebuild, no VSS rebuild -- cheap relative to a fresh
+    :func:`_open_connection_full`, which is the whole point of the T1.3
+    shared-connection refactor.
+    """
+    from claude_sql.sql_views import register_analytics
+
+    register_analytics(con, settings=settings)
+
+
+# Tokens that imply a SQL statement needs the VSS extension and the
+# ``message_embeddings`` table. Substring-matched against the lower-cased SQL.
+# False positives (a literal like 'no message_embeddings here') just register
+# VSS unnecessarily -- no correctness regression. False negatives can't happen
+# without the user genuinely referencing one of these names in the SQL text.
+_VSS_TOKENS: tuple[str, ...] = (
+    "message_embeddings",
+    "semantic_search",
+    "array_cosine_",
+    "array_distance",
+)
+
+
+def _sql_uses_vss(sql: str) -> bool:
+    """Cheap pre-flight: does ``sql`` need VSS / ``message_embeddings``?
+
+    Used by :func:`_open_connection_full` to gate ``register_vss`` and the
+    ``semantic_search`` macro. Triggers on direct table/macro references
+    (``message_embeddings``, ``semantic_search``) and on the two array
+    distance functions the ``search`` command's hand-written SQL uses
+    (``array_cosine_*``, ``array_distance``).
+    """
+    lowered = sql.lower()
+    return any(tok in lowered for tok in _VSS_TOKENS)
+
+
 def _sql_uses_catalog(sql: str) -> bool:
     """Cheap pre-flight: does ``sql`` reference any registered view/macro?
 
-    Substring-matches against ``VIEW_NAMES + MACRO_NAMES`` (case-insensitive).
+    Substring-matches against ``VIEW_NAMES + MACRO_NAMES`` (case-insensitive)
+    and against :data:`_VSS_TOKENS` so a query like
+    ``SELECT count(*) FROM message_embeddings`` -- whose table is NOT in
+    :data:`VIEW_NAMES` because it lives inside the attached ``hnsw_store`` --
+    still routes to the full connection that registers VSS for it.
     False positives (a string literal containing ``'sessions'``) just trigger
-    the slow path — no correctness regression. False negatives can't happen
+    the slow path -- no correctness regression. False negatives can't happen
     if the user genuinely references a view: the name has to appear in the
     SQL text.
     """
     lowered = sql.lower()
-    return any(name.lower() in lowered for name in (*VIEW_NAMES, *MACRO_NAMES))
+    if any(name.lower() in lowered for name in (*VIEW_NAMES, *MACRO_NAMES)):
+        return True
+    return any(tok in lowered for tok in _VSS_TOKENS)
 
 
 def _emit_worker_result(result: int | dict, common: Common | None, pipeline: str) -> None:
@@ -341,13 +406,29 @@ _EXPLAIN_MARKERS: tuple[str, ...] = (
 
 
 def _describe_checkpoint_entry(path: Path) -> dict[str, object]:
-    """Report the persistent DuckDB checkpoint file alongside the parquet caches.
+    """Report the persistent SQLite checkpoint file alongside the parquet caches.
 
     Keeps the same ``{name, path, exists[, bytes, mtime, rows]}`` shape as
-    :func:`_describe_cache_entry` so ``list-cache`` stays homogeneous.  Row
-    count is queried via :func:`checkpointer.count_rows`.
+    :func:`_describe_cache_entry` so ``list-cache`` stays homogeneous. Row
+    count is queried via :func:`checkpointer.count_rows`, which transparently
+    migrates from the legacy DuckDB file at first read.
     """
     exists = path.exists() and path.is_file()
+    legacy_path = path.parent / "claude_sql.duckdb"
+    legacy_exists = legacy_path.exists() and legacy_path.is_file()
+
+    # When the SQLite file doesn't exist but the legacy DuckDB does, calling
+    # count_rows triggers a one-time migration (creating the SQLite file as a
+    # side effect). Run it eagerly so list-cache reflects the post-migration
+    # state in the same call.
+    if not exists and legacy_exists:
+        # Eagerly trigger the one-time migration so list-cache reflects the
+        # post-migration state. A corrupt or unreadable legacy file silently
+        # skips — the surrounding entry still reports exists/bytes correctly.
+        with contextlib.suppress(duckdb.Error, sqlite3.DatabaseError):
+            checkpointer.count_rows(path)
+        exists = path.exists() and path.is_file()
+
     entry: dict[str, object] = {"name": "session_checkpoint", "path": str(path), "exists": exists}
     if not exists:
         return entry
@@ -356,7 +437,41 @@ def _describe_checkpoint_entry(path: Path) -> dict[str, object]:
     entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
     try:
         entry["rows"] = checkpointer.count_rows(path)
-    except duckdb.Error:
+    except (duckdb.Error, sqlite3.DatabaseError):
+        # Corrupt or unreadable file — list-cache should still report exists/bytes.
+        entry["rows"] = None
+    return entry
+
+
+def _describe_lance_entry(path: Path) -> dict[str, object]:
+    """Report the LanceDB embeddings store alongside the parquet caches.
+
+    Same ``{name, path, exists[, bytes, mtime, rows]}`` shape as
+    :func:`_describe_cache_entry`. Row count comes from
+    :func:`lance_store.count_rows` (zero when the table is missing); ``bytes``
+    sums every file under the dataset directory and ``mtime`` is the deepest
+    nanosecond mtime across the tree (Lance writes new fragments, so the
+    deepest mtime tracks the data).
+    """
+    from claude_sql import lance_store
+
+    exists = path.exists() and path.is_dir()
+    entry: dict[str, object] = {"name": "embeddings_lance", "path": str(path), "exists": exists}
+    if not exists:
+        return entry
+    total_bytes = 0
+    latest_mtime = path.stat().st_mtime
+    for child in path.rglob("*"):
+        if child.is_file():
+            with contextlib.suppress(OSError):
+                st = child.stat()
+                total_bytes += st.st_size
+                latest_mtime = max(latest_mtime, st.st_mtime)
+    entry["bytes"] = total_bytes
+    entry["mtime"] = datetime.fromtimestamp(latest_mtime, tz=UTC).isoformat()
+    try:
+        entry["rows"] = lance_store.count_rows(path)
+    except (OSError, ValueError, RuntimeError):
         entry["rows"] = None
     return entry
 
@@ -565,7 +680,7 @@ def query(
     settings = _resolve_settings(common)
     fmt = _fmt(common)
     con = (
-        _open_connection_full(settings)
+        _open_connection_full(settings, sql=sql)
         if _sql_uses_catalog(sql)
         else _open_connection_introspect(settings)
     )
@@ -615,7 +730,7 @@ def explain(
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
     con = (
-        _open_connection_full(settings)
+        _open_connection_full(settings, sql=sql)
         if _sql_uses_catalog(sql)
         else _open_connection_introspect(settings)
     )
@@ -787,7 +902,8 @@ def list_cache(*, common: Common | None = None) -> None:
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
     entries = [
-        _describe_cache_entry("embeddings", settings.embeddings_parquet_path),
+        _describe_lance_entry(settings.lance_uri),
+        _describe_cache_entry("embeddings_legacy", settings.embeddings_parquet_path),
         _describe_cache_entry("session_classifications", settings.classifications_parquet_path),
         _describe_cache_entry("message_trajectory", settings.trajectory_parquet_path),
         _describe_cache_entry("session_conflicts", settings.conflicts_parquet_path),
@@ -1680,14 +1796,16 @@ def community(
             return
 
         if dry_run:
+            # The connection has ``message_embeddings`` registered as a view
+            # over the LanceDB dataset (ATTACH'd in register_vss). Query through
+            # the view rather than re-opening parquet shards directly.
             row = con.execute(
                 """
                 SELECT COUNT(DISTINCT m.session_id) AS candidate_sessions
-                  FROM read_parquet(?) e
+                  FROM message_embeddings e
                   JOIN messages m
                     ON CAST(m.uuid AS VARCHAR) = e.uuid
                 """,
-                [str(settings.embeddings_parquet_path)],
             ).fetchone()
             n = int(row[0]) if row else 0
             plan: dict[str, object] = {
@@ -1814,10 +1932,17 @@ def analyze(
             stats["builtins"],
         )
 
-    # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
-    if not skip_embed:
-        con = _open_connection_full(settings)
-        try:
+    # Open ONE shared DuckDB connection for every stage that needs the catalog.
+    # ``run_clustering`` reads parquet directly and is the only stage that
+    # doesn't take ``con``; everything else threads this single registered
+    # connection through. Stages that produce new parquet shards mid-run
+    # (embed -> embeddings/part-*.parquet; cluster -> clusters.parquet) call
+    # :func:`_refresh_analytics_views` afterwards so downstream stages see
+    # the freshly written data.
+    con = _open_connection_full(settings)
+    try:
+        # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
+        if not skip_embed:
             n = asyncio.run(
                 run_backfill(
                     con=con,
@@ -1828,46 +1953,40 @@ def analyze(
                 )
             )
             logger.info("analyze/embed: {} new embeddings (dry_run={})", n, dry_run)
-        finally:
-            con.close()
+            # New embeddings/part-*.parquet shards may have landed; re-bind
+            # the analytics views so cluster/terms/community see them.
+            _refresh_analytics_views(con, settings)
 
-    # 2. Cluster (reads embeddings parquet, writes clusters.parquet).  Non-LLM.
-    if not skip_cluster:
-        stats = run_clustering(settings, force=force_cluster)
-        logger.info(
-            "analyze/cluster: {} messages, {} clusters, {} noise",
-            stats["total"],
-            stats["clusters"],
-            stats["noise"],
-        )
-        con = _open_connection_full(settings)
-        try:
+        # 2. Cluster (reads embeddings parquet, writes clusters.parquet).  Non-LLM.
+        if not skip_cluster:
+            stats = run_clustering(settings, force=force_cluster)
+            logger.info(
+                "analyze/cluster: {} messages, {} clusters, {} noise",
+                stats["total"],
+                stats["clusters"],
+                stats["noise"],
+            )
+            # clusters.parquet just got rewritten -- re-bind so terms/community
+            # /classify/trajectory read the fresh cluster IDs.
+            _refresh_analytics_views(con, settings)
             tstats = run_terms(con, settings, force=force_cluster)
             logger.info(
                 "analyze/terms: {} clusters, {} term-rows",
                 tstats["clusters"],
                 tstats["terms"],
             )
-        finally:
-            con.close()
 
-    # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
-    if not skip_community:
-        con = _open_connection_full(settings)
-        try:
+        # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
+        if not skip_community:
             cstats = run_communities(con, settings, force=force_community)
             logger.info(
                 "analyze/community: {} sessions, {} communities",
                 cstats["sessions"],
                 cstats["communities"],
             )
-        finally:
-            con.close()
 
-    # 4. Session classification (LLM).
-    if not skip_classify:
-        con = _open_connection_full(settings)
-        try:
+        # 4. Session classification (LLM).
+        if not skip_classify:
             n = classify_sessions(
                 con,
                 settings,
@@ -1877,13 +1996,9 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/classify: {} sessions (dry_run={})", n, dry_run)
-        finally:
-            con.close()
 
-    # 5. Trajectory (LLM).
-    if not skip_trajectory:
-        con = _open_connection_full(settings)
-        try:
+        # 5. Trajectory (LLM).
+        if not skip_trajectory:
             n = trajectory_messages(
                 con,
                 settings,
@@ -1893,13 +2008,9 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/trajectory: {} messages (dry_run={})", n, dry_run)
-        finally:
-            con.close()
 
-    # 6. Conflicts (LLM, requires full session context).
-    if not skip_conflicts:
-        con = _open_connection_full(settings)
-        try:
+        # 6. Conflicts (LLM, requires full session context).
+        if not skip_conflicts:
             n = detect_conflicts(
                 con,
                 settings,
@@ -1909,13 +2020,9 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/conflicts: {} sessions (dry_run={})", n, dry_run)
-        finally:
-            con.close()
 
-    # 7. Friction (LLM, short-message scope).
-    if not skip_friction:
-        con = _open_connection_full(settings)
-        try:
+        # 7. Friction (LLM, short-message scope).
+        if not skip_friction:
             n = detect_user_friction(
                 con,
                 settings,
@@ -1925,8 +2032,8 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/friction: {} rows (dry_run={})", n, dry_run)
-        finally:
-            con.close()
+    finally:
+        con.close()
 
     logger.info("analyze: done")
 
