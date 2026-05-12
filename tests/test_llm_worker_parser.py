@@ -1,4 +1,4 @@
-"""Tests for :func:`claude_sql.llm_worker._parse_structured_payload`.
+"""Tests for :func:`claude_sql.llm_shared._parse_structured_payload`.
 
 The live Sonnet 4.6 structured-output shape has drifted across Bedrock
 releases; these exercises the four shapes we've seen in the wild so the
@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from claude_sql.llm_worker import BedrockRefusalError, _parse_structured_payload
+from claude_sql.llm_shared import BedrockRefusalError, _parse_structured_payload
 
 
 def test_parses_top_level_output_dict() -> None:

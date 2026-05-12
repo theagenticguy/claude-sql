@@ -50,12 +50,12 @@ import polars as pl
 from loguru import logger
 
 from claude_sql import checkpointer, retry_queue
-from claude_sql.llm_worker import (
+from claude_sql.llm_shared import (
     USER_FRICTION_SYSTEM_PROMPT,
     BedrockRefusalError,
     _build_bedrock_client,
-    _classify_one,
     _estimate_cost,
+    classify_one,
 )
 from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import USER_FRICTION_SCHEMA
@@ -547,7 +547,7 @@ async def _classify_async(
         t0 = time.monotonic()
         prompts = [_USER_PROMPT_TEMPLATE.format(text=text) for _, _, _, text in chunk]
         coros = [
-            _classify_one(
+            classify_one(
                 client,
                 settings.sonnet_model_id,
                 USER_FRICTION_SCHEMA,

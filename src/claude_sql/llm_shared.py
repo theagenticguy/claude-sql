@@ -1,21 +1,21 @@
-"""Bedrock Sonnet 4.6 classification worker.
+"""Shared Bedrock plumbing used by the per-stage LLM workers.
 
-Uses ``invoke_model`` with ``output_config.format`` (GA structured output) --
-NO ``tool_use`` / ``tool_choice`` machinery.  Pydantic v2 models in
-``schemas.py`` supply the flattened JSON Schema dicts.
+This module hosts the bits that every classifier pipeline needs:
 
-Three public pipelines
-----------------------
-classify_sessions(con, settings, *, since_days, limit, dry_run, no_thinking) -> int
-trajectory_messages(con, settings, *, since_days, limit, dry_run, no_thinking) -> int
-detect_conflicts(con, settings, *, since_days, limit, dry_run, no_thinking) -> int
+* Bedrock client construction and the retryable ``invoke_model`` wrapper.
+* The ``classify_one`` async helper that dispatches one structured-output
+  call under a concurrency limiter.
+* Per-pipeline cache-stat accumulator + ``pipeline_cache_stats`` context
+  manager that emits one INFO summary line on exit.
+* The four task-framing system prompts (classify / trajectory / conflicts /
+  user-friction) and a shared ``_CLASSIFIER_APPENDIX`` block.
+* Cost / pending-count helpers reused by ``classify_worker`` and
+  ``conflicts_worker`` for ``--dry-run`` plans.
 
-Each pipeline discovers unfinished rows (anti-join against its parquet),
-dispatches parallel Bedrock calls under a semaphore, and writes results in
-chunks of ``max(batch_size * 4, 256)`` for crash-resilience.
-
-Tenacity + botocore retry shape mirrors ``embed_worker._is_retryable`` exactly
-so throttling behaves the same.
+The four per-stage workers (``classify_worker``, ``trajectory_worker``,
+``conflicts_worker``, plus ``friction_worker`` and ``review_sheet_worker``)
+import from here. There are NO cross-imports between the stage workers
+themselves — every shared symbol lives here.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import threading
 import time
 from collections.abc import Iterator
@@ -35,7 +34,6 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import anyio.to_thread
 import boto3
-import polars as pl
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
     ClientError,
@@ -52,15 +50,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from claude_sql import checkpointer, retry_queue
 from claude_sql.logging_setup import loguru_before_sleep
-from claude_sql.parquet_shards import read_all, write_part
-from claude_sql.schemas import (
-    MESSAGE_TRAJECTORY_SCHEMA,
-    SESSION_CLASSIFICATION_SCHEMA,
-    SESSION_CONFLICTS_SCHEMA,
-)
-from claude_sql.session_text import iter_session_texts, session_bounds
 
 if TYPE_CHECKING:
     import duckdb
@@ -111,6 +101,20 @@ def cacheable_text_block(text: str, ttl: str = "5m") -> dict:
     return {"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}}
 
 
+def build_system_content_block(text: str, *, ttl: str = "1h") -> dict:
+    """Return the system-block dict carried in the Bedrock ``system`` field.
+
+    Same shape as :func:`cacheable_text_block` but defaults to ``ttl="1h"``
+    because system prompts are stable across an entire pipeline run — the
+    1h cache write costs 2× input but pays 0.1× per read for an hour,
+    which beats the 5m default for any backfill that runs end-to-end
+    inside the hour. Sonnet 4.5+ on Bedrock supports 1h via global CRIS
+    profiles on InvokeModel (verified against the Bedrock User Guide,
+    2026-05).
+    """
+    return {"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}}
+
+
 # ---------------------------------------------------------------------------
 # Per-pipeline cache-stat accumulator
 # ---------------------------------------------------------------------------
@@ -121,10 +125,10 @@ def cacheable_text_block(text: str, ttl: str = "5m") -> dict:
 # the system block + first cacheable content block actually translates
 # into a discount on the live corpus. See RFC §4.6 / §9.5.
 #
-# Threadsafe accumulation. ``_classify_one`` dispatches blocking
+# Threadsafe accumulation. ``classify_one`` dispatches blocking
 # ``invoke_model`` calls via ``anyio.to_thread.run_sync`` (per the
 # anyio-structured-concurrency lesson), so two worker threads can land
-# in ``_maybe_log_bedrock_call`` concurrently. We protect the dict with
+# in ``maybe_log_bedrock_call`` concurrently. We protect the dict with
 # a ``threading.Lock`` rather than an ``anyio.CapacityLimiter`` because:
 #
 # * A Lock is the right primitive for a critical section that mutates
@@ -155,7 +159,7 @@ def _empty_cache_stats() -> dict[str, int]:
     }
 
 
-def _extract_usage_metrics(payload: dict) -> dict[str, int]:
+def extract_usage_metrics(payload: dict) -> dict[str, int]:
     """Pull the six accumulator fields out of one Bedrock response.
 
     Handles both the legacy shape (``cache_creation_input_tokens`` only,
@@ -196,7 +200,7 @@ def _accumulate_cache_stats(pipeline: str, payload: dict) -> None:
     if not pipeline:
         return
     try:
-        metrics = _extract_usage_metrics(payload)
+        metrics = extract_usage_metrics(payload)
     except (TypeError, ValueError):
         # Malformed usage payload — accumulation is best-effort.
         return
@@ -262,7 +266,7 @@ def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
 
     On entry the per-pipeline bucket is reset so a previous (e.g.
     crashed) run can't leak into this one. Every Bedrock response goes
-    through ``_maybe_log_bedrock_call`` which feeds the accumulator. On
+    through ``maybe_log_bedrock_call`` which feeds the accumulator. On
     exit (success or exception) one summary line is emitted at INFO
     and the bucket is dropped from the registry.
 
@@ -278,7 +282,7 @@ def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
         pipeline_finalize(pipeline)
 
 
-def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
+def maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
     """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set
     and feed the per-pipeline cache-stat accumulator.
 
@@ -349,7 +353,7 @@ def _build_bedrock_client(settings: Settings) -> Any:
     still produce a fresh client with the right ``max_pool_connections``.
 
     Config choices (sources in docstrings of the retry decorator and
-    ``_maybe_log_bedrock_call``):
+    ``maybe_log_bedrock_call``):
 
     * ``max_pool_connections`` — botocore default is 10, which starves any
       concurrency >10. AWS's Bedrock scale guide recommends 50 for high
@@ -461,13 +465,7 @@ def _invoke_classifier_sync(
         # 1h is supported on Sonnet 4.5+ via global CRIS profiles on
         # InvokeModel (verified against the Bedrock User Guide,
         # 2026-05).
-        body["system"] = [
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            }
-        ]
+        body["system"] = [build_system_content_block(system, ttl="1h")]
     if thinking_mode == "adaptive":
         body["thinking"] = {"type": "adaptive"}
     t0 = time.monotonic()
@@ -479,7 +477,7 @@ def _invoke_classifier_sync(
     )
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     payload = json.loads(resp["body"].read())
-    _maybe_log_bedrock_call(
+    maybe_log_bedrock_call(
         pipeline=schema.get("title", "classifier") if isinstance(schema, dict) else "classifier",
         model_id=model_id,
         payload=payload,
@@ -557,7 +555,7 @@ def _parse_structured_payload(payload: dict) -> dict:
     raise RuntimeError(f"Unexpected response shape: {sorted(payload.keys())}")
 
 
-async def _classify_one(
+async def classify_one(
     client: Any,
     model_id: str,
     schema: dict,
@@ -1193,160 +1191,6 @@ def _estimate_cost(
     return (n_items * avg_in_tokens * in_rate + n_items * avg_out_tokens * out_rate) / 1_000_000
 
 
-# ---------------------------------------------------------------------------
-# Pipeline 1: session classification
-# ---------------------------------------------------------------------------
-
-
-async def _classify_sessions_async(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None,
-    limit: int | None,
-    thinking_mode: str,
-) -> int:
-    """Async implementation behind :func:`classify_sessions`."""
-    already: set[str] = set()
-    done_df = read_all(settings.classifications_parquet_path)
-    if done_df is not None and done_df.height > 0:
-        already = set(done_df["session_id"].to_list())
-
-    # Checkpoint skip: compare current (last_ts, mtime) against the last run.
-    bounds = session_bounds(con, since_days=since_days, limit=limit)
-    unchanged_pending, skipped = checkpointer.filter_unchanged(
-        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
-        pipeline="classify",
-        checkpoint_db_path=settings.checkpoint_db_path,
-    )
-    keep = set(unchanged_pending)
-
-    # Retry queue: pull pending retries first so they're re-enqueued into
-    # `keep` even when the checkpoint would otherwise skip them.
-    retry_ids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="classify"))
-    if retry_ids:
-        logger.info("classify: draining {} retry-queue entries", len(retry_ids))
-        keep |= retry_ids
-
-    pending: list[tuple[str, str]] = []
-    for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
-        if sid in already and sid not in retry_ids:
-            continue
-        if sid not in keep:
-            continue
-        pending.append((sid, text))
-
-    if not pending:
-        logger.info("classify: no pending sessions (skipped={} via checkpoint)", skipped)
-        return 0
-    if skipped:
-        logger.info("classify: skipped {} sessions via checkpoint", skipped)
-
-    client = _build_bedrock_client(settings)
-    sem = anyio.CapacityLimiter(settings.llm_concurrency)
-    chunk_size = max(settings.batch_size * 4, 256)
-    logger.info(
-        "classify: {} pending, model={}, thinking={}, concurrency={}, chunks of {}",
-        len(pending),
-        settings.sonnet_model_id,
-        thinking_mode,
-        settings.llm_concurrency,
-        chunk_size,
-    )
-
-    written = 0
-    for i in range(0, len(pending), chunk_size):
-        chunk = pending[i : i + chunk_size]
-        t0 = time.monotonic()
-        coros = [
-            _classify_one(
-                client,
-                settings.sonnet_model_id,
-                SESSION_CLASSIFICATION_SCHEMA,
-                text,
-                max_tokens=settings.classify_max_tokens,
-                thinking_mode=thinking_mode,
-                sem=sem,
-                system=CLASSIFY_SYSTEM_PROMPT,
-            )
-            for _, text in chunk
-        ]
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        elapsed = time.monotonic() - t0
-
-        now = datetime.now(UTC)
-        ok_rows: list[dict[str, Any]] = []
-        errors = 0
-        for (sid, _), res in zip(chunk, results, strict=True):
-            if isinstance(res, BaseException):
-                errors += 1
-                logger.warning("classify: {} failed (queued for retry): {}", sid, res)
-                retry_queue.enqueue(
-                    settings.checkpoint_db_path,
-                    pipeline="classify",
-                    unit_id=sid,
-                    error=str(res),
-                )
-                continue
-            res_dict: dict[str, Any] = res
-            ok_rows.append(
-                {
-                    "session_id": sid,
-                    "autonomy_tier": res_dict.get("autonomy_tier"),
-                    "work_category": res_dict.get("work_category"),
-                    "success": res_dict.get("success"),
-                    "goal": res_dict.get("goal"),
-                    "confidence": float(res_dict.get("confidence", 0.0)),
-                    "classified_at": now,
-                }
-            )
-
-        if ok_rows:
-            df = pl.DataFrame(
-                ok_rows,
-                schema={
-                    "session_id": pl.Utf8,
-                    "autonomy_tier": pl.Utf8,
-                    "work_category": pl.Utf8,
-                    "success": pl.Utf8,
-                    "goal": pl.Utf8,
-                    "confidence": pl.Float32,
-                    "classified_at": pl.Datetime("us", "UTC"),
-                },
-            )
-            write_part(settings.classifications_parquet_path, df)
-
-        # Checkpoint the sessions we just classified — at their CURRENT bounds,
-        # so a later re-run with no new messages is a no-op. Also clear those
-        # sessions from the retry queue.
-        if ok_rows:
-            ok_sids = [row["session_id"] for row in ok_rows]
-            checkpointer.mark_completed(
-                settings.checkpoint_db_path,
-                pipeline="classify",
-                rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
-            )
-            retry_queue.mark_done(
-                settings.checkpoint_db_path,
-                pipeline="classify",
-                unit_ids=ok_sids,
-            )
-
-        written += len(ok_rows)
-        logger.info(
-            "classify chunk {}/{}: {} ok, {} errors, {:.1f}s ({:.1f} sess/s)",
-            i // chunk_size + 1,
-            (len(pending) + chunk_size - 1) // chunk_size,
-            len(ok_rows),
-            errors,
-            elapsed,
-            len(ok_rows) / elapsed if elapsed > 0 else 0,
-        )
-
-    logger.info("classify: wrote {} total rows", written)
-    return written
-
-
 def _count_pending_sessions(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -1387,582 +1231,3 @@ def _count_pending_sessions(
     if limit is not None:
         total = min(total, int(limit))
     return total
-
-
-def classify_sessions(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
-    """Classify pending sessions and return count of successful classifications.
-
-    In ``--dry-run`` mode, returns a plan dict with keys ``{pipeline,
-    candidates, llm_calls, avg_input_tokens, avg_output_tokens,
-    estimated_cost_usd, model, thinking, since_days, limit}`` instead of the
-    row count, so the CLI can emit it as structured JSON.
-    """
-    thinking_mode = "disabled" if no_thinking else settings.classify_thinking
-
-    if dry_run:
-        already: set[str] = set()
-        done_df = read_all(settings.classifications_parquet_path)
-        if done_df is not None and done_df.height > 0:
-            already = set(done_df["session_id"].to_list())
-        pending_count = _count_pending_sessions(
-            con, already=already, since_days=since_days, limit=limit
-        )
-        # Back-of-envelope: avg 8K input tokens, 300 output per session.
-        cost = _estimate_cost(pending_count, 8000, 300, settings.sonnet_pricing)
-        logger.info(
-            "classify --dry-run: {} sessions pending.  Estimated cost ~${:.2f} "
-            "(thinking={}, model={})",
-            pending_count,
-            cost,
-            thinking_mode,
-            settings.sonnet_model_id,
-        )
-        return {
-            "pipeline": "classify",
-            "candidates": pending_count,
-            "llm_calls": pending_count,
-            "avg_input_tokens": 8000,
-            "avg_output_tokens": 300,
-            "estimated_cost_usd": round(cost, 4),
-            "model": settings.sonnet_model_id,
-            "thinking": thinking_mode,
-            "since_days": since_days,
-            "limit": limit,
-            "dry_run": True,
-        }
-
-    return asyncio.run(
-        _classify_sessions_async(
-            con,
-            settings,
-            since_days=since_days,
-            limit=limit,
-            thinking_mode=thinking_mode,
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline 2: message trajectory
-# ---------------------------------------------------------------------------
-
-# Cheap prefilter: short + starts with acknowledgement pattern -> is_transition, skip LLM.
-_TRANSITION_RE = re.compile(
-    r"^\s*(ok|okay|alright|now|let me|great[,!]?|sure|got it|sounds good|perfect|clean)\b",
-    re.IGNORECASE,
-)
-
-
-def _heuristic_trajectory(text: str) -> dict | None:
-    """Fast path -- return a result dict if confident, else None."""
-    if not text:
-        return None
-    if len(text) < 80 and _TRANSITION_RE.match(text):
-        return {"sentiment_delta": "neutral", "is_transition": True, "confidence": 0.9}
-    return None
-
-
-async def _trajectory_async(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None,
-    limit: int | None,
-    thinking_mode: str,
-) -> int:
-    """Async implementation behind :func:`trajectory_messages`."""
-    already: set[str] = set()
-    done_df = read_all(settings.trajectory_parquet_path)
-    if done_df is not None and done_df.height > 0:
-        already = set(done_df["uuid"].to_list())
-
-    # Session-level checkpoint: drop messages whose host session has not advanced
-    # since the last trajectory run. This cuts the per-message SQL down before
-    # the anti-join on uuid.
-    bounds = session_bounds(con, since_days=since_days, limit=limit)
-    unchanged_pending, skipped_sessions = checkpointer.filter_unchanged(
-        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
-        pipeline="trajectory",
-        checkpoint_db_path=settings.checkpoint_db_path,
-    )
-    active_sessions: set[str] = set(unchanged_pending)
-
-    # Retry queue: drain pending failed uuids into the `already`-bypass set
-    # so they get retried even though they landed in the parquet the first
-    # time they were attempted.
-    retry_uuids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="trajectory"))
-    if retry_uuids:
-        logger.info("trajectory: draining {} retry-queue entries", len(retry_uuids))
-        already -= retry_uuids
-
-    where = ["mt.text_content IS NOT NULL", "length(mt.text_content) >= 1"]
-    if since_days is not None:
-        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
-    if active_sessions:
-        where.append(
-            "CAST(mt.session_id AS VARCHAR) IN (SELECT unnest(?))",
-        )
-    sql = f"""
-        SELECT CAST(mt.uuid AS VARCHAR) AS uuid,
-               CAST(mt.session_id AS VARCHAR) AS sid,
-               mt.text_content
-          FROM messages_text mt
-         WHERE {" AND ".join(where)}
-         ORDER BY mt.ts
-    """
-    if limit is not None:
-        sql += f"\nLIMIT {int(limit)}"
-    params = [list(active_sessions)] if active_sessions else []
-    rows_raw = con.execute(sql, params).fetchall() if active_sessions or not bounds else []
-    rows = [(r[0], r[2]) for r in rows_raw if r[0] not in already]
-    session_for_uuid = {r[0]: r[1] for r in rows_raw if r[0] not in already}
-    if skipped_sessions:
-        logger.info(
-            "trajectory: skipped {} sessions via checkpoint",
-            skipped_sessions,
-        )
-    logger.info("trajectory: {} pending messages", len(rows))
-
-    if not rows:
-        logger.info("trajectory: wrote 0 total rows (nothing pending)")
-        return 0
-
-    heuristic_rows: list[dict[str, Any]] = []
-    llm_pending: list[tuple[str, str]] = []
-    now = datetime.now(UTC)
-    for uuid, text in rows:
-        fast = _heuristic_trajectory(text)
-        if fast is not None:
-            heuristic_rows.append({"uuid": uuid, **fast, "classified_at": now})
-        else:
-            llm_pending.append((uuid, text))
-
-    logger.info(
-        "trajectory: {} heuristic, {} LLM",
-        len(heuristic_rows),
-        len(llm_pending),
-    )
-
-    if heuristic_rows:
-        df = pl.DataFrame(
-            heuristic_rows,
-            schema={
-                "uuid": pl.Utf8,
-                "sentiment_delta": pl.Utf8,
-                "is_transition": pl.Boolean,
-                "confidence": pl.Float32,
-                "classified_at": pl.Datetime("us", "UTC"),
-            },
-        )
-        write_part(settings.trajectory_parquet_path, df)
-
-    processed_sessions: set[str] = set()
-    for row in heuristic_rows:
-        sid = session_for_uuid.get(row["uuid"])
-        if sid is not None:
-            processed_sessions.add(sid)
-
-    if not llm_pending:
-        if processed_sessions:
-            checkpointer.mark_completed(
-                settings.checkpoint_db_path,
-                pipeline="trajectory",
-                rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
-            )
-        logger.info("trajectory: wrote {} total rows", len(heuristic_rows))
-        return len(heuristic_rows)
-
-    client = _build_bedrock_client(settings)
-    sem = anyio.CapacityLimiter(settings.llm_concurrency)
-    chunk_size = max(settings.batch_size * 4, 256)
-    written = len(heuristic_rows)
-
-    for i in range(0, len(llm_pending), chunk_size):
-        chunk = llm_pending[i : i + chunk_size]
-        t0 = time.monotonic()
-        coros = [
-            _classify_one(
-                client,
-                settings.sonnet_model_id,
-                MESSAGE_TRAJECTORY_SCHEMA,
-                text,
-                max_tokens=settings.classify_max_tokens,
-                thinking_mode=thinking_mode,
-                sem=sem,
-                system=TRAJECTORY_SYSTEM_PROMPT,
-            )
-            for _, text in chunk
-        ]
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        now = datetime.now(UTC)
-
-        ok: list[dict[str, Any]] = []
-        ok_uuids: list[str] = []
-        refused_uuids: list[str] = []
-        errors = 0
-        for (uuid, _), res in zip(chunk, results, strict=True):
-            if isinstance(res, BedrockRefusalError):
-                # Terminal: Bedrock won't classify this body. Stamp a neutral
-                # placeholder so the session moves on and the retry queue
-                # doesn't cycle forever on the same refusal.
-                logger.info("trajectory: {} refused by Bedrock — marking neutral", uuid)
-                now = datetime.now(UTC)
-                ok.append(
-                    {
-                        "uuid": uuid,
-                        "sentiment_delta": "neutral",
-                        "is_transition": False,
-                        "confidence": 0.0,
-                        "classified_at": now,
-                    }
-                )
-                refused_uuids.append(uuid)
-                continue
-            if isinstance(res, BaseException):
-                errors += 1
-                logger.warning("trajectory: {} failed (queued for retry): {}", uuid, res)
-                retry_queue.enqueue(
-                    settings.checkpoint_db_path,
-                    pipeline="trajectory",
-                    unit_id=uuid,
-                    error=str(res),
-                )
-                continue
-            res_dict: dict[str, Any] = res
-            ok.append(
-                {
-                    "uuid": uuid,
-                    "sentiment_delta": res_dict.get("sentiment_delta"),
-                    "is_transition": bool(res_dict.get("is_transition", False)),
-                    "confidence": float(res_dict.get("confidence", 0.0)),
-                    "classified_at": now,
-                }
-            )
-            ok_uuids.append(uuid)
-            sid = session_for_uuid.get(uuid)
-            if sid is not None:
-                processed_sessions.add(sid)
-        if ok:
-            df = pl.DataFrame(
-                ok,
-                schema={
-                    "uuid": pl.Utf8,
-                    "sentiment_delta": pl.Utf8,
-                    "is_transition": pl.Boolean,
-                    "confidence": pl.Float32,
-                    "classified_at": pl.Datetime("us", "UTC"),
-                },
-            )
-            write_part(settings.trajectory_parquet_path, df)
-            # Clear retry queue for both successful uuids AND refusals we just
-            # neutralised — the refusal placeholder lives in the parquet now,
-            # so these uuids must not loop back through the queue.
-            done_uuids = ok_uuids + refused_uuids
-            if done_uuids:
-                retry_queue.mark_done(
-                    settings.checkpoint_db_path,
-                    pipeline="trajectory",
-                    unit_ids=done_uuids,
-                )
-            # Per-chunk checkpoint: stamp sessions we've fully processed so a
-            # mid-run crash doesn't lose the whole trajectory run.
-            chunk_sessions = {session_for_uuid[u] for u in ok_uuids if u in session_for_uuid}
-            if chunk_sessions:
-                checkpointer.mark_completed(
-                    settings.checkpoint_db_path,
-                    pipeline="trajectory",
-                    rows=[(sid, *bounds.get(sid, (None, None))) for sid in chunk_sessions],
-                )
-        written += len(ok)
-        logger.info(
-            "trajectory chunk {}/{}: {} ok, {} errors, {:.1f}s",
-            i // chunk_size + 1,
-            (len(llm_pending) + chunk_size - 1) // chunk_size,
-            len(ok),
-            errors,
-            time.monotonic() - t0,
-        )
-
-    if processed_sessions:
-        checkpointer.mark_completed(
-            settings.checkpoint_db_path,
-            pipeline="trajectory",
-            rows=[(sid, *bounds.get(sid, (None, None))) for sid in processed_sessions],
-        )
-    logger.info("trajectory: wrote {} total rows", written)
-    return written
-
-
-def trajectory_messages(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
-    """Per-message sentiment + transition classification.
-
-    In ``--dry-run`` mode returns a plan dict (see :func:`classify_sessions`).
-    """
-    thinking_mode = "disabled" if no_thinking else settings.trajectory_thinking
-    if dry_run:
-        where = ["mt.text_content IS NOT NULL"]
-        if since_days is not None:
-            where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
-        if limit is not None:
-            sql = (
-                f"SELECT least({int(limit)}, count(*)) "
-                f"FROM messages_text mt WHERE {' AND '.join(where)}"
-            )
-        else:
-            sql = f"SELECT count(*) FROM messages_text mt WHERE {' AND '.join(where)}"
-        row = con.execute(sql).fetchone()
-        n = int(row[0]) if row is not None else 0
-        # Roughly half survive heuristic pre-filter.
-        llm_n = n // 2
-        cost = _estimate_cost(llm_n, 500, 50, settings.sonnet_pricing)
-        logger.info(
-            "trajectory --dry-run: {} messages, estimated LLM cost ~${:.2f}",
-            n,
-            cost,
-        )
-        return {
-            "pipeline": "trajectory",
-            "candidates": n,
-            "llm_calls": llm_n,
-            "avg_input_tokens": 500,
-            "avg_output_tokens": 50,
-            "estimated_cost_usd": round(cost, 4),
-            "model": settings.sonnet_model_id,
-            "thinking": thinking_mode,
-            "since_days": since_days,
-            "limit": limit,
-            "dry_run": True,
-        }
-    return asyncio.run(
-        _trajectory_async(
-            con,
-            settings,
-            since_days=since_days,
-            limit=limit,
-            thinking_mode=thinking_mode,
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline 3: conflict detection
-# ---------------------------------------------------------------------------
-
-
-async def _conflicts_async(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None,
-    limit: int | None,
-    thinking_mode: str,
-) -> int:
-    """Async implementation behind :func:`detect_conflicts`."""
-    already: set[str] = set()
-    done_df = read_all(settings.conflicts_parquet_path)
-    if done_df is not None and done_df.height > 0:
-        already = set(done_df["session_id"].to_list())
-
-    bounds = session_bounds(con, since_days=since_days, limit=limit)
-    unchanged_pending, skipped = checkpointer.filter_unchanged(
-        ((sid, lt, mt) for sid, (lt, mt) in bounds.items()),
-        pipeline="conflicts",
-        checkpoint_db_path=settings.checkpoint_db_path,
-    )
-    keep = set(unchanged_pending)
-
-    retry_ids = set(retry_queue.drain(settings.checkpoint_db_path, pipeline="conflicts"))
-    if retry_ids:
-        logger.info("conflicts: draining {} retry-queue entries", len(retry_ids))
-        keep |= retry_ids
-
-    pending: list[tuple[str, str]] = []
-    for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
-        if sid in already and sid not in retry_ids:
-            continue
-        if sid not in keep:
-            continue
-        pending.append((sid, text))
-
-    if not pending:
-        logger.info("conflicts: no pending sessions (skipped={} via checkpoint)", skipped)
-        return 0
-    if skipped:
-        logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
-
-    client = _build_bedrock_client(settings)
-    sem = anyio.CapacityLimiter(settings.llm_concurrency)
-    chunk_size = max(settings.batch_size * 4, 256)
-    logger.info("conflicts: {} pending sessions", len(pending))
-
-    written = 0
-    for i in range(0, len(pending), chunk_size):
-        chunk = pending[i : i + chunk_size]
-        t0 = time.monotonic()
-        coros = [
-            _classify_one(
-                client,
-                settings.sonnet_model_id,
-                SESSION_CONFLICTS_SCHEMA,
-                text,
-                max_tokens=settings.classify_max_tokens,
-                thinking_mode=thinking_mode,
-                sem=sem,
-                system=CONFLICTS_SYSTEM_PROMPT,
-            )
-            for _, text in chunk
-        ]
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        now = datetime.now(UTC)
-
-        rows: list[dict[str, Any]] = []
-        errors = 0
-        for (sid, _), res in zip(chunk, results, strict=True):
-            if isinstance(res, BaseException):
-                errors += 1
-                logger.warning("conflicts: {} failed (queued for retry): {}", sid, res)
-                retry_queue.enqueue(
-                    settings.checkpoint_db_path,
-                    pipeline="conflicts",
-                    unit_id=sid,
-                    error=str(res),
-                )
-                continue
-            res_dict: dict[str, Any] = res
-            conflicts = res_dict.get("conflicts") or []
-            if not conflicts:
-                # Write a sentinel row so we don't re-classify this session.
-                rows.append(
-                    {
-                        "session_id": sid,
-                        "conflict_idx": 0,
-                        "stance_a": None,
-                        "stance_b": None,
-                        "resolution": None,
-                        "detected_at": now,
-                        "empty": True,
-                    }
-                )
-                continue
-            for idx, c in enumerate(conflicts):
-                rows.append(
-                    {
-                        "session_id": sid,
-                        "conflict_idx": idx,
-                        "stance_a": c.get("stance_a"),
-                        "stance_b": c.get("stance_b"),
-                        "resolution": c.get("resolution"),
-                        "detected_at": now,
-                        "empty": False,
-                    }
-                )
-        if rows:
-            df = pl.DataFrame(
-                rows,
-                schema={
-                    "session_id": pl.Utf8,
-                    "conflict_idx": pl.Int32,
-                    "stance_a": pl.Utf8,
-                    "stance_b": pl.Utf8,
-                    "resolution": pl.Utf8,
-                    "detected_at": pl.Datetime("us", "UTC"),
-                    "empty": pl.Boolean,
-                },
-            )
-            write_part(settings.conflicts_parquet_path, df)
-        ok_sids = {
-            sid
-            for (sid, _t), r in zip(chunk, results, strict=True)
-            if not isinstance(r, BaseException)
-        }
-        if ok_sids:
-            checkpointer.mark_completed(
-                settings.checkpoint_db_path,
-                pipeline="conflicts",
-                rows=[(sid, *bounds.get(sid, (None, None))) for sid in ok_sids],
-            )
-            retry_queue.mark_done(
-                settings.checkpoint_db_path,
-                pipeline="conflicts",
-                unit_ids=list(ok_sids),
-            )
-        written += len(ok_sids)
-        logger.info(
-            "conflicts chunk {}/{}: {} sessions processed, {} errors, {:.1f}s",
-            i // chunk_size + 1,
-            (len(pending) + chunk_size - 1) // chunk_size,
-            len(chunk) - errors,
-            errors,
-            time.monotonic() - t0,
-        )
-
-    logger.info("conflicts: processed {} sessions", written)
-    return written
-
-
-def detect_conflicts(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
-    """Detect stance conflicts per session and return count processed.
-
-    In ``--dry-run`` mode returns a plan dict (see :func:`classify_sessions`).
-    """
-    thinking_mode = "disabled" if no_thinking else settings.classify_thinking
-    if dry_run:
-        already: set[str] = set()
-        done_df = read_all(settings.conflicts_parquet_path)
-        if done_df is not None and done_df.height > 0:
-            already = set(done_df["session_id"].to_list())
-        pending_count = _count_pending_sessions(
-            con, already=already, since_days=since_days, limit=limit
-        )
-        cost = _estimate_cost(pending_count, 6000, 400, settings.sonnet_pricing)
-        logger.info(
-            "conflicts --dry-run: {} sessions, estimated cost ~${:.2f}",
-            pending_count,
-            cost,
-        )
-        return {
-            "pipeline": "conflicts",
-            "candidates": pending_count,
-            "llm_calls": pending_count,
-            "avg_input_tokens": 6000,
-            "avg_output_tokens": 400,
-            "estimated_cost_usd": round(cost, 4),
-            "model": settings.sonnet_model_id,
-            "thinking": thinking_mode,
-            "since_days": since_days,
-            "limit": limit,
-            "dry_run": True,
-        }
-    return asyncio.run(
-        _conflicts_async(
-            con,
-            settings,
-            since_days=since_days,
-            limit=limit,
-            thinking_mode=thinking_mode,
-        )
-    )

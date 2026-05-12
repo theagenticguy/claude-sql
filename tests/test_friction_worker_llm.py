@@ -26,7 +26,7 @@ import pytest
 
 from claude_sql import checkpointer, friction_worker, retry_queue
 from claude_sql.config import Settings
-from claude_sql.llm_worker import BedrockRefusalError
+from claude_sql.llm_shared import BedrockRefusalError
 from claude_sql.parquet_shards import read_all
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ def _patch_classify_one(
     *,
     response_factory: Callable[[str], Any],
 ) -> list[str]:
-    """Patch ``friction_worker._classify_one`` to capture inputs and return canned results.
+    """Patch ``friction_worker.classify_one`` to capture inputs and return canned results.
 
     The real function is async and runs under an ``anyio.CapacityLimiter``;
     the fake mirrors that surface so it can be awaited identically. Each
@@ -148,8 +148,8 @@ def _patch_classify_one(
             raise result
         return result
 
-    monkeypatch.setattr(friction_worker, "_classify_one", fake_classify_one)
-    # Don't actually open a boto3 client — the patched _classify_one ignores
+    monkeypatch.setattr(friction_worker, "classify_one", fake_classify_one)
+    # Don't actually open a boto3 client — the patched classify_one ignores
     # what we return, but the surrounding code still calls
     # _build_bedrock_client and would fail without AWS creds.
     monkeypatch.setattr(friction_worker, "_build_bedrock_client", lambda _settings: object())

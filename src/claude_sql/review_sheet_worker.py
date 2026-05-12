@@ -17,7 +17,7 @@ Pipeline shape
    (``<instructions>``, ``<context>``, ``<examples><example>``,
    ``<anti_patterns>``) that frames the task as "compress the bound
    transcript into a 1K-token PR review sheet."
-4. Call ``llm_worker._invoke_classifier_sync`` with
+4. Call ``llm_shared._invoke_classifier_sync`` with
    :data:`PR_REVIEW_SHEET_SCHEMA`. Adaptive thinking is on by default;
    ``no_thinking=True`` disables it.
 5. Return ``{"sheet": <PRReviewSheet dict>, "metadata": {...}}`` on
@@ -41,7 +41,7 @@ from urllib.parse import unquote, urlparse
 from loguru import logger
 
 from claude_sql.binding import resolve_commit_to_transcript
-from claude_sql.llm_worker import (
+from claude_sql.llm_shared import (
     BedrockRefusalError,
     _build_bedrock_client,
     _invoke_classifier_sync,

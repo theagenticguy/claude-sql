@@ -122,9 +122,9 @@ class _FakeBedrockClient:
 
 
 def test_llm_invoke_body_uses_user_friction_schema() -> None:
-    """The friction pipeline goes through llm_worker._invoke_classifier_sync
+    """The friction pipeline goes through llm_shared._invoke_classifier_sync
     with USER_FRICTION_SCHEMA; no tool_use, output_config.format only."""
-    from claude_sql import llm_worker
+    from claude_sql import llm_shared
 
     fake_payload = {
         "output": {
@@ -134,7 +134,7 @@ def test_llm_invoke_body_uses_user_friction_schema() -> None:
         }
     }
     fake = _FakeBedrockClient(fake_payload)
-    result = llm_worker._invoke_classifier_sync(
+    result = llm_shared._invoke_classifier_sync(
         fake,
         "global.anthropic.claude-sonnet-4-6",
         USER_FRICTION_SCHEMA,

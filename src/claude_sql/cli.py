@@ -53,6 +53,7 @@ from claude_sql import (
     skills_catalog as _skills_catalog,
     ungrounded_worker as _ungrounded_worker,
 )
+from claude_sql.classify_worker import classify_sessions
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import (
     ResolutionLevel,
@@ -60,6 +61,7 @@ from claude_sql.community_worker import (
     run_communities,
 )
 from claude_sql.config import Settings
+from claude_sql.conflicts_worker import detect_conflicts
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.friction_worker import detect_user_friction
 from claude_sql.home import claude_sql_home, recognized_legacy_caches
@@ -69,7 +71,6 @@ from claude_sql.ingest import (
     stamp_messages as _ingest_stamp_messages,
 )
 from claude_sql.install_source import format_version
-from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
 from claude_sql.output import (
     EXIT_CODES,
@@ -102,6 +103,7 @@ from claude_sql.sql_views import (
     register_vss,
 )
 from claude_sql.terms_worker import run_terms
+from claude_sql.trajectory_worker import trajectory_messages
 
 _APP_HELP = """\
 Zero-copy SQL + Cohere Embed v4 semantic search + Sonnet 4.6 analytics over

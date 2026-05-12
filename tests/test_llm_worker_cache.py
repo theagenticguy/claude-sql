@@ -25,12 +25,13 @@ from unittest.mock import MagicMock
 
 from loguru import logger as loguru_logger
 
-from claude_sql import llm_worker
-from claude_sql.llm_worker import (
+from claude_sql import llm_shared
+from claude_sql.llm_shared import (
     _accumulate_cache_stats,
-    _extract_usage_metrics,
     _invoke_classifier_sync,
     cacheable_text_block,
+    extract_usage_metrics,
+    maybe_log_bedrock_call,
     pipeline_cache_stats,
     pipeline_finalize,
 )
@@ -141,7 +142,7 @@ def test_extract_usage_metrics_handles_ephemeral_1h_subobject() -> None:
             },
         }
     }
-    metrics = _extract_usage_metrics(payload)
+    metrics = extract_usage_metrics(payload)
     assert metrics == {
         "calls": 1,
         "input_tokens": 50,
@@ -164,7 +165,7 @@ def test_extract_usage_metrics_falls_back_to_legacy_shape() -> None:
             "cache_creation_input_tokens": 750,
         }
     }
-    metrics = _extract_usage_metrics(payload)
+    metrics = extract_usage_metrics(payload)
     assert metrics["cache_creation_5m_input_tokens"] == 750
     assert metrics["cache_creation_1h_input_tokens"] == 0
     assert metrics["input_tokens"] == 100
@@ -173,7 +174,7 @@ def test_extract_usage_metrics_falls_back_to_legacy_shape() -> None:
 def test_extract_usage_metrics_handles_missing_usage() -> None:
     """A response with no ``usage`` key returns all-zero metrics with
     ``calls=1`` so the call still counts toward the total."""
-    metrics = _extract_usage_metrics({})
+    metrics = extract_usage_metrics({})
     assert metrics == {
         "calls": 1,
         "input_tokens": 0,
@@ -304,13 +305,13 @@ def test_pipeline_cache_stats_no_op_when_inactive() -> None:
 
 
 def test_maybe_log_bedrock_call_feeds_accumulator(monkeypatch) -> None:
-    """``_maybe_log_bedrock_call`` is the integration point — verify it
+    """``maybe_log_bedrock_call`` is the integration point — verify it
     feeds the accumulator even when ``CLAUDE_SQL_BEDROCK_TRACE`` is unset."""
-    monkeypatch.setattr(llm_worker, "_BEDROCK_TRACE_PATH", None)
+    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", None)
     buf, sink_id = _capture_loguru("INFO")
     try:
         with pipeline_cache_stats("integration"):
-            llm_worker._maybe_log_bedrock_call(
+            maybe_log_bedrock_call(
                 "integration",
                 "model-x",
                 {
