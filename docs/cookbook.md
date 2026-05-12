@@ -10,13 +10,33 @@ communities, classifications, trajectory, conflicts, friction) lives in
 Run any recipe as:
 
 ```bash
-claude-sql query "<SQL>"
+claude-sql query "{{SQL}}"
 ```
 
 First invocation takes tens of seconds because `register_all()` force-reads
 the full corpus for schema inference (`sample_size=-1`). Subsequent queries
 in the same process are fast. Drop into `claude-sql shell` if you want an
 interactive REPL with every view and macro pre-registered.
+
+### Placeholder convention
+
+Recipes that need a per-user value use **Mustache-style double braces** —
+`{{uuid}}`, `{{session_id}}`, `{{community_id}}`. Substitute the literal
+value (with surrounding quotes for strings) before running. Don't paste
+`{{...}}` into `claude-sql query` raw — DuckDB will treat it as a
+prepared-statement parameter and error out.
+
+### Cache home (v1.0+)
+
+Derived caches now live under a dedicated parent directory, **not**
+`~/.claude/`. Resolution order: `$CLAUDE_SQL_HOME` → `$XDG_DATA_HOME/claude-sql/`
+(Linux) → `~/Library/Application Support/claude-sql/` (macOS) →
+`~/.claude-sql/` (universal fallback). On first connect, claude-sql moves
+recognized caches (`embeddings_lance/`, `clusters.parquet`,
+`session_classifications/`, etc.) from `~/.claude/` into the new home —
+the migration is one-time idempotent. Paths in this cookbook reference
+the new home; under the previous default they sat alongside Claude Code's
+own state.
 
 All output shapes below are illustrative — they show column layout and
 expected row counts, not data from any specific user's corpus.
@@ -99,13 +119,13 @@ WITH RECURSIVE thread AS (
            session_id, 0 AS depth
     FROM messages
     WHERE parent_uuid IS NULL
-      AND session_id = '<your-session-id>'
+      AND session_id = '{{session_id}}'
     UNION ALL
     SELECT t.thread_root_uuid, m.uuid AS descendant_uuid,
            m.session_id, t.depth + 1 AS depth
     FROM thread t
     JOIN messages m ON m.parent_uuid = t.descendant_uuid
-    WHERE m.session_id = '<your-session-id>'
+    WHERE m.session_id = '{{session_id}}'
 )
 SELECT depth, count(*) AS n
 FROM thread
@@ -340,28 +360,36 @@ embeddings parquet doesn't exist yet:
 AWS_PROFILE=your-profile claude-sql embed --since-days 7
 ```
 
-`register_vss()` builds the HNSW index at connection open from
-`~/.claude/embeddings.parquet`. Until that parquet exists, the
-`message_embeddings` table is empty. `--since-days 7` is a cheap starter;
-ramp to `30` or `90` once you've confirmed the pipeline.
+`register_vss()` attaches the LanceDB embeddings store at connection
+open from `claude_sql_home()/embeddings_lance/` (typically
+`~/.claude-sql/embeddings_lance/`). Until that store has a populated
+`message_embeddings` table, the corresponding DuckDB view is empty.
+`--since-days 7` is a cheap starter; ramp to `30` or `90` once you've
+confirmed the pipeline.
 
-### 5.1 `claude-sql search "<query>" --k 5`
+### 5.1 `claude-sql search "{{query}}" --k 5`
 
 The CLI computes a query embedding via Cohere Embed v4 with
 `input_type=search_query`, then runs the shape below (equivalent SQL after
-the CLI binds the `FLOAT[1024]` query vector):
+the CLI binds the `FLOAT[1024]` query vector). The `WITH qv` seed is
+joined with **`CROSS JOIN`** rather than referenced via a correlated
+subquery — lancedb 0.30 fails the latter shape with `Catalog Error:
+Table Function with name __lance_table_scan does not exist!` because
+the planner pushes the subquery below the Lance scan. CROSS JOIN
+keeps the seed row in the outer plan where Lance can be materialised.
 
 ```sql
 WITH qv AS (SELECT CAST(? AS FLOAT[1024]) AS v)
 SELECT m.uuid,
        m.session_id,
        m.role,
-       array_cosine_similarity(me.embedding, (SELECT v FROM qv)) AS sim,
+       array_cosine_similarity(me.embedding, qv.v) AS sim,
        substr(mt.text_content, 1, 200) AS snippet
 FROM message_embeddings me
+CROSS JOIN qv
 JOIN messages m USING (uuid)
 LEFT JOIN messages_text mt ON mt.uuid = m.uuid
-ORDER BY array_distance(me.embedding, (SELECT v FROM qv))
+ORDER BY array_distance(me.embedding, qv.v)
 LIMIT ?;
 ```
 
@@ -380,19 +408,22 @@ claude-sql search "temporal workflow determinism" --k 10
 ### 5.2 Messages semantically similar to a known uuid
 
 Once embeddings exist, "find neighbors of message X" is a self-join on
-`message_embeddings` (no query-side embedding needed):
+`message_embeddings` (no query-side embedding needed). Same CROSS JOIN
+rule applies — the seed CTE must be joined, not subqueried, so the
+Lance scan binds:
 
 ```sql
 WITH seed AS (
     SELECT embedding AS v
     FROM message_embeddings
-    WHERE uuid = '<known-message-uuid>'
+    WHERE uuid = '{{uuid}}'
 )
 SELECT me.uuid,
-       array_cosine_similarity(me.embedding, (SELECT v FROM seed)) AS sim
+       array_cosine_similarity(me.embedding, seed.v) AS sim
 FROM message_embeddings me
-WHERE me.uuid <> '<known-message-uuid>'
-ORDER BY array_distance(me.embedding, (SELECT v FROM seed))
+CROSS JOIN seed
+WHERE me.uuid <> '{{uuid}}'
+ORDER BY array_distance(me.embedding, seed.v)
 LIMIT 10;
 ```
 
@@ -486,10 +517,99 @@ ORDER BY su.ts DESC
 LIMIT 10;
 ```
 
+## 7. v1.0 ingest stamps
+
+`ingest_stamps` is one row per `messages_text` row, populated by the
+`ingest` worker. Schema: `(uuid, session_id, approx_tokens, simhash64,
+token_budget_bucket, canonical_uuid, first_seen_ts, stamped_at)`.
+`approx_tokens` uses `tiktoken cl100k` × an Anthropic-billing scaling
+factor; `simhash64` is a signed-64-bit SimHash; `canonical_uuid` is
+filled by a follow-up DuckDB self-join that pairs rows whose simhashes
+differ by ≤3 bits (top-16-bit bucket gates the join).
+
+### 7.1 Find near-duplicate user messages across the corpus
+
+Rows whose `canonical_uuid` differs from `uuid` are the duplicates;
+the canonical row sits at `canonical_uuid = uuid`.
+
+```sql
+SELECT canonical_uuid, count(*) AS n_duplicates
+FROM ingest_stamps
+WHERE canonical_uuid IS NOT NULL
+  AND canonical_uuid != uuid
+GROUP BY canonical_uuid
+ORDER BY n_duplicates DESC
+LIMIT 20;
+```
+
+Pair with `canonical_uuid_resolve()` (the table macro) to materialise
+the same pairing without depending on the prior `resolve_canonicals`
+pass having stamped the parquet.
+
+### 7.2 Token-budget distribution
+
+`token_budget_bucket ∈ {xs, sm, md, lg, xl}` — `xs` ≤ 256, `sm` ≤ 2048,
+`md` ≤ 8192, `lg` ≤ 32768, `xl` everything above.
+
+```sql
+SELECT token_budget_bucket, count(*) AS n
+FROM ingest_stamps
+GROUP BY 1
+ORDER BY 1;
+```
+
+### 7.3 Largest sessions by Anthropic-billing tokens
+
+The headline corpus-cost cut: which sessions consumed the most tokens
+under the Anthropic-billing scaling.
+
+```sql
+SELECT session_id, sum(approx_tokens) AS total_tokens
+FROM ingest_stamps
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 10;
+```
+
+## 8. v1.0 turn_window
+
+`turn_window` is an adjacent-turn LAG window over `messages_text`,
+emitted by `sql_views.py`. Schema: `(session_id, prev_uuid, prev_role,
+prev_ts, curr_uuid, curr_role, curr_ts, gap_ms, window_idx)`. Compact-
+summary rows are filtered out so the LAG pointer never lands on a
+synthetic checkpoint. `gap_ms` is `NULL` on the first row of each
+session.
+
+### 8.1 Average gap_ms between adjacent turns per session
+
+```sql
+SELECT session_id, avg(gap_ms) AS avg_gap_ms
+FROM turn_window
+WHERE prev_uuid IS NOT NULL
+GROUP BY 1
+ORDER BY avg_gap_ms DESC NULLS LAST
+LIMIT 20;
+```
+
+### 8.2 Sessions with the longest pauses
+
+```sql
+SELECT session_id, max(gap_ms) AS max_gap_ms
+FROM turn_window
+WHERE prev_uuid IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 10;
+```
+
+A spike in `max(gap_ms)` is usually a session that got abandoned and
+resumed hours or days later. Pair with `friction_rate(30)` from the
+analytics cookbook — long pauses correlate weakly with frustration.
+
 ## Explain: prove the pushdown
 
 ```bash
-claude-sql explain "SELECT uuid, role FROM messages WHERE session_id = '<your-session-id>'"
+claude-sql explain "SELECT uuid, role FROM messages WHERE session_id = '{{session_id}}'"
 ```
 
 Green-highlighted markers worth confirming in the plan:
@@ -501,7 +621,7 @@ Green-highlighted markers worth confirming in the plan:
 
 Session-pinned queries still scan every file because `sessionId` is a
 *field* inside each JSONL, not a partition key. Add
-`AND source_file LIKE '%<session_id>.jsonl'` to let the filename filter
+`AND source_file LIKE '%{{session_id}}.jsonl'` to let the filename filter
 prune the scan to a single file.
 
 ## Performance tuning
@@ -514,8 +634,8 @@ through pydantic-settings with the `CLAUDE_SQL_` prefix.
 |---|---|---|
 | `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | Pin lower on a shared host or in CI. |
 | `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | Use an absolute size like `'4GB'` on shared hosts; percentage strings are resolved against host RAM at apply time. |
-| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | Point at faster / bigger storage if clustering spills. Avoid `/tmp` on Amazon devboxes — it's a 4 GB tmpfs. |
-| `CLAUDE_SQL_HNSW_DB_PATH` | `~/.claude/hnsw.duckdb` | Move the persistent HNSW store off `~/.claude/` if disk space is tight. |
+| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude-sql/duckdb_tmp` | Point at faster / bigger storage if clustering spills. Avoid `/tmp` on Amazon devboxes — it's a 4 GB tmpfs. |
+| `CLAUDE_SQL_LANCE_URI` | `~/.claude-sql/embeddings_lance` | Move the LanceDB embeddings store off `claude_sql_home()` if disk space is tight. |
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Drop to 2-4 if Bedrock starts throttling Cohere Embed v4 (rare on global CRIS). |
 | `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Bump to 4 cautiously for Sonnet 4.6; tenacity catches transient throttles. |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Higher captures more friction signals at higher Bedrock cost. |
@@ -523,11 +643,11 @@ through pydantic-settings with the `CLAUDE_SQL_` prefix.
 ### Profiling a slow query
 
 Add `--profile-json` to `query` or `explain` to drop a JSON timing tree
-under `~/.claude/profiling/`:
+under `claude_sql_home()/profiling/` (typically `~/.claude-sql/profiling/`):
 
 ```bash
 claude-sql query --profile-json "SELECT count(*) FROM messages_text"
-ls ~/.claude/profiling/
+ls ~/.claude-sql/profiling/
 # query-1738234567890.json
 ```
 
@@ -536,14 +656,18 @@ node — feed it back to an LLM or `jq` to find the dominant operator.
 
 ### Cache layout
 
-Five caches use the **sharded directory** layout (one
-`part-<ts_ns>.parquet` per worker chunk):
+All paths below are relative to `claude_sql_home()` — that's
+`~/.claude-sql/` on Linux without `XDG_DATA_HOME`,
+`~/Library/Application Support/claude-sql/` on macOS, or whatever
+`$CLAUDE_SQL_HOME` resolves to. Six caches use the **sharded directory**
+layout (one `part-<ts_ns>.parquet` per worker chunk):
 
-- `~/.claude/embeddings/`
-- `~/.claude/session_classifications/`
-- `~/.claude/message_trajectory/`
-- `~/.claude/session_conflicts/`
-- `~/.claude/user_friction/`
+- `embeddings/` — legacy parquet shards (rolled forward into LanceDB)
+- `session_classifications/`
+- `message_trajectory/`
+- `session_conflicts/`
+- `user_friction/`
+- `ingest_stamps/`
 
 Three remain single-file (written once per worker run, no sharding
 payoff): `clusters.parquet`, `cluster_terms.parquet`,

@@ -7,29 +7,45 @@ communities, classifications, trajectory, conflicts, friction — against
 Run any recipe as:
 
 ```bash
-claude-sql query "<SQL>"
+claude-sql query "{{SQL}}"
 ```
 
 First invocation takes roughly a minute because `register_all()`
 force-reads the full corpus for schema inference (`sample_size=-1`),
-rebuilds the HNSW index from `~/.claude/embeddings.parquet`, and
-materializes the analytics views.
+attaches the LanceDB embeddings store, and materializes the analytics
+views.
 
 **v1 recipes** (sessions, messages, tool_calls, todo_events, subagent_*,
 semantic search) live in [`cookbook.md`](cookbook.md). This file covers
 only the v2 additions.
 
+### Placeholder convention
+
+Recipes that need a per-user value use **Mustache-style double braces** —
+`{{uuid}}`, `{{session_id}}`, `{{community_id}}`. Substitute the literal
+value (with surrounding quotes for strings) before running. Do not paste
+`{{...}}` into `claude-sql query` raw — DuckDB will treat it as a
+prepared-statement parameter and error out.
+
 ## Which sections run today
+
+Caches live under `claude_sql_home()` — `$CLAUDE_SQL_HOME` overrides;
+otherwise `$XDG_DATA_HOME/claude-sql/` (Linux) /
+`~/Library/Application Support/claude-sql/` (macOS) / `~/.claude-sql/`
+(universal fallback). The migration from `~/.claude/` is one-time
+idempotent, so existing installs may still see the legacy parent on
+first run.
 
 | Section | Backing parquet | Prerequisite |
 |---|---|---|
-| 1. Clustering overview | `~/.claude/clusters.parquet` | `claude-sql cluster` |
-| 2. Cluster topic labels | `~/.claude/cluster_terms.parquet` | `claude-sql cluster` (auto-builds terms) |
-| 3. Community distribution | `~/.claude/session_communities.parquet` | `claude-sql community` |
-| 4. Classification analytics | `~/.claude/session_classifications.parquet` | `claude-sql classify --no-dry-run` |
-| 5. Trajectory + sentiment | `~/.claude/message_trajectory.parquet` | `claude-sql trajectory --no-dry-run` |
-| 6. Cost-of-classification estimate | (stderr only) | none |
-| 7. Full pipeline | n/a | none |
+| 1. Clustering overview | `clusters.parquet` | `claude-sql cluster` |
+| 2. Cluster topic labels | `cluster_terms.parquet` | `claude-sql cluster` (auto-builds terms) |
+| 3. Community distribution | `session_communities.parquet` | `claude-sql community` |
+| 4. Classification analytics | `session_classifications/` | `claude-sql classify --no-dry-run` |
+| 5. Trajectory + sentiment | `message_trajectory/` | `claude-sql trajectory --no-dry-run` |
+| 6. Conflicts | `session_conflicts/` | `claude-sql conflicts --no-dry-run` |
+| 7. Cost-of-classification estimate | (stderr only) | none |
+| 8. Full pipeline | n/a | none |
 
 Missing parquets don't crash the CLI — the matching view registers empty,
 warns once at connection open, and every query against it returns zero
@@ -137,7 +153,7 @@ fall into and show the top c-TF-IDF terms per cluster. That's what
 `community_top_topics(cid, n)` does:
 
 ```sql
-SELECT * FROM community_top_topics(<community_id>, 10);
+SELECT * FROM community_top_topics({{community_id}}, 10);
 ```
 
 Returns `cluster_id, n_msgs, top_terms` — read the `top_terms` column
@@ -195,35 +211,94 @@ the x-axis, count on y, colored by tier.
 
 ## 5. Trajectory + sentiment
 
-> **Requires `claude-sql trajectory --no-dry-run` first.** Each assistant
-> message gets a `sentiment_delta` (`positive` / `neutral` / `negative`)
-> and an `is_transition` boolean. The `sentiment_arc(sid)` macro joins
+> **Requires `claude-sql trajectory --no-dry-run` first.** v1.0 uses a
+> **windowed** schema: each row is a `(prev_uuid, curr_uuid)` pair that
+> reports the *transition* from the previous turn to the current turn.
+> Schema: `(session_id, prev_uuid, curr_uuid, prev_sentiment,
+> curr_sentiment, delta, is_transition, transition_kind, confidence,
+> classified_at)`. `delta` is the integer `(curr - prev)` polarity diff
+> in `{-2, -1, 0, 1, 2}` (`null` on the session-first window).
+> `transition_kind ∈ {frustration_spike, resolution, reset, drift,
+> clarification, none}`. The `sentiment_arc(sid)` macro joins
 > `message_trajectory` to `messages` ordered by time for a single
-> session.
+> session — its output columns are `(ts, role, curr_sentiment, delta,
+> transition_kind, is_transition, confidence)`.
+>
+> The `message_trajectory` view exposes `curr_sentiment AS sentiment`
+> as a back-compat alias so older recipes still bind, but new recipes
+> should target the canonical column names.
 
 ### 5.1 Per-session sentiment arc
 
 ```sql
-SELECT * FROM sentiment_arc('<session-id>');
+SELECT * FROM sentiment_arc('{{session_id}}');
 ```
 
-Returns `ts, role, sentiment_delta, is_transition, text` for the session
-timeline. Plot cumulative `sentiment_delta` against `ts` to see momentum.
+Returns `ts, role, curr_sentiment, delta, transition_kind, is_transition,
+confidence` for the session timeline. Plot cumulative `delta` against
+`ts` to see momentum; `transition_kind` colors the segments.
 
-### 5.2 Global sentiment-delta histogram
+For finer control without the macro — e.g. you want the prev/curr UUIDs
+and don't need the `messages` join — query the windowed shape directly:
 
 ```sql
-SELECT sentiment_delta, count(*)
+SELECT prev_uuid,
+       curr_uuid,
+       prev_sentiment,
+       curr_sentiment,
+       delta,
+       transition_kind,
+       is_transition,
+       confidence,
+       classified_at
 FROM message_trajectory
-GROUP BY 1
-ORDER BY 1;
+WHERE session_id = '{{session_id}}'
+ORDER BY classified_at;
 ```
 
-### 5.3 Filler fraction — share of assistant turns that are transitional
+### 5.2 Sessions where sentiment dropped sharply
 
-`is_transition` flags assistant messages that are pure status / handoff
-filler (e.g. "Now I'll check…", "Got it, moving on to…"). The ratio of
-transitions to substantive turns is a crude "autonomy fluency" signal.
+Sharp negative transitions: `delta < -0.5` only fires meaningfully on
+the integer encoding when the magnitude is ≥1. Pair with
+`is_transition` and the categorical `transition_kind` for an
+agent-actionable cut.
+
+```sql
+SELECT session_id,
+       count(*) FILTER (WHERE transition_kind = 'frustration_spike') AS spikes,
+       count(*) FILTER (WHERE transition_kind = 'reset')              AS resets,
+       min(delta)                                                     AS worst_delta
+FROM message_trajectory
+WHERE delta IS NOT NULL
+  AND delta <= -1
+  AND is_transition = false
+  AND transition_kind IN ('frustration_spike', 'reset')
+GROUP BY session_id
+ORDER BY spikes DESC, worst_delta ASC
+LIMIT 20;
+```
+
+### 5.3 Find frustration spikes across the corpus
+
+`transition_kind = 'frustration_spike'` is the load-bearing label for
+"things just got worse". The `is_transition = false` filter drops pure
+filler turns so the result is substantive negative pivots.
+
+```sql
+SELECT session_id, prev_uuid, curr_uuid, delta, confidence, classified_at
+FROM message_trajectory
+WHERE transition_kind = 'frustration_spike'
+  AND is_transition = false
+ORDER BY classified_at DESC
+LIMIT 25;
+```
+
+### 5.4 Filler fraction — share of turns that are transitional
+
+`is_transition` flags the *current* turn as pure status / handoff filler
+(e.g. "Now I'll check…", "Got it, moving on to…") regardless of the
+sentiment shape. The ratio of transitions to substantive windows is a
+crude "autonomy fluency" signal.
 
 ```sql
 SELECT is_transition, count(*)
@@ -231,7 +306,112 @@ FROM message_trajectory
 GROUP BY 1;
 ```
 
-## 6. Cost-of-classification estimate
+### 5.5 Global delta histogram
+
+`delta` is the integer encoding of `(curr - prev)` sentiment. Group on
+the integer for a clean five-bucket histogram (plus a NULL bucket for
+session-first windows).
+
+```sql
+SELECT delta, count(*) AS n
+FROM message_trajectory
+GROUP BY 1
+ORDER BY 1 NULLS FIRST;
+```
+
+## 6. Conflicts
+
+> **Requires `claude-sql conflicts --no-dry-run` first.** v1.0 stores
+> one row per conflicting *pair of turns*. Schema: `(session_id,
+> turn_a_uuid, turn_b_uuid, conflict_kind, severity, agent_position,
+> user_position, confidence, detected_at)`. The legacy
+> `(conflict_idx, stance_a, stance_b, resolution, empty)` shape is
+> gone — sessions with no conflicts simply have **zero rows** in
+> `session_conflicts`. The `conflicts_summary` view (registered
+> alongside `session_conflicts`) gives `(session_id, conflict_count)`
+> for any session that has at least one conflict.
+>
+> `conflict_kind ∈ {disagreement, correction, reversal, impasse}`.
+> `severity ∈ {low, medium, high}`.
+
+### 6.1 Conflict counts per session
+
+```sql
+SELECT session_id, conflict_count
+FROM conflicts_summary
+ORDER BY conflict_count DESC
+LIMIT 15;
+```
+
+### 6.2 No-conflict sessions
+
+Use a `LEFT JOIN` against `conflicts_summary` and filter on the missing
+row — the v1.0 surface no longer carries an `empty=true` sentinel.
+
+```sql
+SELECT s.session_id
+FROM sessions s
+LEFT JOIN conflicts_summary cs USING (session_id)
+WHERE cs.conflict_count IS NULL OR cs.conflict_count = 0
+ORDER BY s.started_at DESC
+LIMIT 25;
+```
+
+### 6.3 High-severity reversals across the corpus
+
+A `reversal` is the same party flipping their own earlier position
+("actually let's NOT do X"). High-severity ones are the most
+load-bearing rework signals.
+
+```sql
+SELECT session_id,
+       turn_a_uuid,
+       turn_b_uuid,
+       agent_position,
+       user_position,
+       confidence,
+       detected_at
+FROM session_conflicts
+WHERE conflict_kind = 'reversal'
+  AND severity = 'high'
+ORDER BY detected_at DESC
+LIMIT 20;
+```
+
+### 6.4 Sessions where the user disagreed with the agent and won
+
+`disagreement` (both sides hold a position) plus medium-or-high
+severity surfaces the cases where pushback was substantive enough to
+matter. Pair with `success` from `session_classifications` to see
+whether the disagreement landed on a successful outcome.
+
+```sql
+SELECT sc.session_id,
+       count(*)                AS disagreements,
+       max(sc.severity)        AS top_severity,
+       sk.success              AS outcome
+FROM session_conflicts sc
+LEFT JOIN session_classifications sk USING (session_id)
+WHERE sc.conflict_kind = 'disagreement'
+  AND sc.severity IN ('medium', 'high')
+GROUP BY sc.session_id, sk.success
+ORDER BY disagreements DESC
+LIMIT 20;
+```
+
+### 6.5 Distribution of conflict kinds and severities
+
+The two enums together summarize the corpus's conflict profile in one
+roll-up — useful as a "how much rework is happening" baseline.
+
+```sql
+SELECT conflict_kind, severity, count(*) AS n
+FROM session_conflicts
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+## 7. Cost-of-classification estimate
 
 Before running the real Sonnet 4.6 classifier, check the dry-run estimate
 (default mode for `claude-sql classify`):
@@ -264,7 +444,7 @@ message; `conflicts` assumes 6K input / 400 output per session;
 `friction` counts only user-role messages under
 `CLAUDE_SQL_FRICTION_MAX_CHARS` (default 300).
 
-## 7. Full pipeline
+## 8. Full pipeline
 
 `claude-sql analyze` orchestrates every v2 stage in dependency order:
 `embed → (cluster + community) → classify → trajectory → conflicts →
