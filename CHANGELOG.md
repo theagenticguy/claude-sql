@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Feat
+
+- lance-backed embeddings store + sqlite WAL checkpointer
+
 ## v0.6.0 (2026-05-11)
 
 ### Feat
