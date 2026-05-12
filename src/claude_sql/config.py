@@ -15,6 +15,8 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from claude_sql.home import claude_sql_home
+
 
 def _default_glob() -> str:
     # Top-level session transcripts only.  Subagent side-files live one level
@@ -35,7 +37,7 @@ def _default_embeddings_parquet() -> Path:
     # the live embeddings store is now LanceDB (see ``_default_lance_uri``).
     # The field name keeps the ``_parquet_path`` suffix so existing call sites
     # that hand the path to migrators / cache-list helpers stay stable.
-    return Path(os.path.expanduser("~/.claude/embeddings/"))
+    return claude_sql_home() / "embeddings"
 
 
 def _default_lance_uri() -> Path:
@@ -44,61 +46,68 @@ def _default_lance_uri() -> Path:
     Replaces the parquet-shards + ``hnsw.duckdb`` combo. Lance handles
     storage, versioning, and the IVF_HNSW_SQ index in one place.
     """
-    return Path(os.path.expanduser("~/.claude/embeddings_lance/"))
+    return claude_sql_home() / "embeddings_lance"
 
 
 def _default_classifications_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_classifications/"))
+    return claude_sql_home() / "session_classifications"
 
 
 def _default_trajectory_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/message_trajectory/"))
+    return claude_sql_home() / "message_trajectory"
 
 
 def _default_conflicts_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_conflicts/"))
+    return claude_sql_home() / "session_conflicts"
 
 
 def _default_clusters_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/clusters.parquet"))
+    return claude_sql_home() / "clusters.parquet"
 
 
 def _default_cluster_terms_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/cluster_terms.parquet"))
+    return claude_sql_home() / "cluster_terms.parquet"
 
 
 def _default_communities_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/session_communities.parquet"))
+    return claude_sql_home() / "session_communities.parquet"
 
 
 def _default_community_profile_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/community_profile.parquet"))
+    return claude_sql_home() / "community_profile.parquet"
 
 
 def _default_user_friction_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/user_friction/"))
+    return claude_sql_home() / "user_friction"
 
 
 def _default_skills_catalog_parquet() -> Path:
-    return Path(os.path.expanduser("~/.claude/skills_catalog.parquet"))
+    return claude_sql_home() / "skills_catalog.parquet"
 
 
 def _default_user_skills_dir() -> Path:
+    # Source-of-truth lives under ``~/.claude/skills`` (Claude Code owns it);
+    # claude-sql only reads from it.
     return Path(os.path.expanduser("~/.claude/skills"))
 
 
 def _default_plugins_cache_dir() -> Path:
+    # Same story — Claude Code maintains ``~/.claude/plugins/cache``; we read.
     return Path(os.path.expanduser("~/.claude/plugins/cache"))
 
 
 def _default_checkpoint_db() -> Path:
     # SQLite WAL state file. The legacy ``claude_sql.duckdb`` path is migrated
     # once on first open by ``checkpointer._migrate_from_duckdb_if_present``.
-    return Path(os.path.expanduser("~/.claude/state.db"))
+    return claude_sql_home() / "state.db"
 
 
 def _default_duckdb_temp_dir() -> Path:
-    return Path(os.path.expanduser("~/.claude/duckdb_tmp"))
+    return claude_sql_home() / "duckdb_tmp"
+
+
+def _default_ingest_stamps_parquet() -> Path:
+    return claude_sql_home() / "ingest_stamps"
 
 
 def _default_duckdb_threads() -> int:
@@ -265,6 +274,12 @@ class Settings(BaseSettings):
 
     #: Per-(session_id, pipeline) checkpoint DuckDB file. See ``checkpointer.py``.
     checkpoint_db_path: Path = Field(default_factory=_default_checkpoint_db)
+
+    #: Sharded parquet cache for ingest stamps (``approx_tokens`` / ``simhash64``
+    #: / future per-message metadata). Written by the ingest worker scheduled
+    #: in v1.x; reserved here so :func:`claude_sql_home` plumbing covers it
+    #: from day one and the field name doesn't churn when the worker lands.
+    ingest_stamps_parquet_path: Path = Field(default_factory=_default_ingest_stamps_parquet)
 
     # ------------------------------------------------------------------
     # v2: UMAP + HDBSCAN + Leiden hyperparameters

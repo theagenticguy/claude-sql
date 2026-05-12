@@ -25,6 +25,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -61,6 +62,7 @@ from claude_sql.community_worker import (
 from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.friction_worker import detect_user_friction
+from claude_sql.home import claude_sql_home, recognized_legacy_caches
 from claude_sql.install_source import format_version
 from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
@@ -258,6 +260,56 @@ def _resolve_memory_limit(limit: str) -> str:
     return f"{target_mib}MiB"
 
 
+_MIGRATION_MARKER = ".migration_complete"
+
+
+def _maybe_migrate_legacy_caches() -> None:
+    """One-time move of recognized caches from ``~/.claude/`` → ``CLAUDE_SQL_HOME``.
+
+    Runs at most once per ``CLAUDE_SQL_HOME`` directory: a sentinel file
+    (``.migration_complete``) in the home short-circuits subsequent calls.
+    Every move is wrapped in ``shutil.move`` and the whole loop is guarded
+    against ``OSError`` so a hostile filesystem (read-only mount, EACCES
+    on a single subtree) can't crash startup — we log a warning and the
+    user can rerun ``claude-sql`` later or migrate manually.
+
+    Idempotent. Safe to call from any subcommand entry point. The first
+    successful run stamps the marker; later runs are no-ops.
+    """
+    home = claude_sql_home()
+    marker = home / _MIGRATION_MARKER
+    if marker.exists():
+        return
+    legacy = recognized_legacy_caches()
+    # When the new home already holds caches (e.g. a fresh install on a
+    # box that never had the old layout) we still want to stamp the
+    # marker so we don't keep probing legacy on every invocation.
+    if not legacy:
+        try:
+            marker.touch()
+        except OSError as exc:
+            logger.warning("could not stamp migration marker at {}: {}", marker, exc)
+        return
+    try:
+        names = ", ".join(sorted(legacy))
+        logger.info("migrating claude-sql caches: ~/.claude/{{{}}} -> {}/", names, home)
+        for name, src in legacy.items():
+            dst = home / name
+            if dst.exists():
+                # Already populated under the new home — leave the legacy
+                # copy in place rather than overwriting; the user can
+                # reconcile manually if they care.
+                logger.warning("skipping migrate {}: destination {} already exists", src, dst)
+                continue
+            shutil.move(str(src), str(dst))
+        marker.touch()
+    except OSError as exc:
+        # Defensive: any IO error here aborts the migration but does NOT
+        # crash startup. The next invocation will retry from a clean
+        # state (marker not stamped → loop runs again).
+        logger.warning("legacy cache migration skipped: {}", exc)
+
+
 def _apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Set the tuning PRAGMAs both connection helpers share.
 
@@ -294,6 +346,7 @@ def _open_connection_full(settings: Settings, *, sql: str = "") -> duckdb.DuckDB
     command which builds its own VSS-bearing SQL after the connection is
     already open.
     """
+    _maybe_migrate_legacy_caches()
     con = duckdb.connect(":memory:")
     _apply_duckdb_pragmas(con, settings)
     skip_vss = bool(sql) and not _sql_uses_vss(sql)
@@ -309,6 +362,7 @@ def _open_connection_introspect(settings: Settings) -> duckdb.DuckDBPyConnection
     ``SELECT current_timestamp`` don't reference any view). Returning a
     bare connection avoids the ~25 s :func:`register_all` chain entirely.
     """
+    _maybe_migrate_legacy_caches()
     con = duckdb.connect(":memory:")
     _apply_duckdb_pragmas(con, settings)
     return con
@@ -639,7 +693,7 @@ def _profile_path_for(label: str) -> Path:
     (DuckDB writes the JSON itself; we just read it back to confirm the
     file landed and surface its location to the user).
     """
-    profiling_dir = Path(os.path.expanduser("~/.claude/profiling/"))
+    profiling_dir = claude_sql_home() / "profiling"
     profiling_dir.mkdir(parents=True, exist_ok=True)
     safe_label = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "profile"
     return profiling_dir / f"{safe_label}-{int(time.time() * 1000)}.json"
@@ -947,7 +1001,7 @@ def list_cache(*, common: Common | None = None) -> None:
     _configure(common)
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
-    entries = [
+    entries: list[dict[str, object]] = [
         _describe_lance_entry(settings.lance_uri),
         _describe_cache_entry("embeddings_legacy", settings.embeddings_parquet_path),
         _describe_cache_entry("session_classifications", settings.classifications_parquet_path),
@@ -959,8 +1013,25 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("community_profile", settings.community_profile_parquet_path),
         _describe_cache_entry("user_friction", settings.user_friction_parquet_path),
         _describe_cache_entry("skills_catalog", settings.skills_catalog_parquet_path),
+        _describe_cache_entry("ingest_stamps", settings.ingest_stamps_parquet_path),
         _describe_checkpoint_entry(settings.checkpoint_db_path),
     ]
+    # One-time deprecation breadcrumb: surface any caches that still live
+    # under the old ``~/.claude/`` root after the auto-migration ran. This
+    # is rare (auto-migration would have moved them) but possible if the
+    # marker file got stamped before a manual restore — flag it so the
+    # user can ``claude-sql cache migrate`` or move them by hand.
+    for name, legacy_path in recognized_legacy_caches().items():
+        entries.append(
+            {
+                "name": f"legacy:{name}",
+                "path": str(legacy_path),
+                "exists": True,
+                "bytes": None,
+                "mtime": None,
+                "rows": None,
+            }
+        )
 
     if fmt is OutputFormat.TABLE:
         df = pl.DataFrame(entries)
