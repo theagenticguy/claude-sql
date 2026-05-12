@@ -1,0 +1,48 @@
+name: Setup claude-sql
+description: >-
+  Install mise-managed toolchain (Python + uv pinned via mise.toml), restore
+  uv's package cache keyed on uv.lock, and sync dependencies. Replaces the
+  duplicated ``mise-action + uv sync`` block across every CI job.
+
+  Caller must run ``actions/checkout`` first — local composite actions
+  require the repo to already be checked out so action.yml is on disk.
+
+# Why this composite action and not ``astral-sh/setup-uv``?
+# ``mise`` is the source of truth for ``uv`` AND Python versions
+# (mise.toml). Using ``setup-uv`` separately would install a second uv
+# binary that may drift from the one mise pins. The cache step below
+# accomplishes the same speedup ``setup-uv`` advertises (key on
+# uv.lock, restore ~/.cache/uv across runs) without the dual-install
+# footgun.
+
+inputs:
+  cache-uv:
+    description: >-
+      Restore uv's download cache keyed on uv.lock. Default true; set to
+      "false" only for jobs where the cache restore would mask the
+      behavior under test (rare).
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@v4
+
+    # Restore uv's package cache (~/.cache/uv on Linux runners) keyed on
+    # uv.lock. uv re-uses the cache to skip re-downloading every wheel
+    # already seen on a prior run with the same lockfile. mise.toml +
+    # uv.lock pin the toolchain + dep set, so a hash of uv.lock alone
+    # uniquely identifies the cache contents we want.
+    - name: Restore uv package cache
+      if: ${{ inputs.cache-uv == 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          uv-${{ runner.os }}-
+
+    - name: uv sync
+      shell: bash
+      run: uv sync --locked --all-extras --all-groups
