@@ -2,11 +2,7 @@
 
 ### Feat
 
-- lance-backed embeddings store + sqlite WAL checkpointer
-
-### Fix
-
-- **checkpointer**: WAL-mode race on cold-start concurrent writers + CodeQL py/catch-base-exception
+- lance-backed embeddings store + sqlite WAL checkpointer (#37)
 
 ## v0.6.0 (2026-05-11)
 
