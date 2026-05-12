@@ -170,95 +170,237 @@ class SessionClassification(BaseModel):
 SESSION_CLASSIFICATION_SCHEMA: dict = _bedrock_schema(SessionClassification)
 
 
-class MessageTrajectory(BaseModel):
-    """Per-message sentiment + transition-filler flag.
+class TrajectoryWindow(BaseModel):
+    """One windowed turn-pair classification (RFC 0002 §3.4 / §4.1).
 
-    Applied only to messages that pass the cheap regex heuristic pre-filter.
-    Classification is on the message's standalone polarity — the model
-    sees just this one message, with no surrounding turns. The legacy
-    field name ``sentiment_delta`` is preserved for parquet compatibility,
-    but the semantics are absolute polarity, not "delta vs prior".
+    A *window* binds two adjacent text turns from one session — the
+    previous turn (``prev_uuid``) and the current turn (``curr_uuid``).
+    The very first window of a session has ``prev_uuid is None`` plus a
+    synthetic ``prev_sentiment``: this lets the parquet hold one row per
+    text-turn instead of one fewer than the turn count.
+
+    The model emits one such object per window; the array form
+    :class:`TrajectoryArrayResult` carries the per-chunk batch.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    sentiment_delta: Literal["positive", "neutral", "negative"] = Field(
+    prev_uuid: str | None = Field(
         ...,
         description=(
-            "Standalone emotional polarity of this single message — judged "
-            "from the message text alone, no surrounding context.  "
-            "'positive': excitement, approval, momentum, explicit thanks. "
-            "'neutral': factual, procedural, no affect (this is the "
-            "majority class for a coding session — use it aggressively). "
-            "'negative': frustration, pushback, blocked, explicit "
-            "correction. "
-            "When the cue is mild or ambiguous, prefer 'neutral'."
+            "UUID of the prior text turn in this session, or null for the "
+            "session-first window. The host pipeline echoes (prev_uuid, "
+            "curr_uuid) back to verify per-window completeness."
+        ),
+    )
+    curr_uuid: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "UUID of the current text turn — the window's anchor. Must "
+            "match exactly one of the curr_uuid values supplied in the "
+            "<window> XML payload."
+        ),
+    )
+    prev_sentiment: Literal["negative", "neutral", "positive"] | None = Field(
+        ...,
+        description=(
+            "Polarity of the prior turn (or null on session-first). "
+            "'negative' = frustration / pushback / blocked. 'neutral' = "
+            "factual / procedural / acknowledgement (majority class). "
+            "'positive' = excitement / approval / momentum."
+        ),
+    )
+    curr_sentiment: Literal["negative", "neutral", "positive"] = Field(
+        ...,
+        description="Polarity of the current turn — same three labels as prev_sentiment.",
+    )
+    delta: float | None = Field(
+        ...,
+        description=(
+            "curr_sentiment - prev_sentiment encoded as integer in "
+            "{-2,-1,0,1,2} (negative=-1, neutral=0, positive=1, then "
+            "subtract). null when prev is null. The ``delta`` field is the "
+            "load-bearing signal for downstream sentiment-arc analytics."
         ),
     )
     is_transition: bool = Field(
         ...,
         description=(
-            "True if this message is pure transition/filler (e.g. 'Ok now let me check that', "
-            "'Running the tests', 'Clean.').  Use True for acknowledgement-only messages that "
-            "don't carry substantive content."
+            "True when the *current* turn is pure filler / acknowledgement "
+            "with no substantive content (e.g. 'ok let me check', "
+            "'running...', 'done.'). Independent of prev_sentiment."
+        ),
+    )
+    transition_kind: Literal[
+        "frustration_spike",
+        "resolution",
+        "reset",
+        "drift",
+        "clarification",
+        "none",
+    ] = Field(
+        ...,
+        description=(
+            "Categorical label for the shape of the prev→curr transition. "
+            "'frustration_spike' = neutral/positive → negative. "
+            "'resolution' = negative → neutral/positive (problem fixed). "
+            "'reset' = abrupt topic change unrelated to prev. "
+            "'drift' = same polarity but new sub-topic. "
+            "'clarification' = curr restates / refines prev's substance. "
+            "'none' = no salient transition (the majority class — use it)."
         ),
     )
     confidence: float = Field(
         ...,
         ge=0.0,
         le=1.0,
-        description="Classifier self-confidence 0.0-1.0.",
-    )
-
-
-MESSAGE_TRAJECTORY_SCHEMA: dict = _bedrock_schema(MessageTrajectory)
-
-
-class Conflict(BaseModel):
-    """A single stance conflict within a session."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    stance_a: str = Field(
-        ...,
-        min_length=1,
-        max_length=280,
-        description="One-sentence summary of the first stance.",
-    )
-    stance_b: str = Field(
-        ...,
-        min_length=1,
-        max_length=280,
-        description="One-sentence summary of the conflicting stance.",
-    )
-    resolution: Literal["resolved", "unresolved", "abandoned"] = Field(
-        ...,
         description=(
-            "How the conflict ended.  "
-            "'resolved': the session converged on one stance. "
-            "'unresolved': both stances were still live at end of session. "
-            "'abandoned': the topic was dropped without resolution."
+            "Classifier self-confidence 0.0-1.0. Use <0.5 when the cue is "
+            "ambiguous or the prev/curr polarities are both neutral with "
+            "no visible salience."
         ),
     )
 
 
-class SessionConflicts(BaseModel):
-    """All stance conflicts detected in a session.  Empty list if none found."""
+class TrajectoryArrayResult(BaseModel):
+    """Sonnet returns this — the array of windows for one chunk.
+
+    The host pipeline verifies completeness by echoing the
+    (prev_uuid, curr_uuid) tuples in the request payload back against
+    the returned ``windows``. Missing windows trigger one bounded retry;
+    persistent misses are stamped with neutral placeholders so the
+    pipeline never wedges on a single refused chunk.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    conflicts: list[Conflict] = Field(
+    windows: list[TrajectoryWindow] = Field(
+        ...,
+        description=(
+            "One TrajectoryWindow per (prev_uuid, curr_uuid) supplied in "
+            "the request. Order should match the input window order; the "
+            "host pipeline does not rely on order but ordered output is "
+            "easier for an auditor to skim."
+        ),
+    )
+
+
+TRAJECTORY_ARRAY_SCHEMA: dict = _bedrock_schema(TrajectoryArrayResult)
+
+
+class ConflictPair(BaseModel):
+    """A single stance-conflict pair, keyed on the two opposing turn UUIDs.
+
+    The v1.0 storage shape is pair-keyed on ``(turn_a_uuid, turn_b_uuid)``.
+    The pair-scanner that emits one row per *adjacent turn pair* is RFC §4.2
+    work scheduled for v1.1; for v1.0 the whole-session prompt still runs
+    but it must now name the two specific turns whose stances clash.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn_a_uuid: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "UUID of the first turn that holds stance A.  Pull from the "
+            "``[uuid=...]`` headers in the bound transcript -- copy verbatim, "
+            "do NOT invent or paraphrase.  Together with ``turn_b_uuid`` this "
+            "is the natural key of a conflict row."
+        ),
+    )
+    turn_b_uuid: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "UUID of the second turn that holds the opposing stance.  Same "
+            "rules as ``turn_a_uuid`` -- copy verbatim from the transcript "
+            "headers.  Must differ from ``turn_a_uuid``."
+        ),
+    )
+    conflict_kind: Literal["disagreement", "correction", "reversal", "impasse"] = Field(
+        ...,
+        description=(
+            "Shape of the conflict.  "
+            "'disagreement': two parties hold opposing positions and discuss them. "
+            "'correction': one party explicitly tells the other their answer/action "
+            "was wrong (e.g. 'no, not that, do X instead'). "
+            "'reversal': the same party flips their own earlier position "
+            "('actually let's NOT do X'). "
+            "'impasse': both sides restate their positions without converging "
+            "and the topic stalls."
+        ),
+    )
+    severity: Literal["low", "medium", "high"] = Field(
+        ...,
+        description=(
+            "How consequential the conflict is for the session outcome.  "
+            "'low': a minor course nudge with little downstream impact. "
+            "'medium': changes the implementation approach or scope but stays "
+            "inside the original goal. "
+            "'high': blocks progress, reverses a major decision, or "
+            "fundamentally changes the goal."
+        ),
+    )
+    agent_position: str = Field(
+        ...,
+        min_length=1,
+        max_length=280,
+        description=(
+            "One-sentence summary of the agent's stance in this conflict, "
+            "phrased in the agent's own framing.  Strip pleasantries; keep "
+            "the substantive claim."
+        ),
+    )
+    user_position: str = Field(
+        ...,
+        min_length=1,
+        max_length=280,
+        description=(
+            "One-sentence summary of the user's stance, phrased the way the "
+            "user phrased it.  Same length budget as ``agent_position``."
+        ),
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Classifier self-confidence 0.0-1.0 that this is a real, "
+            "substantive conflict (not deliberation, not collaboration, not "
+            "an accepted-risk caveat).  Use <0.5 for borderline cases."
+        ),
+    )
+
+
+class ConflictsResult(BaseModel):
+    """Sonnet's response: zero or more conflict pairs.
+
+    An empty list is valid and common.  When the model returns an empty
+    list the worker writes ZERO rows for that session -- the legacy
+    ``empty=True`` sentinel row is gone.  Sessions with no conflicts simply
+    don't appear in ``session_conflicts`` (or in the derived
+    ``conflicts_summary`` view).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conflicts: list[ConflictPair] = Field(
         default_factory=list,
         description=(
-            "Zero or more stance conflicts.  A conflict is a pair of mutually-exclusive "
-            "positions on the same question that surface during the session.  Report "
-            "only substantive technical or strategic conflicts -- skip trivial style "
+            "Zero or more stance-conflict pairs.  Each entry names the two "
+            "turn UUIDs whose stances clash, the kind/severity, both party "
+            "positions, and a confidence score.  Report only substantive "
+            "technical or strategic conflicts -- skip trivial style "
             "disagreements."
         ),
     )
 
 
-SESSION_CONFLICTS_SCHEMA: dict = _bedrock_schema(SessionConflicts)
+SESSION_CONFLICTS_SCHEMA: dict = _bedrock_schema(ConflictsResult)
 
 
 class UserFrictionSignal(BaseModel):
@@ -439,16 +581,17 @@ PR_REVIEW_SHEET_SCHEMA: dict = _bedrock_schema(PRReviewSheet)
 
 
 __all__ = [
-    "MESSAGE_TRAJECTORY_SCHEMA",
     "PR_REVIEW_SHEET_SCHEMA",
     "SESSION_CLASSIFICATION_SCHEMA",
     "SESSION_CONFLICTS_SCHEMA",
+    "TRAJECTORY_ARRAY_SCHEMA",
     "USER_FRICTION_SCHEMA",
-    "Conflict",
+    "ConflictPair",
+    "ConflictsResult",
     "Correction",
-    "MessageTrajectory",
     "PRReviewSheet",
     "SessionClassification",
-    "SessionConflicts",
+    "TrajectoryArrayResult",
+    "TrajectoryWindow",
     "UserFrictionSignal",
 ]

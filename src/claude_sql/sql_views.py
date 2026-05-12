@@ -82,6 +82,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "session_goals",
     "message_trajectory",
     "session_conflicts",
+    "conflicts_summary",
     "message_clusters",
     "cluster_terms",
     "session_communities",
@@ -306,6 +307,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "session_goals",
     "message_trajectory",
     "session_conflicts",
+    "conflicts_summary",
     "message_clusters",
     "cluster_terms",
     "session_communities",
@@ -1508,16 +1510,30 @@ def register_macros(
             );
             """,
         ),
-        # Sentiment arc for a single session: per-message (ts, role,
-        # delta, transition flag, confidence) in chronological order.
+        # Sentiment arc for a single session: per-window (ts, role,
+        # current-turn sentiment, numeric delta, transition_kind, filler
+        # flag, confidence) in chronological order.
+        #
+        # v1.0 windowed rewrite (RFC 0002 §3.4): the macro now joins on
+        # ``mt.curr_uuid`` (the per-window anchor turn) instead of the
+        # pre-rewrite per-message ``mt.uuid`` column. Output columns are
+        # ``(ts, role, curr_sentiment, delta, transition_kind,
+        # is_transition, confidence)`` — ``sentiment_delta`` (the old
+        # column name) is gone.
         (
             "sentiment_arc",
             """
             CREATE OR REPLACE MACRO sentiment_arc(sid) AS TABLE (
-                SELECT m.ts, m.role, mt.sentiment_delta, mt.is_transition, mt.confidence
+                SELECT m.ts,
+                       m.role,
+                       mt.curr_sentiment,
+                       mt.delta,
+                       mt.transition_kind,
+                       mt.is_transition,
+                       mt.confidence
                   FROM messages m
                   JOIN message_trajectory mt
-                    ON CAST(m.uuid AS VARCHAR) = mt.uuid
+                    ON CAST(m.uuid AS VARCHAR) = mt.curr_uuid
                  WHERE CAST(m.session_id AS VARCHAR) = sid
                  ORDER BY m.ts
             );
@@ -1901,8 +1917,20 @@ def register_analytics(
         "session_classifications": (
             "*, autonomy_tier AS autonomy, success AS success_outcome, work_category AS category"
         ),
-        "message_trajectory": ("*, sentiment_delta AS sentiment, is_transition AS transition"),
-        "session_conflicts": ("*, resolution AS conflict_resolution"),
+        # v1.0 windowed shape: ``(session_id, prev_uuid, curr_uuid,
+        # prev_sentiment, curr_sentiment, delta, is_transition,
+        # transition_kind, confidence, classified_at)``. The legacy
+        # ``sentiment_delta`` alias is gone — see RFC 0002 §3.4.
+        # ``sentiment`` is kept as a convenience alias for the *current*
+        # turn's polarity (the load-bearing one for sentiment-arc plots).
+        "message_trajectory": "*, curr_sentiment AS sentiment, is_transition AS transition",
+        # v1.0 pair-keyed shape: ``(session_id, turn_a_uuid, turn_b_uuid,
+        # conflict_kind, severity, agent_position, user_position,
+        # confidence, detected_at)``.  Sessions with no conflicts produce
+        # zero rows -- the legacy ``empty=True`` sentinel is gone, and
+        # the legacy ``resolution AS conflict_resolution`` alias with it
+        # (RFC 0002 §3.4).
+        "session_conflicts": None,
     }
 
     registered: set[str] = set()
@@ -1930,7 +1958,32 @@ def register_analytics(
             )
             logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)
-        except duckdb.Error:
+        except duckdb.Error as exc:
+            # Curated projection failed — most commonly because the on-disk
+            # parquet predates a schema rewrite (e.g. v1.0 trajectory rip-
+            # and-replace) and the column the projection aliases against
+            # doesn't exist yet. Fall back to bare ``SELECT *`` so the
+            # legacy view binds for read-only inspection; the next worker
+            # run purges the stale shards and the curated projection
+            # comes back on the following ``register_analytics``.
+            if projection != "*":
+                try:
+                    con.execute(
+                        f"CREATE OR REPLACE VIEW {view_name} AS "
+                        f"SELECT * FROM read_parquet([{path_literals}]);"
+                    )
+                    logger.warning(
+                        "register_analytics: {} bound with fallback SELECT * "
+                        "(legacy schema detected at {}; run the matching worker "
+                        "to refresh): {}",
+                        view_name,
+                        path,
+                        exc,
+                    )
+                    registered.add(view_name)
+                    continue
+                except duckdb.Error:
+                    pass
             logger.exception("Failed to register analytics view {} from {}", view_name, path)
 
     # ``session_goals`` is a thin projection of ``session_classifications``;
@@ -1947,6 +2000,26 @@ def register_analytics(
             logger.debug("Registered analytics view: session_goals")
         except duckdb.Error:
             logger.exception("Failed to register session_goals view")
+
+    # ``conflicts_summary`` is the v1.0 replacement for the old
+    # ``empty=True`` sentinel scheme.  Sessions with zero conflict rows
+    # in ``session_conflicts`` simply do not appear here -- callers that
+    # want every session in the result set must LEFT JOIN this view onto
+    # ``sessions`` and coalesce the missing count to 0.  See RFC 0002
+    # §3.4 for the rationale.
+    if "session_conflicts" in registered:
+        try:
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW conflicts_summary AS
+                SELECT session_id, count(*) AS conflict_count
+                FROM session_conflicts
+                GROUP BY session_id;
+                """
+            )
+            logger.debug("Registered analytics view: conflicts_summary")
+        except duckdb.Error:
+            logger.exception("Failed to register conflicts_summary view")
 
     # ``skill_usage`` joins ``skill_invocations`` (always-on) against the
     # catalog for human-readable labels + ``is_builtin`` tagging.  When the

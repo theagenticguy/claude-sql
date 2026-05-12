@@ -350,6 +350,59 @@ for the lesson capturing this; the cyclonedx-py flag-shape fix is in
 - Adaptive thinking stays on. `citations` is the only feature incompatible
   with structured output — do not add it.
 
+## Trajectory classifier (`trajectory_worker.py`) — windowed v1.0
+
+The v1.0 trajectory pipeline (RFC 0002 §3.4 / §4.1) is **per-session
+windowed**, not per-message. Each text turn produces one row keyed on
+`(prev_uuid, curr_uuid)`; the session-first turn gets a synthetic pair
+with `prev_uuid IS NULL`. Sonnet 4.6 sees up to 16 windows per chunk in
+one structured-output call (`TrajectoryArrayResult` schema in
+`schemas.py`) — sessions longer than 16 text turns split into
+anchor-sharing chunks where chunk N's last `curr_uuid` equals chunk N+1's
+first `prev_uuid`. The host pipeline echoes `(prev_uuid, curr_uuid)`
+tuples back from the response and runs ONE bounded retry of just the
+missing windows; persistent misses become neutral placeholder rows so a
+single refusing chunk never wedges the pipeline. The output parquet
+schema is `(session_id, prev_uuid, curr_uuid, prev_sentiment,
+curr_sentiment, delta, is_transition, transition_kind, confidence,
+classified_at)`. `transition_kind` is the new categorical signal — a
+six-value enum: `frustration_spike`, `resolution`, `reset`, `drift`,
+`clarification`, `none`. Stale per-message shards (the pre-v1.0 schema
+with `uuid`/`sentiment_delta` columns) are detected via parquet metadata
+and deleted on first run. The whole run is wrapped in
+`pipeline_cache_stats("trajectory")` so the system-prompt 1h cache write
++ subsequent reads emit one summary line at INFO. The system prompt is
+padded past Sonnet 4.6's 2048-input-token cache floor — verified by
+`test_system_prompt_clears_cache_floor`. The `sentiment_arc(sid)` macro
+joins `messages.uuid` to `message_trajectory.curr_uuid` and surfaces
+`(ts, role, curr_sentiment, delta, transition_kind, is_transition,
+confidence)`. Old `sentiment_delta` callers must rebase to `delta` and
+`curr_sentiment`.
+
+## Conflicts classifier (`conflicts_worker.py`) — pair-keyed v1.0
+
+The v1.0 conflicts pipeline (RFC 0002 §3.4) is **pair-keyed** on
+`(turn_a_uuid, turn_b_uuid)`. Sessions with no conflicts produce **zero
+rows** — the legacy `empty=True` sentinel is gone, so any caller that
+wants every session in the result set must `LEFT JOIN sessions` and
+coalesce missing counts to 0. Two enums supplement the pair: `conflict_kind`
+∈ {`disagreement`, `correction`, `reversal`, `impasse`} and `severity` ∈
+{`low`, `medium`, `high`}, plus `agent_position` / `user_position` /
+`confidence`. The output parquet shape is `(session_id, turn_a_uuid,
+turn_b_uuid, conflict_kind, severity, agent_position, user_position,
+confidence, detected_at)`. Stale shards from the pre-v1.0 schema (anything
+carrying `conflict_idx` or `empty` columns) are detected via parquet
+metadata and the entire cache directory is deleted on first run before
+new shards land. The whole run is wrapped in
+`pipeline_cache_stats("conflicts")` so the 1h system-prompt cache write
++ reads surface one summary line at INFO. The new `conflicts_summary`
+view is a simple `count(*) GROUP BY session_id` over `session_conflicts`
+— sessions with no conflict rows do not appear there. The pair-scanner
+(RFC §4.2) that would replace the whole-session prompt with one row per
+adjacent turn pair is v1.1 work and explicitly out of scope for v1.0; the
+existing whole-session prompt still runs but now elicits the new
+pair-keyed shape.
+
 ## Friction classifier (`friction_worker.py`)
 
 Detects user-friction signals in short user-role messages (≤300 chars by

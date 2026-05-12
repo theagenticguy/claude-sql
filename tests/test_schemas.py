@@ -5,16 +5,17 @@ from __future__ import annotations
 import json
 
 from claude_sql.schemas import (
-    MESSAGE_TRAJECTORY_SCHEMA,
     PR_REVIEW_SHEET_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
-    Conflict,
+    TRAJECTORY_ARRAY_SCHEMA,
+    ConflictPair,
+    ConflictsResult,
     Correction,
-    MessageTrajectory,
     PRReviewSheet,
     SessionClassification,
-    SessionConflicts,
+    TrajectoryArrayResult,
+    TrajectoryWindow,
 )
 
 
@@ -57,32 +58,52 @@ def test_session_classification_enum_values() -> None:
     assert set(props["success"]["enum"]) == {"success", "partial", "failure", "unknown"}
 
 
-def test_message_trajectory_schema_flat() -> None:
-    s = MESSAGE_TRAJECTORY_SCHEMA
+def test_trajectory_array_schema_flat() -> None:
+    """v1.0 windowed schema: array of TrajectoryWindow with three-label sentiment.
+
+    Replaces the old per-message ``MESSAGE_TRAJECTORY_SCHEMA`` (RFC 0002 §3.4).
+    """
+    s = TRAJECTORY_ARRAY_SCHEMA
     dumped = json.dumps(s)
     assert "$ref" not in dumped
     assert s["additionalProperties"] is False
-    assert set(s["properties"]["sentiment_delta"]["enum"]) == {
+    items = s["properties"]["windows"]["items"]
+    assert items["additionalProperties"] is False
+    assert set(items["properties"]["curr_sentiment"]["enum"]) == {
         "positive",
         "neutral",
         "negative",
     }
+    # transition_kind has exactly the six RFC §3.4 values.
+    assert set(items["properties"]["transition_kind"]["enum"]) == {
+        "frustration_spike",
+        "resolution",
+        "reset",
+        "drift",
+        "clarification",
+        "none",
+    }
 
 
 def test_session_conflicts_nested_flattened() -> None:
-    """SessionConflicts has a nested list[Conflict] -- verify the Conflict shape
-    got inlined under items without a $ref."""
+    """ConflictsResult has a nested list[ConflictPair] — verify the
+    ConflictPair shape got inlined under items without a ``$ref``."""
     s = SESSION_CONFLICTS_SCHEMA
     assert "$ref" not in json.dumps(s)
     assert "$defs" not in s
-    # conflicts.items should be the Conflict schema inlined
     items = s["properties"]["conflicts"]["items"]
     assert items["additionalProperties"] is False
-    assert set(items["required"]) >= {"stance_a", "stance_b", "resolution"}
-    assert set(items["properties"]["resolution"]["enum"]) == {
-        "resolved",
-        "unresolved",
-        "abandoned",
+    assert set(items["required"]) >= {
+        "turn_a_uuid",
+        "turn_b_uuid",
+        "conflict_kind",
+        "severity",
+    }
+    assert set(items["properties"]["conflict_kind"]["enum"]) == {
+        "disagreement",
+        "correction",
+        "reversal",
+        "impasse",
     }
 
 
@@ -90,7 +111,7 @@ def test_all_object_subschemas_forbid_additional() -> None:
     """Every object-typed subschema must have additionalProperties: false."""
     for root in (
         SESSION_CLASSIFICATION_SCHEMA,
-        MESSAGE_TRAJECTORY_SCHEMA,
+        TRAJECTORY_ARRAY_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
         PR_REVIEW_SHEET_SCHEMA,
     ):
@@ -163,10 +184,31 @@ def test_pydantic_models_validate_happy_path() -> None:
     )
     assert sc.work_category == "sde"
 
-    mt = MessageTrajectory(sentiment_delta="positive", is_transition=False, confidence=0.8)
+    mt = TrajectoryWindow(
+        prev_uuid="u1",
+        curr_uuid="u2",
+        prev_sentiment="neutral",
+        curr_sentiment="positive",
+        delta=1.0,
+        is_transition=False,
+        transition_kind="resolution",
+        confidence=0.8,
+    )
     assert mt.is_transition is False
+    arr = TrajectoryArrayResult(windows=[mt])
+    assert len(arr.windows) == 1
 
-    sx = SessionConflicts(
-        conflicts=[Conflict(stance_a="cosine", stance_b="euclidean", resolution="resolved")]
+    sx = ConflictsResult(
+        conflicts=[
+            ConflictPair(
+                turn_a_uuid="u-a",
+                turn_b_uuid="u-b",
+                conflict_kind="disagreement",
+                severity="medium",
+                agent_position="Use cosine distance.",
+                user_position="Use Euclidean distance instead.",
+                confidence=0.85,
+            )
+        ]
     )
     assert len(sx.conflicts) == 1

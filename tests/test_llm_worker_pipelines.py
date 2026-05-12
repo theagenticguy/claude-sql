@@ -42,11 +42,10 @@ from claude_sql import (
     trajectory_worker,
 )
 from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files, read_all
+from claude_sql.parquet_shards import iter_part_files
 from claude_sql.sql_views import register_raw, register_views
 from conftest import (
     _seed_subagent_stub,
-    make_assistant_msg,
     make_user_msg,
     write_session_jsonl,
 )
@@ -399,8 +398,14 @@ def test_classify_retry_queue_captures_failures(
 
 
 # ===========================================================================
-# 5. trajectory_messages(dry_run=True)
+# 5. trajectory_messages(dry_run=True) — v1.0 windowed shape
 # ===========================================================================
+#
+# The detailed real-run coverage moved to ``test_trajectory_windowed.py``
+# alongside the windowed-pipeline rewrite (RFC 0002 §3.4 / §4.1). These
+# two dry-run smoke tests stay here to round out the cross-pipeline
+# matrix: classify / trajectory / conflicts / friction all share the
+# dry-run contract.
 
 
 def test_trajectory_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings) -> None:
@@ -418,140 +423,19 @@ def test_trajectory_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings)
 def test_trajectory_dry_run_populated_corpus(
     basic_con: duckdb.DuckDBPyConnection, tmp_settings: Settings
 ) -> None:
-    """Populated → candidates>0, llm_calls=candidates//2."""
+    """Populated corpus → candidates is the per-session count, not per-message.
+
+    The v1.0 rewrite (RFC 0002 §3.4 / §4.1) reports per-session candidates;
+    ``llm_calls`` is the chunk count (ceil(turns / 16)).
+    """
     plan = trajectory_worker.trajectory_messages(basic_con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["candidates"] > 0
-    assert plan["llm_calls"] == plan["candidates"] // 2
+    assert plan["llm_calls"] >= 1
     assert plan["model"] == tmp_settings.sonnet_model_id
-
-
-# ===========================================================================
-# 6. trajectory_messages real run + heuristic shortcut
-# ===========================================================================
-
-
-def test_trajectory_real_run_heuristic_shortcut(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Short transition messages bypass the LLM via the regex heuristic."""
-    sid = "traj-sess"
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid,
-                [
-                    # "ok let me check that" matches _TRANSITION_RE and is <80 chars.
-                    make_user_msg(
-                        "u-trans-1",
-                        sid,
-                        "ok let me check that file please",
-                        ts="2026-04-01T10:00:00.000Z",
-                    ),
-                    make_user_msg(
-                        "u-trans-2",
-                        sid,
-                        "great, that works for me",
-                        ts="2026-04-01T10:00:01.000Z",
-                    ),
-                    make_assistant_msg(
-                        "a-trans",
-                        sid,
-                        ts="2026-04-01T10:00:05.000Z",
-                        content=[{"type": "text", "text": "ok let me check that approach now"}],
-                    ),
-                ],
-            )
-        ],
-    )
-
-    classify_spy = AsyncMock()
-    monkeypatch.setattr(trajectory_worker, "classify_one", classify_spy)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written >= 1
-
-    # The heuristic-fast-path messages must have skipped the LLM entirely.
-    assert classify_spy.await_count == 0
-
-    # All written rows have is_transition=True from the heuristic.
-    df = read_all(tmp_settings.trajectory_parquet_path)
-    assert df is not None
-    assert df.height >= 1
-    assert df["is_transition"].to_list() == [True] * df.height
-    assert df["sentiment_delta"].to_list() == ["neutral"] * df.height
-    con.close()
-
-
-# ===========================================================================
-# 7. trajectory_messages LLM path including refusal
-# ===========================================================================
-
-
-def test_trajectory_llm_path_with_refusal_and_success(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Long messages bypass the heuristic; refusal yields a neutral placeholder."""
-    sid = "traj-llm-sess"
-    long_msg_1 = (
-        "this is a long substantive technical message that goes far past the "
-        "80-character heuristic threshold so it must hit the LLM path "
-        "directly without any regex shortcut applying"
-    )
-    long_msg_2 = (
-        "another substantive technical message also long enough to exceed "
-        "the heuristic threshold and route through the LLM classifier path"
-    )
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid,
-                [
-                    make_user_msg("u-long-1", sid, long_msg_1, ts="2026-04-01T10:00:00.000Z"),
-                    make_user_msg("u-long-2", sid, long_msg_2, ts="2026-04-01T10:00:01.000Z"),
-                ],
-            )
-        ],
-    )
-
-    # Two long user messages → two LLM dispatches. First refused, second OK.
-    refusal = llm_shared.BedrockRefusalError("policy")
-    ok_payload = {
-        "sentiment_delta": "positive",
-        "is_transition": False,
-        "confidence": 0.88,
-    }
-    classifier = AsyncMock(side_effect=[refusal, ok_payload])
-    monkeypatch.setattr(trajectory_worker, "classify_one", classifier)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written == 2
-
-    df = read_all(tmp_settings.trajectory_parquet_path)
-    assert df is not None
-    rows = df.to_dicts()
-
-    # Refused row → neutral placeholder with confidence 0.0.
-    refused_rows = [r for r in rows if float(r["confidence"]) == 0.0]
-    assert len(refused_rows) == 1
-    assert refused_rows[0]["sentiment_delta"] == "neutral"
-    assert refused_rows[0]["is_transition"] is False
-
-    # Successful row → confidence > 0.0 and the dispatched payload values.
-    success_rows = [r for r in rows if float(r["confidence"]) > 0.0]
-    assert len(success_rows) == 1
-    assert success_rows[0]["sentiment_delta"] == "positive"
-    con.close()
+    # The plan also exposes the raw text-turn count (windowed pipeline shape).
+    assert "turns" in plan
+    assert plan["turns"] >= plan["candidates"]
 
 
 # ===========================================================================
@@ -584,90 +468,12 @@ def test_conflicts_dry_run_populated_corpus(
 
 
 # ===========================================================================
-# 9. detect_conflicts real run
+# 9. detect_conflicts real-run coverage lives in test_conflicts_storage_v2.py
 # ===========================================================================
-
-
-def test_conflicts_real_run_sentinel_and_populated_rows(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Empty conflicts → sentinel ``empty=True``; populated → ``empty=False``."""
-    sid_a = "sess-clean"
-    sid_b = "sess-conflict"
-    # Unique markers in the message bodies so the stub _classify_one can
-    # tell which session it's classifying. Assembled session text doesn't
-    # carry the literal session id, only the message bodies + ts headers.
-    marker_a = "MARKER_NO_CONFLICT_AAA"
-    marker_b = "MARKER_HAS_CONFLICT_BBB"
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid_a,
-                [
-                    make_user_msg(
-                        "u-clean",
-                        sid_a,
-                        f"{marker_a} let's pick a simple plan with no disagreement",
-                        ts="2026-04-01T10:00:00.000Z",
-                    )
-                ],
-            ),
-            (
-                sid_b,
-                [
-                    make_user_msg(
-                        "u-conf",
-                        sid_b,
-                        f"{marker_b} I think we should ship the simple version now",
-                        ts="2026-04-02T10:00:00.000Z",
-                    )
-                ],
-            ),
-        ],
-    )
-
-    populated_payload = {
-        "conflicts": [
-            {
-                "stance_a": "Ship the simple version now.",
-                "stance_b": "Wait for cleanup first.",
-                "resolution": "resolved",
-            }
-        ]
-    }
-
-    async def _by_marker(*_args: Any, **kwargs: Any) -> dict[str, Any]:
-        # ``classify_one(client, model_id, schema, text, ...)`` — pull the
-        # text and route on the unique marker we embedded above.
-        text = _args[3] if len(_args) >= 4 else kwargs.get("text", "")
-        if marker_b in text:
-            return populated_payload
-        return {"conflicts": []}
-
-    monkeypatch.setattr(conflicts_worker, "classify_one", AsyncMock(side_effect=_by_marker))
-    monkeypatch.setattr(conflicts_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = conflicts_worker.detect_conflicts(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written == 2
-
-    df = read_all(tmp_settings.conflicts_parquet_path)
-    assert df is not None
-    rows = df.to_dicts()
-    sentinel = [r for r in rows if r["session_id"] == sid_a]
-    populated = [r for r in rows if r["session_id"] == sid_b]
-    assert len(sentinel) == 1
-    assert sentinel[0]["empty"] is True
-    assert sentinel[0]["stance_a"] is None
-
-    assert len(populated) == 1
-    assert populated[0]["empty"] is False
-    assert populated[0]["stance_a"] == "Ship the simple version now."
-    assert populated[0]["resolution"] == "resolved"
-    con.close()
+#
+# The legacy ``empty=True`` sentinel was removed in v1.0 (RFC 0002 §3.4).
+# Real-run coverage for the new ``(turn_a_uuid, turn_b_uuid)`` schema lives
+# in ``tests/test_conflicts_storage_v2.py``.
 
 
 # ===========================================================================

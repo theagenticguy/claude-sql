@@ -19,9 +19,9 @@ import pytest
 
 from claude_sql.config import Settings
 from claude_sql.schemas import (
-    MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
+    TRAJECTORY_ARRAY_SCHEMA,
 )
 from claude_sql.sql_views import (
     register_analytics,
@@ -41,7 +41,7 @@ def test_schemas_no_ref() -> None:
     for schema in (
         SESSION_CLASSIFICATION_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
-        MESSAGE_TRAJECTORY_SCHEMA,
+        TRAJECTORY_ARRAY_SCHEMA,
     ):
         text = json.dumps(schema)
         assert "$ref" not in text
@@ -68,7 +68,7 @@ def test_schemas_additional_properties_false() -> None:
     for schema in (
         SESSION_CLASSIFICATION_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
-        MESSAGE_TRAJECTORY_SCHEMA,
+        TRAJECTORY_ARRAY_SCHEMA,
     ):
         _walk(schema)
 
