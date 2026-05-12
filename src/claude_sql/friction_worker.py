@@ -28,8 +28,12 @@ Outputs ``user_friction.parquet`` with one row per analysed user message:
     {uuid, session_id, ts, text_snippet, label, rationale, source,
      confidence, classified_at}
 
-``source`` is ``'regex'`` or ``'llm'`` so downstream queries can filter to
-the high-recall LLM rows or audit the fast-path separately.
+``source`` is ``'regex'``, ``'sql'``, ``'llm'``, or ``'refused'`` so
+downstream queries can filter to the high-recall LLM rows or audit the
+fast paths separately.  The SQL stamp layer (RFC §4.3, §9.4) sits
+between regex and LLM and catches three deterministic shapes — repeated
+user messages, short imperative reverts, and trailing-? after error
+tool_results — without paying Bedrock.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import anyio
+import duckdb
 import polars as pl
 from loguru import logger
 
@@ -57,8 +62,6 @@ from claude_sql.schemas import USER_FRICTION_SCHEMA
 from claude_sql.session_text import session_bounds
 
 if TYPE_CHECKING:
-    import duckdb
-
     from claude_sql.config import Settings
 
 
@@ -156,6 +159,156 @@ def regex_fast_path(text: str) -> tuple[str, float] | None:
         if pat.search(probe):
             return label, 0.9
     return None
+
+
+# ---------------------------------------------------------------------------
+# SQL stamp layer — pre-LLM, post-regex deterministic shapes (RFC §4.3, §9.4)
+# ---------------------------------------------------------------------------
+#
+# Three rules catch deterministic friction shapes in pure SQL so we don't
+# pay Bedrock for them.  The output is the same ``(label, confidence,
+# source)`` triple the regex bank emits; ``source='sql'`` is the only new
+# value.  Source priority is regex > sql > llm: regex hits always win,
+# then SQL stamps, then anything still unstamped goes to Sonnet.
+#
+# Rule 1 — repeated user message body within 10 turns.  A user-role
+#   message whose normalized text matches an earlier user-role message in
+#   the same session, within 10 user-role turns prior, is stamped
+#   ``unmet_expectation`` at confidence 0.85.  Re-asking the same
+#   question is a strong signal the agent's first answer fell short.
+#
+# Rule 2 — short imperative reverts (≤30 chars, first token ∈
+#   {stop, redo, revert, rollback, undo, restart}) → ``correction``,
+#   confidence 0.9.  Ruff-style explicit corrections that bypass the
+#   regex bank's punctuation requirements.
+#
+# Rule 3 — trailing ``?`` after an error tool_result → ``confusion``,
+#   confidence 0.85.  We derive ``is_error`` from ``messages.content_json``
+#   because the ``tool_results`` view does NOT expose it: ``content_blocks``
+#   only extracts a fixed field set, and ``is_error`` lives at the same
+#   level as ``$.content`` in the raw block JSON.  Re-deriving here keeps
+#   the friction worker self-contained and dodges a sql_views.py change
+#   that would touch every analytics caller.
+
+
+_RULE1_REPEATED_TEMPLATE = """
+    WITH candidates AS (
+        SELECT mt.uuid, mt.session_id, mt.ts,
+               lower(regexp_replace(mt.text_content, '\\s+', ' ', 'g')) AS norm,
+               row_number() OVER (
+                   PARTITION BY mt.session_id ORDER BY mt.ts, mt.uuid
+               ) AS rn
+        FROM messages_text mt
+        WHERE mt.role = 'user'
+    )
+    SELECT cur.uuid AS uuid,
+           'unmet_expectation' AS label,
+           CAST(0.85 AS DOUBLE) AS confidence,
+           'sql' AS source
+      FROM candidates cur
+      JOIN candidates prev
+        ON cur.session_id = prev.session_id
+       AND cur.norm = prev.norm
+       AND prev.rn < cur.rn
+       AND cur.rn - prev.rn <= 10
+     WHERE cur.uuid IN (SELECT unnest(?))
+"""
+
+
+# Imperatives must be matched on a single first token, so an exact
+# token-set membership beats a regex with anchored boundaries — and
+# ``split_part(trim(...), ' ', 1)`` is portable across DuckDB versions.
+_RULE2_IMPERATIVE_TEMPLATE = """
+    SELECT mt.uuid AS uuid,
+           'correction' AS label,
+           CAST(0.9 AS DOUBLE) AS confidence,
+           'sql' AS source
+      FROM messages_text mt
+     WHERE mt.role = 'user'
+       AND length(mt.text_content) <= 30
+       AND lower(rtrim(split_part(trim(mt.text_content), ' ', 1), '.,!?'))
+           IN ('stop', 'redo', 'revert', 'rollback', 'undo', 'restart')
+       AND mt.uuid IN (SELECT unnest(?))
+"""
+
+
+# Rule 3 needs ``is_error`` which is NOT exposed by the ``tool_results``
+# view (see comment block above for why).  We unnest ``messages.content_json``
+# to recover the boolean and join back to ``messages_text`` via session_id
+# + a ts-ordered "no event in between" predicate.  The user message must
+# end with ``?`` and be the immediate next event after the failing
+# tool_result.
+_RULE3_CONFUSION_TEMPLATE = """
+    WITH error_results AS (
+        SELECT m.session_id, m.ts
+          FROM messages m,
+               UNNEST(json_extract(m.content_json, '$[*]')) AS t(block)
+         WHERE json_extract_string(block, '$.type') = 'tool_result'
+           AND json_extract_string(block, '$.is_error') = 'true'
+    )
+    SELECT mt.uuid AS uuid,
+           'confusion' AS label,
+           CAST(0.85 AS DOUBLE) AS confidence,
+           'sql' AS source
+      FROM messages_text mt
+      JOIN error_results er
+        ON er.session_id = mt.session_id
+       AND er.ts < mt.ts
+     WHERE mt.role = 'user'
+       AND mt.text_content LIKE '%?'
+       AND mt.uuid IN (SELECT unnest(?))
+       AND NOT EXISTS (
+            SELECT 1
+              FROM messages_text mt2
+             WHERE mt2.session_id = mt.session_id
+               AND mt2.ts > er.ts
+               AND mt2.ts < mt.ts
+       )
+"""
+
+
+def sql_stamp(
+    con: duckdb.DuckDBPyConnection,
+    candidate_uuids: list[str],
+) -> dict[str, tuple[str, float, str]]:
+    """Run the three deterministic SQL stamps over ``candidate_uuids``.
+
+    Returns a ``{uuid: (label, confidence, source='sql')}`` map.  When two
+    rules match the same uuid, the higher-confidence rule wins; rules 1+3
+    tie at 0.85 so first-rule-wins (deterministic ordering: 1 → 2 → 3).
+
+    Rule 3 may fail if the ``messages`` view is not registered (some test
+    fixtures only create ``messages_text``).  That branch is caught and
+    skipped so the SQL-stamp layer degrades gracefully — the LLM path
+    will still classify those messages.
+    """
+    if not candidate_uuids:
+        return {}
+    out: dict[str, tuple[str, float, str]] = {}
+
+    # Rules 1 and 2 — pure messages_text, always available.
+    for sql_template in (_RULE1_REPEATED_TEMPLATE, _RULE2_IMPERATIVE_TEMPLATE):
+        rows = con.execute(sql_template, [list(candidate_uuids)]).fetchall()
+        for uuid, label, conf, source in rows:
+            existing = out.get(uuid)
+            if existing is None or conf > existing[1]:
+                out[uuid] = (label, float(conf), source)
+
+    # Rule 3 — needs the ``messages`` view (json content unnest).  Skip
+    # silently when it's absent so test fixtures with a hand-built
+    # ``messages_text`` table still exercise rules 1 and 2.
+    try:
+        rows = con.execute(_RULE3_CONFUSION_TEMPLATE, [list(candidate_uuids)]).fetchall()
+    except duckdb.CatalogException:
+        # ``messages`` view not registered — pure-messages_text test
+        # fixture; rule 3 simply doesn't fire.  No-op.
+        rows = []
+    for uuid, label, conf, source in rows:
+        existing = out.get(uuid)
+        if existing is None or conf > existing[1]:
+            out[uuid] = (label, float(conf), source)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +469,7 @@ async def _classify_async(
 
     # 1. Regex fast-path.
     fast_rows: list[dict[str, Any]] = []
-    llm_pending: list[tuple[str, str, Any, str]] = []
+    sql_stamp_pending: list[tuple[str, str, Any, str]] = []
     now = datetime.now(UTC)
     for uuid, session_id, ts, text in candidates:
         hit = regex_fast_path(text or "")
@@ -336,11 +489,35 @@ async def _classify_async(
                 }
             )
         else:
-            llm_pending.append((uuid, session_id, ts, text or ""))
+            sql_stamp_pending.append((uuid, session_id, ts, text or ""))
+
+    # 2. SQL stamp layer (RFC §4.3, §9.4) — pre-LLM, post-regex.
+    sql_stamps = sql_stamp(con, [c[0] for c in sql_stamp_pending])
+    llm_pending: list[tuple[str, str, Any, str]] = []
+    for uuid, session_id, ts, text in sql_stamp_pending:
+        stamp = sql_stamps.get(uuid)
+        if stamp is not None:
+            label, conf, source = stamp
+            fast_rows.append(
+                {
+                    "uuid": uuid,
+                    "session_id": session_id,
+                    "ts": ts,
+                    "text_snippet": (text or "")[:200],
+                    "label": label,
+                    "rationale": "sql stamp",
+                    "source": source,
+                    "confidence": conf,
+                    "classified_at": now,
+                }
+            )
+        else:
+            llm_pending.append((uuid, session_id, ts, text))
 
     logger.info(
-        "user_friction: {} regex fast-path, {} pending LLM",
-        len(fast_rows),
+        "user_friction: {} regex, {} sql-stamped, {} pending LLM",
+        sum(1 for r in fast_rows if r["source"] == "regex"),
+        sum(1 for r in fast_rows if r["source"] == "sql"),
         len(llm_pending),
     )
 
@@ -558,4 +735,4 @@ def detect_user_friction(
     )
 
 
-__all__ = ["detect_user_friction", "regex_fast_path"]
+__all__ = ["detect_user_friction", "regex_fast_path", "sql_stamp"]
