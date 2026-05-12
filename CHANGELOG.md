@@ -1,18 +1,16 @@
-## Unreleased
-
 ## v0.7.0 (2026-05-12)
 
 ### Feat
 
-- lance-backed embeddings store + sqlite WAL checkpointer
+- lance-backed embeddings store + sqlite WAL checkpointer (#37)
 
 ## v0.6.0 (2026-05-11)
 
 ### Feat
 
-- **perf**: two-tier connections + parquet-gated macros + static schema
-- **sql_views**: static catalog + ago() macro
-- **cli**: drop --format markdown from public OutputFormat
+- **perf**: two-tier connections + parquet-gated macros + static schema (#31)
+- **sql_views**: static catalog + ago() macro (#30)
+- **cli**: drop --format markdown from public OutputFormat (#29)
 
 ## v0.5.0 (2026-05-10)
 
@@ -37,22 +35,22 @@ nothing. New community_profile.parquet sidecar appears at
 
 ### Feat
 
-- **ci**: PyPI Trusted Publishing workflow + cz changelog drift gate
+- **ci**: PyPI Trusted Publishing workflow + cz changelog drift gate (#23)
 
 ### Fix
 
-- **publish**: switch to uv-native publish + add missing packaging dep
+- **publish**: switch to uv-native publish + add missing packaging dep (#25)
 - **ci**: scope changelog gate to PRs + normalize squash-merge suffix
-- **ci**: correct cyclonedx-py environment flags in SBOM workflow
+- **ci**: correct cyclonedx-py environment flags in SBOM workflow (#20)
 
 ## v0.3.0 (2026-05-09)
 
 ### Feat
 
-- **views**: split task views for v2.1.16/v2.1.63 Claude Code taxonomy
-- **review-sheet**: PRReviewSheet schema + worker + claude-sql review-sheet CLI
-- **binding**: RFC 0001 — transcript-PR binding (commit-trailer + git notes)
-- **team-corpus**: Settings.team_corpus_root + 2-user fixture smoke test
+- **views**: split task views for v2.1.16/v2.1.63 Claude Code taxonomy (#18)
+- **review-sheet**: PRReviewSheet schema + worker + claude-sql review-sheet CLI (#13)
+- **binding**: RFC 0001 — transcript-PR binding (commit-trailer + git notes) (#12)
+- **team-corpus**: Settings.team_corpus_root + 2-user fixture smoke test (#11)
 - **cli**: add --profile-json flag to query and explain subcommands
 - **perf**: skip UMAP+HDBSCAN refit when embeddings mtime is unchanged
 - **perf**: replace community_worker centroid Python loop with DuckDB SQL CTE

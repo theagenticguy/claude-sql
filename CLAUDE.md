@@ -206,6 +206,20 @@ that auto-clear once the first release lands.
 
 ## Version bumping & changelog
 
+**`CHANGELOG.md` is write-only via `cz bump`.** Never hand-edit it. Never
+run `mise run changelog` between releases — its output drifts against
+`cz`'s post-squash-merge projection (the `## Unreleased` placeholder
++ `(#NNN)` suffix injection) and any drift gate built on top will
+fight you. CI no longer enforces any drift check; the file mutates
+exactly twice per release: once when `cz bump` writes the new
+`## vX.Y.Z` block on the release branch, and once when squash-merge
+appends `(#NNN)` to the merged commit's bullet.
+
+Between releases, query commit history directly:
+- `mise run bump:dry-run` — preview next version + the bullets `cz bump`
+  would write.
+- `git log --oneline v0.7.0..HEAD` — raw conventional-commit list.
+
 Version management is driven by `cz bump`, which reads commit history,
 picks MAJOR/MINOR/PATCH from the conventional-commits types, updates
 `pyproject.toml` + `uv.lock` (via `version_provider = "uv"`), writes
@@ -214,7 +228,6 @@ picks MAJOR/MINOR/PATCH from the conventional-commits types, updates
 - `mise run bump:dry-run` — preview the next version + tag without writing.
 - `mise run bump` — bump, update changelog, commit as
   `chore(release): X → Y`, create annotated `vY` tag.
-- `mise run changelog` — regenerate `CHANGELOG.md` from history without bumping.
 
 Commitizen config lives in `[tool.commitizen]` in `pyproject.toml`:
 `tag_format = "v$version"`, `version_provider = "uv"`,
