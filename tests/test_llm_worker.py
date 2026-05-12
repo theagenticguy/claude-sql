@@ -120,7 +120,9 @@ def test_invoke_body_carries_system_block_with_cache_control() -> None:
     block = body["system"][0]
     assert block["type"] == "text"
     assert block["text"] == sys_prompt
-    assert block["cache_control"] == {"type": "ephemeral"}
+    # ttl="1h" landed in Act-5: see test_llm_worker_cache.py for the
+    # explicit ttl + per-pipeline accumulator coverage.
+    assert block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:

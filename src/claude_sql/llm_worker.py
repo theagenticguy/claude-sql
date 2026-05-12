@@ -26,6 +26,8 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -91,8 +93,194 @@ _RETRY_CODES: set[str] = {
 _BEDROCK_TRACE_PATH = os.environ.get("CLAUDE_SQL_BEDROCK_TRACE")
 
 
+def cacheable_text_block(text: str, ttl: str = "5m") -> dict:
+    """Return a content block with ephemeral ``cache_control`` attached.
+
+    Helper for per-stage request-body builders that want to mark a stable
+    content block (e.g. a schema reminder, a session header) for prompt
+    caching. Defaults to the 5m TTL — the right choice for content that
+    only repeats within a single pipeline run. Pass ``ttl="1h"`` for
+    pieces that are stable across runs, but note Anthropic's ordering
+    rule: 1h breakpoints must precede 5m breakpoints in the prefix.
+
+    See AWS Bedrock User Guide ("Prompt caching", 2026-05) for the per-
+    model cache minimums and TTL semantics. The Anthropic docs page
+    incorrectly claims Bedrock does not support 1h TTL — that is stale;
+    1h is supported on Sonnet 4.5+ via global CRIS profiles.
+    """
+    return {"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}}
+
+
+# ---------------------------------------------------------------------------
+# Per-pipeline cache-stat accumulator
+# ---------------------------------------------------------------------------
+#
+# Each Bedrock response carries a ``usage`` object with input / output
+# token counts and prompt-cache stats. Aggregating those across a whole
+# pipeline run is the only way to verify that the cache_control shape on
+# the system block + first cacheable content block actually translates
+# into a discount on the live corpus. See RFC §4.6 / §9.5.
+#
+# Threadsafe accumulation. ``_classify_one`` dispatches blocking
+# ``invoke_model`` calls via ``anyio.to_thread.run_sync`` (per the
+# anyio-structured-concurrency lesson), so two worker threads can land
+# in ``_maybe_log_bedrock_call`` concurrently. We protect the dict with
+# a ``threading.Lock`` rather than an ``anyio.CapacityLimiter`` because:
+#
+# * A Lock is the right primitive for a critical section that mutates
+#   a shared dict — it costs nothing and works from any thread, including
+#   the test fixtures that drive the accumulator without an event loop.
+# * ``anyio.CapacityLimiter`` is a *concurrency* primitive (cap N
+#   simultaneous tasks) — it doesn't serialize a critical section; you
+#   still need a lock inside it. Using one here would conflate "how
+#   many requests in flight" with "who owns the dict slot", and the
+#   former is already governed upstream by the per-pipeline
+#   ``settings.llm_concurrency`` limiter.
+# * The hot path is two integer reads + a few dict ``+=`` operations
+#   per response. Lock contention is a non-issue at our concurrency
+#   ceiling (default 2, max ~16).
+
+_CACHE_STATS_LOCK = threading.Lock()
+_CACHE_STATS: dict[str, dict[str, int]] = {}
+
+
+def _empty_cache_stats() -> dict[str, int]:
+    return {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_5m_input_tokens": 0,
+        "cache_creation_1h_input_tokens": 0,
+    }
+
+
+def _extract_usage_metrics(payload: dict) -> dict[str, int]:
+    """Pull the six accumulator fields out of one Bedrock response.
+
+    Handles both the legacy shape (``cache_creation_input_tokens`` only,
+    no ``cache_creation`` sub-object — implicitly 5m TTL since 1h didn't
+    exist) and the current shape (``cache_creation`` carrying explicit
+    ``ephemeral_5m_input_tokens`` and ``ephemeral_1h_input_tokens``).
+
+    Missing fields default to 0 so the accumulator never sees ``None``.
+    """
+    usage = payload.get("usage") or {}
+    cache_creation = usage.get("cache_creation")
+    if isinstance(cache_creation, dict):
+        five_m = int(cache_creation.get("ephemeral_5m_input_tokens") or 0)
+        one_h = int(cache_creation.get("ephemeral_1h_input_tokens") or 0)
+    else:
+        # Legacy shape: only cache_creation_input_tokens present, no
+        # 5m/1h split. Attribute the whole thing to the 5m bucket since
+        # 1h TTL post-dates this response shape.
+        five_m = int(usage.get("cache_creation_input_tokens") or 0)
+        one_h = 0
+    return {
+        "calls": 1,
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+        "cache_creation_5m_input_tokens": five_m,
+        "cache_creation_1h_input_tokens": one_h,
+    }
+
+
+def _accumulate_cache_stats(pipeline: str, payload: dict) -> None:
+    """Add this response's usage to the accumulator under ``pipeline``.
+
+    No-op when no ``pipeline_cache_stats`` block is active for this
+    name (i.e. the pipeline isn't registered in ``_CACHE_STATS``).
+    Failures are swallowed — accumulation must never break a real run.
+    """
+    if not pipeline:
+        return
+    try:
+        metrics = _extract_usage_metrics(payload)
+    except (TypeError, ValueError):
+        # Malformed usage payload — accumulation is best-effort.
+        return
+    with _CACHE_STATS_LOCK:
+        bucket = _CACHE_STATS.get(pipeline)
+        if bucket is None:
+            # No active context manager for this pipeline; drop the
+            # sample silently. The accumulator is opt-in per RFC §4.6.
+            return
+        for key, val in metrics.items():
+            bucket[key] += val
+
+
+def _format_token_count(n: int) -> str:
+    """Return ``n`` as ``1.2M`` / ``950K`` / ``42`` for compact log lines."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def pipeline_finalize(pipeline: str) -> dict[str, int]:
+    """Emit one INFO log line summarizing the accumulator for ``pipeline``.
+
+    Returns the totals dict (post-clear, so callers can assert on it
+    in tests). Safe to call when the pipeline has no entries — emits a
+    log line with zeroes and clears nothing. Used by the
+    ``pipeline_cache_stats`` context manager on exit.
+    """
+    with _CACHE_STATS_LOCK:
+        totals = _CACHE_STATS.pop(pipeline, _empty_cache_stats())
+    cache_read = totals["cache_read_input_tokens"]
+    fresh_input = totals["input_tokens"]
+    if fresh_input > 0:
+        ratio = (cache_read + fresh_input) / fresh_input
+        ratio_str = f"{ratio:.2f}x"
+    else:
+        ratio_str = "n/a"
+    logger.info(
+        "pipeline={}  calls={}  input={}  cache_read={} (ratio={})  "
+        "cache_create_5m={}  cache_create_1h={}  output={}",
+        pipeline,
+        totals["calls"],
+        _format_token_count(fresh_input),
+        _format_token_count(cache_read),
+        ratio_str,
+        _format_token_count(totals["cache_creation_5m_input_tokens"]),
+        _format_token_count(totals["cache_creation_1h_input_tokens"]),
+        _format_token_count(totals["output_tokens"]),
+    )
+    return totals
+
+
+@contextmanager
+def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
+    """Reset, accumulate, then emit-and-clear the cache stats for ``pipeline``.
+
+    Usage::
+
+        with pipeline_cache_stats("trajectory"):
+            await _trajectory_async(...)
+
+    On entry the per-pipeline bucket is reset so a previous (e.g.
+    crashed) run can't leak into this one. Every Bedrock response goes
+    through ``_maybe_log_bedrock_call`` which feeds the accumulator. On
+    exit (success or exception) one summary line is emitted at INFO
+    and the bucket is dropped from the registry.
+
+    Not yet wired into the per-stage workers — exposed at module level
+    for downstream agents to wrap the trajectory / classify / conflicts /
+    friction loops in a follow-up PR per RFC §4.6.
+    """
+    with _CACHE_STATS_LOCK:
+        _CACHE_STATS[pipeline] = _empty_cache_stats()
+    try:
+        yield
+    finally:
+        pipeline_finalize(pipeline)
+
+
 def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
-    """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set.
+    """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set
+    and feed the per-pipeline cache-stat accumulator.
 
     Anthropic returns prompt-cache stats under ``payload["usage"]``; we
     capture the full shape so downstream cost accounting can split
@@ -102,6 +290,8 @@ def _maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed
     for the per-model cache minimums. Failures are swallowed — tracing
     must never break a real run.
     """
+    # Always feed the accumulator first — independent of trace path.
+    _accumulate_cache_stats(pipeline, payload)
     if not _BEDROCK_TRACE_PATH:
         return
     try:
@@ -253,13 +443,31 @@ def _invoke_classifier_sync(
     }
     if system:
         # Mark the system block with prompt caching so Anthropic reuses the
-        # encoded prefix across calls. Below the minimum-cacheable threshold
-        # (~1024 tokens for Sonnet 4.6) the cache_control header is ignored
-        # silently — no harm — and once the per-pipeline system prompts
-        # cross the threshold, the discount kicks in automatically. We send
-        # the system value as a content-block list so cache_control attaches
-        # cleanly; Bedrock also accepts a bare string for non-cached calls.
-        body["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        # encoded prefix across calls. Sonnet 4.6 raised the cacheable
+        # minimum from 1024 to 2048 input tokens (AWS Bedrock User Guide,
+        # 2026-05) — below that the cache_control header is ignored
+        # silently. Once the per-pipeline system prompts cross the
+        # threshold, the discount kicks in automatically.
+        #
+        # ``ttl="1h"`` (vs the default 5m) costs 2× input rate to write
+        # the cache but pays 0.1× input rate per read for an hour. For a
+        # backfill that runs through the corpus in tens of minutes, 1h
+        # is correctly the cheaper choice — the system prompt is stable
+        # across the whole pipeline run. Per AWS ordering rule, 1h
+        # breakpoints must precede 5m breakpoints in the prefix; the
+        # system block is always first so this composes cleanly with
+        # any per-stage 5m breakpoints further down. The Anthropic docs
+        # claim "Bedrock does not support 1h TTL" — that page is stale;
+        # 1h is supported on Sonnet 4.5+ via global CRIS profiles on
+        # InvokeModel (verified against the Bedrock User Guide,
+        # 2026-05).
+        body["system"] = [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        ]
     if thinking_mode == "adaptive":
         body["thinking"] = {"type": "adaptive"}
     t0 = time.monotonic()
