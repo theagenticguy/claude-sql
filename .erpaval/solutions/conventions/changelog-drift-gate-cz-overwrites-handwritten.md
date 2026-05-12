@@ -1,11 +1,13 @@
 ---
-title: cz changelog overwrites hand-written CHANGELOG entries
+title: cz changelog overwrites hand-written CHANGELOG entries (SUPERSEDED)
 track: knowledge
 category: conventions
 module: CHANGELOG.md
 component: commitizen
 severity: info
-tags: [changelog, commitizen, ci, drift-gate, conventional-commits, release]
+tags: [changelog, commitizen, ci, drift-gate, conventional-commits, release, superseded]
+superseded_by:
+  - .erpaval/solutions/conventions/changelog-write-only-via-cz-bump.md
 applies_when:
   - The repo has a CI gate that runs `cz changelog` and asserts the file matches the regenerated output
   - You're tempted to hand-write detailed `### BREAKING CHANGE` / `### Fix` body text in CHANGELOG.md
