@@ -89,6 +89,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "user_friction",
     "skills_catalog",
     "skill_usage",
+    "ingest_stamps",
 )
 
 # Hand-maintained column schema for the v1 (transcript-derived) views.
@@ -311,6 +312,7 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "community_profile",
     "user_friction",
     "skills_catalog",
+    "ingest_stamps",
 )
 
 # Macro names registered by :func:`register_macros`.  ``ago`` is the
@@ -339,6 +341,7 @@ MACRO_NAMES: tuple[str, ...] = (
     "friction_rate",
     "friction_examples",
     "unused_skills",
+    "canonical_uuid_resolve",
 )
 
 
@@ -378,6 +381,7 @@ MACRO_SIGNATURES: dict[str, tuple[str, ...]] = {
     "friction_rate": ("since_days",),
     "friction_examples": ("label_name", "n"),
     "unused_skills": ("last_n_days",),
+    "canonical_uuid_resolve": (),
 }
 
 
@@ -1162,6 +1166,7 @@ _ANALYTICS_MACRO_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "friction_rate": ("user_friction_parquet_path",),
     "friction_examples": ("user_friction_parquet_path",),
     "unused_skills": ("skills_catalog_parquet_path",),
+    "canonical_uuid_resolve": ("ingest_stamps_parquet_path",),
 }
 
 
@@ -1220,7 +1225,7 @@ def register_macros(
     v2 analytics macros (created via :func:`_safe_macro`, skipped when their
     backing analytics view is missing): ``autonomy_trend``, ``work_mix``,
     ``success_rate_by_work``, ``cluster_top_terms``, ``community_top_topics``,
-    ``sentiment_arc``.
+    ``sentiment_arc``, ``canonical_uuid_resolve``.
 
     ``semantic_search(query_vec, k)`` is a table macro that returns the top-k
     uuids by cosine distance to ``query_vec`` using the HNSW index.
@@ -1627,6 +1632,28 @@ def register_macros(
             );
             """,
         ),
+        # Canonical-UUID resolution over the ``ingest_stamps`` view.  Pairs
+        # rows whose 64-bit SimHash differs by ≤ 3 bits (top-16-bit bucket
+        # gates the self-join so it doesn't blow up on large corpora) and
+        # picks the earliest-seen row as canonical.  ``xor`` is the bit-XOR
+        # builtin (DuckDB's ``^`` is exponentiation, not XOR).  Materialised
+        # as a table macro so callers can ``SELECT * FROM
+        # canonical_uuid_resolve()`` without re-deriving the join.
+        (
+            "canonical_uuid_resolve",
+            """
+            CREATE OR REPLACE MACRO canonical_uuid_resolve() AS TABLE (
+                SELECT a.uuid AS uuid,
+                       MIN(b.uuid) AS canonical_uuid
+                  FROM ingest_stamps a
+                  JOIN ingest_stamps b
+                    ON (a.simhash64 >> 48) = (b.simhash64 >> 48)
+                   AND bit_count(xor(a.simhash64, b.simhash64)) <= 3
+                   AND b.first_seen_ts <= a.first_seen_ts
+                 GROUP BY a.uuid
+            );
+            """,
+        ),
     ]
 
     for macro_name, ddl in analytics_macros:
@@ -1862,6 +1889,7 @@ def register_analytics(
         "skills_catalog": skills_catalog_parquet
         if skills_catalog_parquet is not None
         else resolved.skills_catalog_parquet_path,
+        "ingest_stamps": resolved.ingest_stamps_parquet_path,
     }
 
     # View projections keyed by view name. A ``None`` projection means

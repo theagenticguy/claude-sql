@@ -63,6 +63,11 @@ from claude_sql.config import Settings
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.friction_worker import detect_user_friction
 from claude_sql.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.ingest import (
+    count_pending as _ingest_count_pending,
+    resolve_canonicals as _ingest_resolve_canonicals,
+    stamp_messages as _ingest_stamp_messages,
+)
 from claude_sql.install_source import format_version
 from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
@@ -1767,6 +1772,74 @@ def friction(
 
 
 @app.command
+def ingest(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    common: Common | None = None,
+) -> None:
+    """Stamp every message with ``approx_tokens`` / ``simhash64`` / canonical_uuid.
+
+    Pipeline
+    --------
+    1. Pull messages_text rows whose ``uuid`` is not in ``ingest_stamps``.
+    2. Compute ``approx_tokens`` (cl100k × 0.78 Anthropic ratio) and
+       ``simhash64`` (blake2b over word 3-grams) for each.
+    3. Write to ``~/.claude/ingest_stamps/part-<ts>.parquet`` shards.
+    4. Run ``canonical_uuid_resolve`` (DuckDB self-join with bit_count(xor)
+       ≤ 3 over a top-16-bit bucket) and rewrite the parquet with the
+       resolved ``canonical_uuid`` column populated.
+
+    Cost: zero (CPU-only, no Bedrock).  Defaults to ``--dry-run`` so an
+    agent can preview the pending count before writing anything.
+
+    Flags
+    -----
+    --since-days N      Only stamp messages newer than N days.
+    --limit N           Cap stamped rows this run.
+    --dry-run           (DEFAULT) emit plan JSON, no parquet writes.
+    --no-dry-run        Stamp + resolve.
+
+    Dry-run output (stdout JSON)
+    ----------------------------
+    ``{"pipeline":"ingest","candidates":N,"since_days":...,"limit":...,
+       "dry_run":true}``
+
+    Real-run output: ``{"pipeline":"ingest","rows_processed":N,
+    "dry_run":false}``.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    con = _open_connection_full(settings)
+    try:
+        if dry_run:
+            n = _ingest_count_pending(con, settings, since_days=since_days, limit=limit)
+            logger.info("ingest --dry-run: {} pending rows", n)
+            _emit_worker_result(
+                {
+                    "pipeline": "ingest",
+                    "candidates": n,
+                    "since_days": since_days,
+                    "limit": limit,
+                    "dry_run": True,
+                },
+                common,
+                pipeline="ingest",
+            )
+            return
+        stamped = _ingest_stamp_messages(con, settings, since_days=since_days, limit=limit)
+        # Re-bind the analytics views so resolve_canonicals (and any later
+        # query in the same process) sees the freshly-written shards.
+        _refresh_analytics_views(con, settings)
+        resolved = _ingest_resolve_canonicals(con, settings)
+        logger.info("ingest: stamped={} resolved={}", stamped, resolved)
+        _emit_worker_result(stamped, common, pipeline="ingest")
+    finally:
+        con.close()
+
+
+@app.command
 def cluster(*, force: bool = False, common: Common | None = None) -> None:
     """Cluster message embeddings with UMAP (8D) + HDBSCAN. Writes clusters.parquet.
 
@@ -1974,6 +2047,7 @@ def analyze(
     limit: int | None = None,
     dry_run: bool = True,
     no_thinking: bool = False,
+    skip_ingest: bool = False,
     skip_embed: bool = False,
     skip_classify: bool = False,
     skip_trajectory: bool = False,
@@ -1991,14 +2065,15 @@ def analyze(
     Stages (in order)
     -----------------
     0. skills sync  (filesystem walk; zero-cost; produces skills_catalog.parquet)
-    1. embed        (Bedrock Cohere Embed v4; honors --dry-run)
-    2. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
-    3. terms        (c-TF-IDF labels for clusters; zero-cost)
-    4. community    (Leiden+CPM; zero-cost; --force-community to rebuild)
-    5. classify     (Sonnet 4.6; honors --dry-run)
-    6. trajectory   (Sonnet 4.6; honors --dry-run)
-    7. conflicts    (Sonnet 4.6; honors --dry-run)
-    8. friction     (Sonnet 4.6; honors --dry-run)
+    1. ingest       (tiktoken + blake2b SimHash; zero-cost; honors --dry-run)
+    2. embed        (Bedrock Cohere Embed v4; honors --dry-run)
+    3. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
+    4. terms        (c-TF-IDF labels for clusters; zero-cost)
+    5. community    (Leiden+CPM; zero-cost; --force-community to rebuild)
+    6. classify     (Sonnet 4.6; honors --dry-run)
+    7. trajectory   (Sonnet 4.6; honors --dry-run)
+    8. conflicts    (Sonnet 4.6; honors --dry-run)
+    9. friction     (Sonnet 4.6; honors --dry-run)
 
     Cost
     ----
@@ -2012,8 +2087,9 @@ def analyze(
     --dry-run / --no-dry-run  (default --dry-run)
     --no-thinking          Disable Sonnet adaptive thinking across all stages.
     --skip-<stage>         Drop a stage:
-                           embed, cluster, community, classify, trajectory,
-                           conflicts, friction. Terms is bound to cluster.
+                           ingest, embed, cluster, community, classify,
+                           trajectory, conflicts, friction. Terms is bound
+                           to cluster.
     --force-cluster        Rebuild clusters.parquet (+ terms) even if present.
     --force-community      Rebuild session_communities.parquet even if present.
     --glob / --subagent-glob  Narrow the corpus (applies to every stage).
@@ -2058,7 +2134,23 @@ def analyze(
     # the freshly written data.
     con = _open_connection_full(settings)
     try:
-        # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
+        # 1. Ingest stamps (zero-cost: tiktoken + blake2b SimHash).  Always
+        # safe to run -- pure CPU, no Bedrock.  Honors --dry-run to support
+        # an agent's "preview before commit" pattern even though the cost is
+        # zero.  Resolution pass is wired so embed (next) can read the
+        # ``canonical_uuid`` column to skip near-dup messages.
+        if not skip_ingest:
+            if dry_run:
+                n = _ingest_count_pending(con, settings, since_days=since_days, limit=limit)
+                logger.info("analyze/ingest: {} candidate rows (dry_run=True)", n)
+            else:
+                stamped = _ingest_stamp_messages(con, settings, since_days=since_days, limit=limit)
+                _refresh_analytics_views(con, settings)
+                resolved = _ingest_resolve_canonicals(con, settings)
+                logger.info("analyze/ingest: stamped={} resolved={}", stamped, resolved)
+                _refresh_analytics_views(con, settings)
+
+        # 2. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
         if not skip_embed:
             n = asyncio.run(
                 run_backfill(
@@ -2803,7 +2895,7 @@ def _default(*, common: Common | None = None) -> None:
     del common
     print("claude-sql - pass a subcommand or --help")
     print("  schema | query | explain | shell | list-cache")
-    print("  embed | search")
+    print("  ingest | embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
     print("  bind | resolve | review-sheet")
