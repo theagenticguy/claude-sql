@@ -215,7 +215,6 @@ def _team_settings(corpus_root: Path, tmp_path: Path) -> Settings:
         user_skills_dir=cache / "skills",
         plugins_cache_dir=cache / "plugins",
         checkpoint_db_path=cache / "claude_sql.duckdb",
-        hnsw_db_path=cache / "hnsw.duckdb",
         duckdb_temp_dir=cache / "duckdb_tmp",
     )
 

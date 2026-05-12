@@ -1,4 +1,4 @@
-"""Durable retry queue backed by the persistent claude-sql DuckDB file.
+"""Durable retry queue backed by SQLite WAL.
 
 When a Bedrock call fails in a way that's worth retrying (parse failure,
 throttle that outlived tenacity's stop-after-attempt, transient model
@@ -7,67 +7,73 @@ queue before starting fresh work, so a mid-run crash never costs us the
 rows we already paid for.
 
 One row per ``(pipeline, unit_id)``. ``unit_id`` is ``session_id`` for
-``classify`` / ``conflicts`` and the message ``uuid`` for ``trajectory``.
-Semantics are "upsert with attempt counter":
+``classify`` / ``conflicts`` / ``user_friction`` and the message ``uuid`` for
+``trajectory``. Semantics are "upsert with attempt counter":
 
 - First failure  → insert with attempts=1, next_attempt_at = now + 2 min.
 - Retry failure  → update attempts += 1, next_attempt_at = now + 2^attempts min (cap 60).
 - Retry success  → ``completed_at`` stamped; row stays as audit trail.
 
-Lives in the same ``~/.claude/claude_sql.duckdb`` as the checkpoint
-table so a single file holds all durable worker state.
+Lives in the same ``~/.claude/state.db`` as the checkpoint table so a
+single SQLite file holds all durable worker state.
 """
 
 from __future__ import annotations
 
-import time
+import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import duckdb
-
-from claude_sql.checkpointer import PIPELINE_NAMES
+from claude_sql.checkpointer import (
+    _SCHEMA_BOOTSTRAP_LOCK,
+    _SCHEMA_BOOTSTRAPPED,
+    PIPELINE_NAMES,
+    _connect as _checkpoint_connect,
+    _from_iso,
+    _legacy_duckdb_path,
+    _to_iso,
+)
 
 MAX_ATTEMPTS_DEFAULT: int = 5
 _BACKOFF_CAP_MIN: int = 60
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS retry_queue (
-    pipeline        VARCHAR   NOT NULL,
-    unit_id         VARCHAR   NOT NULL,
-    error           VARCHAR   NOT NULL,
-    attempts        INTEGER   NOT NULL DEFAULT 0,
-    next_attempt_at TIMESTAMP NOT NULL,
-    created_at      TIMESTAMP NOT NULL,
-    completed_at    TIMESTAMP,
+    pipeline        TEXT    NOT NULL,
+    unit_id         TEXT    NOT NULL,
+    error           TEXT    NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    completed_at    TEXT,
     PRIMARY KEY (pipeline, unit_id)
 );
 """
 
 
-def _connect(path: Path, *, max_attempts: int = 20) -> duckdb.DuckDBPyConnection:
-    """Open the queue DB, retrying on lock contention.
+def _connect(path: Path, *, max_attempts: int = 20) -> sqlite3.Connection:
+    """Open the queue DB. Reuses the checkpointer connection helper.
 
-    The same DB file backs both ``session_checkpoint`` and ``retry_queue``;
-    three pipelines running in parallel will occasionally collide on the
-    file lock. Retry with exponential backoff so concurrent callers
-    serialize instead of crashing.
+    Both tables live in the same SQLite file. The checkpointer's ``_connect``
+    handles WAL pragma setup, schema bootstrap, and the one-time DuckDB
+    migration. We additionally ensure the ``retry_queue`` table exists.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    delay = 0.05
-    last_err: duckdb.IOException | None = None
-    for _ in range(max_attempts):
-        try:
-            con = duckdb.connect(str(path))
+    con = _checkpoint_connect(path)
+    # Schema bootstrap once per process per path — see _SCHEMA_BOOTSTRAPPED in
+    # checkpointer.py. Distinct sentinel so retry_queue's CREATE doesn't run
+    # on every open. Locked to defeat the "two threads both win the
+    # not-bootstrapped check" race that would double-issue DDL and trip the
+    # writer lock.
+    key = f"retry::{path.resolve()}"
+    with _SCHEMA_BOOTSTRAP_LOCK:
+        if key not in _SCHEMA_BOOTSTRAPPED:
+            prior = con.isolation_level
+            con.isolation_level = None  # autocommit for DDL — no implicit transaction wrap
             con.execute(_CREATE_TABLE_SQL)
-            return con
-        except duckdb.IOException as exc:
-            last_err = exc
-            time.sleep(delay)
-            delay = min(delay * 1.5, 1.6)
-    assert last_err is not None  # noqa: S101 — loop-postcondition invariant
-    raise last_err
+            con.isolation_level = prior
+            _SCHEMA_BOOTSTRAPPED.add(key)
+    return con
 
 
 def _backoff_delta(attempts: int) -> timedelta:
@@ -90,7 +96,8 @@ def enqueue(
     """
     if pipeline not in PIPELINE_NAMES:
         raise ValueError(f"unknown pipeline: {pipeline!r}")
-    cur = (now or datetime.now(UTC)).replace(tzinfo=None)
+    cur = now or datetime.now(UTC)
+    cur_iso = _to_iso(cur)
     con = _connect(db_path)
     try:
         row = con.execute(
@@ -99,13 +106,23 @@ def enqueue(
         ).fetchone()
         prev = int(row[0]) if row else 0
         attempts = prev + 1
-        next_at = cur + _backoff_delta(attempts)
-        con.execute(
-            "INSERT OR REPLACE INTO retry_queue "
-            "(pipeline, unit_id, error, attempts, next_attempt_at, created_at, completed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-            [pipeline, unit_id, error[:2000], attempts, next_at, cur],
+        next_at = (cur if isinstance(cur, datetime) else datetime.now(UTC)) + _backoff_delta(
+            attempts
         )
+        next_at_iso = _to_iso(next_at)
+        con.execute(
+            "INSERT INTO retry_queue "
+            "(pipeline, unit_id, error, attempts, next_attempt_at, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+            "ON CONFLICT(pipeline, unit_id) DO UPDATE SET "
+            "error = excluded.error, "
+            "attempts = excluded.attempts, "
+            "next_attempt_at = excluded.next_attempt_at, "
+            "created_at = excluded.created_at, "
+            "completed_at = NULL",
+            [pipeline, unit_id, error[:2000], attempts, next_at_iso, cur_iso],
+        )
+        con.commit()
     finally:
         con.close()
     return attempts
@@ -120,9 +137,10 @@ def drain(
     limit: int | None = None,
 ) -> list[str]:
     """Return unit_ids eligible for retry (not completed, attempts<max, due now)."""
-    if not db_path.exists():
+    if not db_path.exists() and not _legacy_duckdb_path(db_path).exists():
         return []
-    cur = (now or datetime.now(UTC)).replace(tzinfo=None)
+    cur = now or datetime.now(UTC)
+    cur_iso = _to_iso(cur)
     con = _connect(db_path)
     sql = (
         "SELECT unit_id FROM retry_queue "
@@ -130,7 +148,7 @@ def drain(
         "  AND attempts < ? AND next_attempt_at <= ? "
         "ORDER BY next_attempt_at"
     )
-    params: list[object] = [pipeline, max_attempts, cur]
+    params: list[object] = [pipeline, max_attempts, cur_iso]
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -152,14 +170,15 @@ def mark_done(
     ids = list(unit_ids)
     if not ids:
         return 0
-    cur = (now or datetime.now(UTC)).replace(tzinfo=None)
+    cur_iso = _to_iso(now or datetime.now(UTC))
     con = _connect(db_path)
     try:
         con.executemany(
             "UPDATE retry_queue SET completed_at = ? "
             "WHERE pipeline = ? AND unit_id = ? AND completed_at IS NULL",
-            [(cur, pipeline, uid) for uid in ids],
+            [(cur_iso, pipeline, uid) for uid in ids],
         )
+        con.commit()
     finally:
         con.close()
     return len(ids)
@@ -167,7 +186,7 @@ def mark_done(
 
 def pending_count(db_path: Path, *, pipeline: str) -> int:
     """Count not-yet-completed rows for one pipeline."""
-    if not db_path.exists():
+    if not db_path.exists() and not _legacy_duckdb_path(db_path).exists():
         return 0
     con = _connect(db_path)
     try:
@@ -178,3 +197,14 @@ def pending_count(db_path: Path, *, pipeline: str) -> int:
     finally:
         con.close()
     return int(row[0]) if row else 0
+
+
+# Re-export _from_iso for tests that need it
+__all__ = [
+    "MAX_ATTEMPTS_DEFAULT",
+    "_from_iso",
+    "drain",
+    "enqueue",
+    "mark_done",
+    "pending_count",
+]

@@ -103,7 +103,6 @@ def _settings(tmp_path: Path) -> Settings:
         user_friction_parquet_path=cache / "user_friction",
         skills_catalog_parquet_path=cache / "skills_catalog.parquet",
         checkpoint_db_path=cache / "claude_sql.duckdb",
-        hnsw_db_path=cache / "hnsw.duckdb",
         duckdb_temp_dir=cache / "duckdb_tmp",
         user_skills_dir=cache / "skills",
         plugins_cache_dir=cache / "plugins_cache",
@@ -322,16 +321,10 @@ def test_classify_async_transient_error_enqueues_retry(
 ) -> None:
     """``RuntimeError("transient")`` → no parquet row, ``retry_queue.enqueue`` called.
 
-    NOTE: ``retry_queue.PIPELINE_NAMES`` is currently ``("classify",
-    "trajectory", "conflicts")`` but ``friction_worker`` calls
-    ``retry_queue.enqueue(..., pipeline="user_friction", ...)`` — the
-    underlying validation rejects that name with a ``ValueError``. To
-    keep this test focused on the friction-worker branch (lines 412-418)
-    rather than the retry-queue validation bug, we patch
-    ``retry_queue.enqueue`` itself and assert it gets called with the
-    expected unit_id. ``retry_queue.pending_count`` for ``user_friction``
-    therefore stays 0 (the real DB never gets touched), but the call
-    capture proves the friction worker took the retry-queue branch.
+    ``user_friction`` is now in ``PIPELINE_NAMES`` (T2.1), so the underlying
+    ``retry_queue.enqueue`` succeeds end-to-end. We still patch ``enqueue`` to
+    capture the call so the assertion stays focused on the friction-worker
+    branch rather than the retry-queue persistence path.
     """
     con = _make_con(
         [

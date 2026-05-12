@@ -31,9 +31,11 @@ dependencies = [
     "anyio>=4.13.0",
     "boto3>=1.42.91",
     "cyclopts>=4.10.2",
-    "duckdb>=1.5.2",
+    # 1.5.1 floor: lance core extension (used by embeddings store) became core. Upper-bounded to <2 to stay on the 1.x train.
+    "duckdb>=1.5.2,<2",
     "hdbscan>=0.8.40",
     "igraph>=1.0.0,<2.0",
+    "lancedb>=0.30,<0.31",
     "leidenalg>=0.11.0,<0.12",
     "loguru>=0.7.3",
     "numpy>=2.4.4",

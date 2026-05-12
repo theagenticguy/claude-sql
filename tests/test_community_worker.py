@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -11,6 +12,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+from claude_sql import lance_store
 from claude_sql.community_worker import (
     NOISE_COMMUNITY_ID,
     _build_igraph,
@@ -21,7 +23,7 @@ from claude_sql.community_worker import (
     run_communities,
 )
 from claude_sql.config import Settings
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.sql_views import register_raw, register_views, register_vss
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -113,22 +115,27 @@ def connected_settings(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, Setti
     e /= np.linalg.norm(e, axis=1, keepdims=True)
 
     msg_uuids = [f"u{i}-1" if k == 0 else f"a{i}-1" for i in range(4) for k in range(2)]
+    now = datetime.now(UTC)
     emb_df = pl.DataFrame(
         {
             "uuid": msg_uuids,
             "model": ["test"] * 8,
             "dim": [dim] * 8,
             "embedding": e,
+            "embedded_at": [now] * 8,
         },
         schema={
             "uuid": pl.Utf8,
             "model": pl.Utf8,
-            "dim": pl.UInt16,
+            "dim": pl.Int32,
             "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
         },
     )
-    emb_path = tmp_path / "embeddings.parquet"
-    emb_df.write_parquet(emb_path)
+    lance_uri = tmp_path / "embeddings_lance"
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    lance_store.add_chunk(tbl, emb_df)
 
     # Subagent placeholder so ``read_json`` schema inference picks up every
     # column ``register_views`` needs (otherwise the glob matches zero files).
@@ -152,7 +159,7 @@ def connected_settings(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, Setti
     )
 
     settings = Settings(
-        embeddings_parquet_path=emb_path,
+        lance_uri=lance_uri,
         communities_parquet_path=tmp_path / "communities.parquet",
         community_profile_parquet_path=tmp_path / "community_profile.parquet",
         default_glob=str(proj / "*.jsonl"),
@@ -175,6 +182,9 @@ def connected_settings(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, Setti
         subagent_meta_glob=settings.subagent_meta_glob,
     )
     register_views(con)
+    # Register the message_embeddings view backed by the Lance dataset so
+    # community_worker._load_session_centroids can join through it.
+    register_vss(con, lance_uri=lance_uri, dim=dim)
     return con, settings
 
 
@@ -219,14 +229,13 @@ def test_load_session_centroids_matches_numpy_reference(
     from claude_sql.community_worker import _load_session_centroids
 
     con, settings = connected_settings
-    sids, centroids = _load_session_centroids(con, settings.embeddings_parquet_path)
+    sids, centroids = _load_session_centroids(con, settings.lance_uri)
 
-    # Pull the same join via Polars and recompute the centroids in-process.
-    parts = list(settings.embeddings_parquet_path.glob("part-*.parquet"))
-    if parts:
-        emb_df = pl.read_parquet([str(p) for p in parts])
-    else:
-        emb_df = pl.read_parquet(settings.embeddings_parquet_path)
+    # Pull the same join via Lance + Polars and recompute the centroids in-process.
+    db = lance_store.connect_db(settings.lance_uri)
+    tbl = db.open_table(lance_store.TABLE_NAME)
+    raw = pl.from_arrow(tbl.to_arrow())
+    emb_df = raw if isinstance(raw, pl.DataFrame) else raw.to_frame()
     msg_df = con.execute(
         "SELECT CAST(uuid AS VARCHAR) AS uuid, "
         "CAST(session_id AS VARCHAR) AS session_id FROM messages"

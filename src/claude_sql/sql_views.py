@@ -26,13 +26,18 @@ Design notes
   idempotent on partially-populated systems.
 * All views use ``CREATE OR REPLACE`` so callers may safely re-register.
 * Globs are inlined into DDL (DuckDB rejects prepared parameters as
-  table-function arguments); ``sample_size`` and ``maximum_object_size`` are
-  likewise inlined (guarded by Python ``int`` typing).
+  table-function arguments).
+* ``v_raw_events`` and ``v_raw_subagents`` are materialized as ``CREATE TEMP
+  TABLE`` with an explicit ``columns={...}`` projection so JSON schema
+  inference runs once instead of once per ``DESCRIBE``/view bind. The
+  ``columns`` dict is a *strict projection filter* in DuckDB 1.5+: every
+  field referenced by any downstream view or macro must appear in the dict
+  or it silently disappears. ``union_by_name=true`` stays enabled to NULL-
+  fill the listed fields across files with per-file drift.
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
 from pathlib import Path
 
@@ -120,7 +125,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     "messages": (
         ("uuid", "VARCHAR"),
         ("parent_uuid", "JSON"),
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("type", "VARCHAR"),
         ("is_sidechain", "BOOLEAN"),
@@ -135,7 +140,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("source_file", "VARCHAR"),
     ),
     "content_blocks": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("message_uuid", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
@@ -150,14 +155,14 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "messages_text": (
         ("uuid", "VARCHAR"),
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
         ("text_content", "VARCHAR"),
     ),
     "tool_calls": (
         ("message_uuid", "VARCHAR"),
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("tool_name", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
@@ -165,13 +170,13 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "tool_results": (
         ("message_uuid", "VARCHAR"),
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("tool_use_id", "VARCHAR"),
         ("content", "JSON"),
     ),
     "todo_events": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("written_at", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("subject", "VARCHAR"),
@@ -180,14 +185,14 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("snapshot_ix", "BIGINT"),
     ),
     "todo_state_current": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("subject", "VARCHAR"),
         ("status", "VARCHAR"),
         ("active_form", "VARCHAR"),
         ("written_at", "TIMESTAMP"),
     ),
     "subagent_spawns": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("spawned_at", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
@@ -198,7 +203,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("run_in_background", "VARCHAR"),
     ),
     "task_creations": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("created_at", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
@@ -209,7 +214,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("metadata", "JSON"),
     ),
     "task_updates": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("updated_at", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
@@ -220,7 +225,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("owner", "VARCHAR"),
     ),
     "tasks_state_current": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("task_id", "VARCHAR"),
         ("subject", "VARCHAR"),
         ("active_form", "VARCHAR"),
@@ -229,7 +234,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("last_updated_at", "TIMESTAMP"),
     ),
     "task_spawns": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("spawned_at", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
@@ -239,7 +244,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("prompt", "VARCHAR"),
     ),
     "skill_invocations": (
-        ("session_id", "UUID"),
+        ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("message_uuid", "VARCHAR"),
         ("source", "VARCHAR"),
@@ -382,21 +387,99 @@ def _sql_str(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Explicit projection for ``v_raw_events`` / ``v_raw_subagents``.
+#
+# DuckDB 1.5's ``read_json(columns={...})`` is a STRICT projection filter:
+# every field not listed is silently dropped. Listing exactly what the
+# downstream views and macros touch lets DuckDB skip JSON schema inference
+# entirely — the dominant cost on the live ~10K-file / ~2GB corpus, which
+# was previously paid every time any view bound to ``v_raw_events``
+# (every ``DESCRIBE``, every cold-start ``SELECT count(*) FROM sessions``).
+#
+# Drift discipline: when a downstream view in :func:`register_views` adds a
+# new top-level field reference, add it here too — otherwise the view will
+# silently return NULL for that column. The
+# ``test_view_schema_matches_describe_all`` drift test catches the column
+# disappearing from any of the 18 v1 views.
+_MESSAGE_STRUCT_TYPE: str = (
+    "STRUCT("
+    '"role" VARCHAR, '
+    '"content" JSON, '
+    "model VARCHAR, "
+    "stop_reason VARCHAR, "
+    "usage STRUCT("
+    "input_tokens BIGINT, "
+    "output_tokens BIGINT, "
+    "cache_read_input_tokens BIGINT, "
+    "cache_creation_input_tokens BIGINT"
+    ")"
+    ")"
+)
+# Type choices: ``sessionId`` and ``uuid`` -> ``VARCHAR`` (not ``UUID``)
+# because the live corpus has occasional non-canonical session/uuid strings
+# (truncated trailing lines from in-flight transcripts, manually edited
+# fixtures in tests, older Claude Code versions that emitted free-form
+# session ids). Strict ``UUID`` typing in DuckDB silently nulls anything
+# that doesn't match the canonical hex layout, which is invisible at
+# read_json time but devastating at view-bind time. ``parentUuid`` ->
+# ``JSON`` because the field is sometimes null and sometimes a UUID-shaped
+# string and downstream views only stringify or json_extract over it.
+_RAW_EVENT_COLUMNS: dict[str, str] = {
+    "uuid": "VARCHAR",
+    "sessionId": "VARCHAR",
+    "parentUuid": "JSON",
+    "type": "VARCHAR",
+    "timestamp": "TIMESTAMP",
+    "isSidechain": "BOOLEAN",
+    "cwd": "VARCHAR",
+    "gitBranch": "VARCHAR",
+    "message": _MESSAGE_STRUCT_TYPE,
+}
+_RAW_SUBAGENT_COLUMNS: dict[str, str] = {
+    "uuid": "VARCHAR",
+    "sessionId": "VARCHAR",
+    "parentUuid": "JSON",
+    "type": "VARCHAR",
+    "timestamp": "TIMESTAMP",
+    "message": _MESSAGE_STRUCT_TYPE,
+}
+# Inlined ``read_json`` upper bound. Bumped from the 16 MB default to handle
+# the rare jumbo transcript line (large tool_result blobs from web pages or
+# repo dumps). Constant rather than a parameter — no caller has needed to
+# override it in production.
+_MAX_OBJECT_SIZE: int = 67_108_864
+
+
+def _render_columns_clause(columns: dict[str, str]) -> str:
+    """Render a ``columns={...}`` clause body for ``read_json``.
+
+    The keys are bare DuckDB identifiers (no quoting) and the values are
+    SQL type strings wrapped in single quotes. Both halves come from
+    code-side constants — never from user input — so escaping is defensive
+    only.
+    """
+    return ", ".join(f"{name}: {_sql_str(typ)}" for name, typ in columns.items())
+
+
 def register_raw(
     con: duckdb.DuckDBPyConnection,
     *,
     glob: str | None = None,
     subagent_glob: str | None = None,
     subagent_meta_glob: str | None = None,
-    sample_size: int = -1,
-    maximum_object_size: int = 67_108_864,
 ) -> None:
-    """Create the low-level ``v_raw_events`` and ``v_raw_subagents`` views.
+    """Create the low-level raw readers as TEMP TABLEs / a meta VIEW.
 
-    Both views are glob-driven zero-copy scans of JSONL via ``read_json`` with
-    ``filename=true`` for file-level predicate pushdown. The subagent
-    ``meta.json`` files are registered separately as ``v_raw_subagent_meta``
-    so ``subagent_sessions`` can join them in.
+    ``v_raw_events`` and ``v_raw_subagents`` are materialized as
+    ``CREATE TEMP TABLE`` with an explicit ``columns={...}`` projection over
+    ``read_json``. This shape pays the JSON schema inference cost exactly
+    once per connection — every downstream view bind is a cheap catalog
+    lookup against a known-shape table instead of a re-inference of the
+    underlying glob.
+
+    The subagent ``meta.json`` files are tiny (one object per file) and
+    bind so quickly that ``v_raw_subagent_meta`` stays as a ``CREATE OR
+    REPLACE VIEW``.
 
     Parameters
     ----------
@@ -409,16 +492,11 @@ def register_raw(
     subagent_meta_glob
         Glob for sibling ``*.meta.json`` files. Defaults to
         :data:`SUBAGENT_META_GLOB`.
-    sample_size
-        ``read_json`` schema-inference sample size. ``-1`` forces a full scan.
-    maximum_object_size
-        Maximum JSON object size in bytes (``read_json`` option). Must be an
-        int so we can inline it safely.
 
     Raises
     ------
     duckdb.Error
-        If any view DDL fails. Logged via ``logger.exception`` before re-raise.
+        If any DDL fails. Logged via ``logger.exception`` before re-raise.
     """
     glob = glob if glob is not None else DEFAULT_GLOB
     subagent_glob = subagent_glob if subagent_glob is not None else SUBAGENT_GLOB
@@ -426,14 +504,13 @@ def register_raw(
         subagent_meta_glob if subagent_meta_glob is not None else SUBAGENT_META_GLOB
     )
 
-    # Inline numeric literals; type-narrow via int() to neutralize injection.
-    sample_size_i = int(sample_size)
-    max_obj_i = int(maximum_object_size)
+    raw_event_cols = _render_columns_clause(_RAW_EVENT_COLUMNS)
+    raw_subagent_cols = _render_columns_clause(_RAW_SUBAGENT_COLUMNS)
 
     try:
         con.execute(
             f"""
-            CREATE OR REPLACE VIEW v_raw_events AS
+            CREATE OR REPLACE TEMP TABLE v_raw_events AS
             SELECT *,
                    filename AS source_file,
                    regexp_extract(filename, '([^/]+)\\.jsonl$', 1) AS session_id_file
@@ -443,20 +520,19 @@ def register_raw(
                 union_by_name=true,
                 filename=true,
                 ignore_errors=true,
-                sample_size={sample_size_i},
-                maximum_object_size={max_obj_i}
+                columns={{{raw_event_cols}}},
+                maximum_object_size={_MAX_OBJECT_SIZE}
             );
             """
         )
         logger.debug(
-            "Registered v_raw_events from glob {} with sample_size={}",
+            "Registered v_raw_events (TEMP TABLE) from glob {} with explicit columns",
             glob,
-            sample_size_i,
         )
 
         con.execute(
             f"""
-            CREATE OR REPLACE VIEW v_raw_subagents AS
+            CREATE OR REPLACE TEMP TABLE v_raw_subagents AS
             SELECT *,
                    filename AS source_file,
                    regexp_extract(
@@ -475,14 +551,16 @@ def register_raw(
                 union_by_name=true,
                 filename=true,
                 ignore_errors=true,
-                sample_size={sample_size_i},
-                maximum_object_size={max_obj_i}
+                columns={{{raw_subagent_cols}}},
+                maximum_object_size={_MAX_OBJECT_SIZE}
             );
             """
         )
-        logger.debug("Registered v_raw_subagents from glob {}", subagent_glob)
+        logger.debug("Registered v_raw_subagents (TEMP TABLE) from glob {}", subagent_glob)
 
         # meta.json files are one object per file (not NDJSON) -> format='auto'.
+        # Tiny relative to the transcript globs; inference is cheap so we
+        # keep the VIEW shape and let DuckDB infer the schema.
         con.execute(
             f"""
             CREATE OR REPLACE VIEW v_raw_subagent_meta AS
@@ -1080,6 +1158,8 @@ def _safe_macro(con: duckdb.DuckDBPyConnection, name: str, ddl: str) -> None:
 def register_macros(
     con: duckdb.DuckDBPyConnection,
     settings: Settings | None = None,
+    *,
+    skip_vss: bool = False,
 ) -> None:
     """Create SQL macros used by the CLI and analysts.
 
@@ -1107,6 +1187,13 @@ def register_macros(
     settings
         Optional :class:`Settings` for pricing overrides; falls back to
         :data:`claude_sql.config.DEFAULT_PRICING`.
+    skip_vss
+        When ``True``, skip the ``semantic_search`` macro registration.
+        DuckDB binds macro bodies at CREATE time, so the macro body's
+        reference to ``message_embeddings`` would fail to bind whenever the
+        VSS extension and the embeddings table are absent. Set this to match
+        whatever was passed to :func:`register_all`'s ``skip_vss`` so the
+        non-vector connection path stays self-consistent.
     """
     pricing = settings.pricing if settings is not None else DEFAULT_PRICING
     pricing_rows = _pricing_values_clause(pricing)
@@ -1189,18 +1276,24 @@ def register_macros(
 
     # ``ORDER BY array_distance`` triggers the HNSW index rewrite; cosine
     # similarity and distance are both surfaced for human-readable ranking.
-    con.execute(
-        """
-        CREATE OR REPLACE MACRO semantic_search(query_vec, k) AS TABLE (
-            SELECT me.uuid,
-                   array_cosine_similarity(me.embedding, query_vec) AS sim,
-                   array_distance(me.embedding, query_vec)          AS distance
-            FROM message_embeddings me
-            ORDER BY array_distance(me.embedding, query_vec)
-            LIMIT k
-        );
-        """
-    )
+    # Skip when VSS was not registered: DuckDB binds macro bodies at CREATE
+    # time, so referencing ``message_embeddings`` here would fail outright
+    # whenever the table doesn't exist on the connection.
+    if not skip_vss:
+        con.execute(
+            """
+            CREATE OR REPLACE MACRO semantic_search(query_vec, k) AS TABLE (
+                SELECT me.uuid,
+                       array_cosine_similarity(me.embedding, query_vec) AS sim,
+                       array_distance(me.embedding, query_vec)          AS distance
+                FROM message_embeddings me
+                ORDER BY array_distance(me.embedding, query_vec)
+                LIMIT k
+            );
+            """
+        )
+    else:
+        logger.debug("Skipped semantic_search macro (skip_vss=True)")
 
     # Skill / slash-command leaderboard over the last N days.  Resolves
     # against ``skill_usage``, which always exists (with or without the
@@ -1247,9 +1340,10 @@ def register_macros(
         """,
     )
 
+    _semantic_search_part = "" if skip_vss else "semantic_search, "
     logger.debug(
         "Registered macros: ago, model_used, cost_estimate, tool_rank, "
-        "todo_velocity, subagent_fanout, semantic_search, skill_rank, "
+        f"todo_velocity, subagent_fanout, {_semantic_search_part}skill_rank, "
         "skill_source_mix"
     )
 
@@ -1500,221 +1594,123 @@ def register_macros(
 # ---------------------------------------------------------------------------
 
 
-def _hnsw_rebuild_needed(parquet: Path, hnsw_db: Path) -> bool:
-    """Decide from filesystem state alone whether the parquet has shifted.
-
-    Handles both legacy single-file caches and sharded directories: for a
-    sharded directory we compare against the *latest* part file's mtime so
-    a brand-new shard invalidates the persisted HNSW even when the
-    directory's own mtime hasn't moved (some filesystems update dir mtime
-    only on add/remove, not on touch of children).
-
-    This is a *necessary* but not sufficient signal — even when the
-    parquet hasn't moved, the attached store might be empty (for instance,
-    DuckDB's ATTACH on a missing path creates a ~12 KB header-only file
-    before any tables exist). Catalog existence is checked separately
-    inside ``register_vss`` after the ATTACH.
-    """
-    if not hnsw_db.exists():
-        return True
-    parts = iter_part_files(parquet)
-    if not parts:
-        # No source-of-truth on disk yet. The attached store is whatever
-        # was previously persisted; nothing to rebuild from.
-        return False
-    latest_ns = max(p.stat().st_mtime_ns for p in parts)
-    return latest_ns > hnsw_db.stat().st_mtime_ns
-
-
-def _attached_embeddings_table_present(con: duckdb.DuckDBPyConnection) -> bool:
-    """Return True when ``hnsw_store.main.message_embeddings`` exists in the catalog."""
-    row = con.execute(
-        """
-        SELECT count(*)
-        FROM duckdb_tables()
-        WHERE database_name = 'hnsw_store'
-          AND schema_name = 'main'
-          AND table_name = 'message_embeddings';
-        """
-    ).fetchone()
-    return bool(row and row[0])
-
-
 def register_vss(
     con: duckdb.DuckDBPyConnection,
     *,
-    embeddings_parquet: Path,
-    hnsw_db_path: Path | None = None,
+    embeddings_parquet: Path | None = None,
+    lance_uri: Path | None = None,
     dim: int = 1024,
     metric: str = "cosine",
-    ef_construction: int = 128,
-    ef_search: int = 64,
-    m: int = 16,
-    m0: int = 32,
 ) -> bool:
-    """Install + load VSS and bind ``message_embeddings`` over a persisted HNSW store.
+    """Bind ``message_embeddings`` over a LanceDB local dataset.
 
-    When ``hnsw_db_path`` is provided the embeddings table and its HNSW
-    index live inside that DuckDB file (ATTACHed under the alias
-    ``hnsw_store``) so reopening a CLI command reuses the index instead of
-    rebuilding it from parquet. The store is rebuilt only when missing,
-    suspiciously small, or older than the embeddings parquet on disk; an
-    ``IOException`` during attach unlinks the store and rebuilds.
-
-    When ``hnsw_db_path`` is ``None`` (legacy / tests) the table and index
-    stay in the connection's main database, matching the original
-    in-memory behavior.
+    LanceDB stores embeddings + its IVF_HNSW_SQ index in one place; reads
+    come back through DuckDB via the lance core extension
+    (``INSTALL lance; LOAD lance; ATTACH (TYPE LANCE)``).
 
     Parameters
     ----------
     con
         Open DuckDB connection.
     embeddings_parquet
-        Path to the embeddings parquet produced by ``claude-sql embed``.
-    hnsw_db_path
-        Persistent DuckDB file that backs the HNSW index, or ``None`` to
-        keep everything in the connection's main database.
+        Legacy parquet shard directory. Used only for one-time migration
+        when no Lance dataset exists yet.
+    lance_uri
+        Local LanceDB dataset directory. When ``None``, falls back to
+        ``embeddings_parquet`` for the legacy path resolution.
     dim
-        Fixed-length embedding dimension. Must match the parquet's
-        ``embedding`` column. Defaults to 1024 (Cohere Embed v4 mid-tier).
+        Fixed-length embedding dimension (matches Lance schema).
     metric
-        HNSW distance metric. One of ``cosine``, ``l2sq``, ``ip``.
-    ef_construction, ef_search, m, m0
-        Standard HNSW tuning knobs. ``m`` and ``m0`` map to DuckDB's ``M``
-        and ``M0`` parameters.
+        Distance metric; ``cosine`` is the default and what the
+        ``semantic_search`` macro expects.
 
     Returns
     -------
     bool
-        ``True`` if the table was populated and the HNSW index is usable;
-        ``False`` if the parquet file does not exist yet.
-
-    Notes
-    -----
-    VSS only supports ``FLOAT`` element type. Embeddings persisted as
-    ``DOUBLE[]`` are cast via ``CAST(embedding AS FLOAT[<dim>])``.
-    Persistence rides on the experimental
-    ``hnsw_enable_experimental_persistence`` flag — when corruption
-    surfaces, ``rm`` the file and the next call rebuilds from parquet.
+        ``True`` when the Lance table is reachable through the
+        ``message_embeddings`` view; ``False`` when no embeddings exist
+        yet (the view is created over an empty schema so downstream
+        ``CREATE MACRO semantic_search`` can still bind).
     """
+    if lance_uri is None and embeddings_parquet is not None:
+        # Default Lance URI is a sibling directory of the legacy parquet path.
+        lance_uri = embeddings_parquet.parent / "embeddings_lance"
+    if lance_uri is None:
+        raise ValueError("register_vss needs either lance_uri or embeddings_parquet")
+
     dim_i = int(dim)
-    ef_c_i = int(ef_construction)
-    ef_s_i = int(ef_search)
-    m_i = int(m)
-    m0_i = int(m0)
-    if metric not in {"cosine", "l2sq", "ip"}:
-        raise ValueError(f"Unsupported HNSW metric: {metric!r}")
+    if metric not in {"cosine", "l2", "dot"}:
+        raise ValueError(f"Unsupported Lance metric: {metric!r}")
 
-    con.execute("INSTALL vss;")
-    con.execute("LOAD vss;")
-    con.execute("SET hnsw_enable_experimental_persistence = true;")
+    from claude_sql import lance_store
 
-    use_persistence = hnsw_db_path is not None
-    schema_qualifier = ""
-    persisted_path: Path | None = hnsw_db_path
-    if use_persistence and persisted_path is not None:
-        persisted_path.parent.mkdir(parents=True, exist_ok=True)
+    # One-time migration: copy legacy parquet shards into Lance if Lance is
+    # empty and legacy shards exist. Idempotent; logs only when work happens.
+    if embeddings_parquet is not None:
         try:
-            con.execute(f"ATTACH '{persisted_path}' AS hnsw_store;")
-        except duckdb.IOException as exc:
-            logger.warning(
-                "ATTACH on {} failed ({}); unlinking and rebuilding the HNSW store.",
-                persisted_path,
-                exc,
+            lance_store.migrate_from_parquet_shards(
+                legacy_dir=embeddings_parquet,
+                lance_uri=lance_uri,
+                dim=dim_i,
+                delete_legacy=False,
             )
-            with contextlib.suppress(FileNotFoundError):
-                persisted_path.unlink()
-            con.execute(f"ATTACH '{persisted_path}' AS hnsw_store;")
-        # ``message_embeddings`` lives inside the attached store. Macros and
-        # readers reference it via a top-level VIEW so existing call sites
-        # (cli.py, the ``semantic_search`` macro) keep working unchanged.
-        schema_qualifier = "hnsw_store.main."
+        except Exception as exc:  # noqa: BLE001 — migration is best-effort
+            logger.warning("Lance migration from {} skipped: {}", embeddings_parquet, exc)
 
-    parts = iter_part_files(embeddings_parquet)
-    if not parts:
+    con.execute("INSTALL lance;")
+    con.execute("LOAD lance;")
+
+    # Empty-dataset gate: probe LanceDB for the embeddings table itself, not
+    # the directory's filesystem state. A directory that exists with metadata
+    # but no embeddings table (legitimate intermediate state, e.g. after a
+    # `connect_db` call that never created a table) ATTACHes cleanly but then
+    # blows up at view-bind time with `Catalog Error: Table … embeddings does
+    # not exist`. The right gate is "is the table actually there?".
+    db = lance_store.connect_db(lance_uri)
+    if not lance_store._has_table(db, lance_store.TABLE_NAME):
         logger.warning(
-            "No embeddings parquet at {}; skipping HNSW index build. "
-            "Run `claude-sql embed` to backfill.",
-            embeddings_parquet,
+            "No Lance embeddings table at {}; creating empty message_embeddings "
+            "table so semantic_search binds. Run `claude-sql embed` to backfill.",
+            lance_uri,
         )
         con.execute(
             f"""
-            CREATE OR REPLACE TABLE {schema_qualifier}message_embeddings (
-                uuid      VARCHAR PRIMARY KEY,
-                model     VARCHAR,
-                dim       USMALLINT,
-                embedding FLOAT[{dim_i}]
+            CREATE OR REPLACE TABLE message_embeddings (
+                uuid        VARCHAR PRIMARY KEY,
+                model       VARCHAR,
+                dim         INTEGER,
+                embedding   FLOAT[{dim_i}],
+                embedded_at TIMESTAMPTZ
             );
             """
         )
-        if use_persistence:
-            con.execute(
-                "CREATE OR REPLACE VIEW message_embeddings AS "
-                "SELECT * FROM hnsw_store.main.message_embeddings;"
-            )
         return False
 
-    rebuild = not use_persistence
-    if use_persistence and persisted_path is not None:
-        # Two reasons to rebuild: parquet is newer than the on-disk store,
-        # or the attached store is empty (newly created header-only file
-        # from ``ATTACH`` on a missing path).
-        rebuild = _hnsw_rebuild_needed(
-            embeddings_parquet, persisted_path
-        ) or not _attached_embeddings_table_present(con)
-
-    if rebuild:
-        # Drop any stale table+index in the target schema first so
-        # CREATE TABLE doesn't trip on an existing index. DROP TABLE
-        # cascades to dependent indexes.
-        con.execute(f"DROP TABLE IF EXISTS {schema_qualifier}message_embeddings;")
-        # ``parts`` may be a single legacy file or a list of shard files.
-        # Inline-escape each path because DDL doesn't accept prepared params.
-        path_literals = ", ".join(_sql_str(str(p)) for p in parts)
-        con.execute(
-            f"""
-            CREATE TABLE {schema_qualifier}message_embeddings AS
-            SELECT
-                uuid,
-                model,
-                dim,
-                CAST(embedding AS FLOAT[{dim_i}]) AS embedding
-            FROM read_parquet([{path_literals}]);
-            """
-        )
-        con.execute(
-            f"""
-            CREATE INDEX idx_msg_hnsw
-            ON {schema_qualifier}message_embeddings
-            USING HNSW (embedding)
-            WITH (
-                metric='{metric}',
-                ef_construction={ef_c_i},
-                ef_search={ef_s_i},
-                M={m_i},
-                M0={m0_i}
-            );
-            """
-        )
-        if use_persistence:
-            con.execute("CHECKPOINT hnsw_store;")
-
-    if use_persistence:
-        con.execute(
-            "CREATE OR REPLACE VIEW message_embeddings AS "
-            "SELECT * FROM hnsw_store.main.message_embeddings;"
-        )
-
-    row = con.execute(f"SELECT count(*) FROM {schema_qualifier}message_embeddings;").fetchone()
+    # ATTACH the Lance directory and project the embeddings table as a
+    # top-level view named ``message_embeddings``. Cast the embedding
+    # column to FLOAT[dim] so existing macros that depend on the fixed-
+    # size shape (``array_cosine_similarity``, ``array_distance``) keep
+    # working without changes.
+    con.execute(f"ATTACH '{lance_uri}' AS lance_store (TYPE LANCE);")
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW message_embeddings AS
+        SELECT
+            uuid,
+            model,
+            dim,
+            CAST(embedding AS FLOAT[{dim_i}]) AS embedding,
+            embedded_at
+        FROM lance_store.main.embeddings;
+        """
+    )
+    row = con.execute("SELECT count(*) FROM message_embeddings;").fetchone()
     count = int(row[0]) if row else 0
     logger.debug(
-        "{} {} embeddings (metric={}, M={}, ef_search={}, persistent={})",
-        "Built" if rebuild else "Reused persisted",
+        "Bound message_embeddings over Lance ({} rows, metric={}, dim={})",
         count,
         metric,
-        m_i,
-        ef_s_i,
-        use_persistence,
+        dim_i,
     )
     return True
 
@@ -1931,6 +1927,7 @@ def register_all(
     *,
     settings: Settings | None = None,
     include_analytics: bool = True,
+    skip_vss: bool = False,
 ) -> None:
     """Register raw views, derived views, VSS, analytics, and macros in order.
 
@@ -1947,6 +1944,12 @@ def register_all(
         analytics view registration entirely (useful in tests that only
         exercise v1 macros or when the caller will register analytics views
         out-of-band).
+    skip_vss
+        When ``True``, skip :func:`register_vss` entirely *and* skip the
+        ``semantic_search`` macro registration inside :func:`register_macros`.
+        Set this for connections that won't run vector queries — it spares
+        the ``INSTALL vss; LOAD vss; ATTACH hnsw.duckdb`` round-trips that
+        otherwise dominate a non-vector ``query`` cold start.
 
     Notes
     -----
@@ -1954,7 +1957,9 @@ def register_all(
 
     1. ``register_vss`` must run before ``register_macros`` because the
        ``semantic_search`` macro body references the ``message_embeddings``
-       table and DuckDB resolves macro bodies at creation time.
+       table and DuckDB resolves macro bodies at creation time. When
+       ``skip_vss=True`` the ``semantic_search`` macro is skipped too, so
+       the ordering still holds: nothing references a missing table.
     2. ``register_analytics`` must also run before ``register_macros`` so
        the analytics macros (``autonomy_trend``, ``cluster_top_terms``, ...)
        bind against the analytics views at macro-creation time.  When a
@@ -1969,20 +1974,17 @@ def register_all(
         subagent_meta_glob=settings.subagent_meta_glob,
     )
     register_views(con)
-    register_vss(
-        con,
-        embeddings_parquet=settings.embeddings_parquet_path,
-        hnsw_db_path=settings.hnsw_db_path,
-        dim=int(settings.output_dimension),
-        metric=settings.hnsw_metric,
-        ef_construction=settings.hnsw_ef_construction,
-        ef_search=settings.hnsw_ef_search,
-        m=settings.hnsw_m,
-        m0=settings.hnsw_m0,
-    )
+    if not skip_vss:
+        register_vss(
+            con,
+            embeddings_parquet=settings.embeddings_parquet_path,
+            lance_uri=settings.lance_uri,
+            dim=int(settings.output_dimension),
+            metric=settings.hnsw_metric,
+        )
     if include_analytics:
         register_analytics(con, settings=settings)
-    register_macros(con, settings=settings)
+    register_macros(con, settings=settings, skip_vss=skip_vss)
 
 
 # ---------------------------------------------------------------------------

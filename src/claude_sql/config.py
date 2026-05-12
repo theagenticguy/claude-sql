@@ -31,12 +31,20 @@ def _default_subagent_meta_glob() -> str:
 
 
 def _default_embeddings_parquet() -> Path:
-    # Sharded cache directory (see ``claude_sql.parquet_shards``).  Writers
-    # drop ``part-<ts_ns>.parquet`` files into it; readers glob the directory.
+    # Legacy parquet shard directory. Kept here for one-time migration only —
+    # the live embeddings store is now LanceDB (see ``_default_lance_uri``).
     # The field name keeps the ``_parquet_path`` suffix so existing call sites
-    # stay stable — only the *semantics* of the path moved from "single file"
-    # to "directory of parts".
+    # that hand the path to migrators / cache-list helpers stay stable.
     return Path(os.path.expanduser("~/.claude/embeddings/"))
+
+
+def _default_lance_uri() -> Path:
+    """LanceDB local dataset directory backing the embeddings store.
+
+    Replaces the parquet-shards + ``hnsw.duckdb`` combo. Lance handles
+    storage, versioning, and the IVF_HNSW_SQ index in one place.
+    """
+    return Path(os.path.expanduser("~/.claude/embeddings_lance/"))
 
 
 def _default_classifications_parquet() -> Path:
@@ -84,11 +92,9 @@ def _default_plugins_cache_dir() -> Path:
 
 
 def _default_checkpoint_db() -> Path:
-    return Path(os.path.expanduser("~/.claude/claude_sql.duckdb"))
-
-
-def _default_hnsw_db() -> Path:
-    return Path(os.path.expanduser("~/.claude/hnsw.duckdb"))
+    # SQLite WAL state file. The legacy ``claude_sql.duckdb`` path is migrated
+    # once on first open by ``checkpointer._migrate_from_duckdb_if_present``.
+    return Path(os.path.expanduser("~/.claude/state.db"))
 
 
 def _default_duckdb_temp_dir() -> Path:
@@ -173,21 +179,15 @@ class Settings(BaseSettings):
     embeddings_parquet_path: Path = Field(default_factory=_default_embeddings_parquet)
 
     # ------------------------------------------------------------------
-    # VSS / HNSW
+    # LanceDB embeddings store
     # ------------------------------------------------------------------
-    hnsw_metric: Literal["cosine", "l2sq", "ip"] = "cosine"
-    hnsw_ef_construction: int = 128
-    hnsw_ef_search: int = 64
-    hnsw_m: int = 16
-    hnsw_m0: int = 32
-    #: Persistent DuckDB file backing the HNSW index. ``register_vss``
-    #: ATTACHes this file (separate from ``checkpoint_db_path`` so a
-    #: corruption in either store recovers in isolation — ``rm
-    #: ~/.claude/hnsw.duckdb`` is the documented HNSW recovery path) and
-    #: rebuilds from the embeddings parquet only when the parquet's mtime
-    #: is newer than the file's. Persistence rides on DuckDB's
-    #: ``hnsw_enable_experimental_persistence`` flag.
-    hnsw_db_path: Path = Field(default_factory=_default_hnsw_db)
+    #: Local LanceDB dataset URI. Replaces ``embeddings_parquet_path`` (legacy
+    #: kept for one-time migration only) and ``hnsw_db_path`` (removed).
+    #: DuckDB reads it back via ``INSTALL lance; LOAD lance; ATTACH (TYPE LANCE)``.
+    lance_uri: Path = Field(default_factory=_default_lance_uri)
+    #: Distance metric for the IVF_HNSW_SQ index. Cosine matches what the
+    #: ``semantic_search`` macro expects.
+    hnsw_metric: Literal["cosine", "l2", "dot"] = "cosine"
 
     # ------------------------------------------------------------------
     # Pricing

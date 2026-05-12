@@ -318,6 +318,7 @@ def tmp_settings(tmp_path: Path) -> Settings:
     cache.mkdir(parents=True, exist_ok=True)
     return Settings(
         embeddings_parquet_path=cache / "embeddings",
+        lance_uri=cache / "embeddings_lance",
         classifications_parquet_path=cache / "classifications",
         trajectory_parquet_path=cache / "trajectory",
         conflicts_parquet_path=cache / "conflicts",
@@ -326,8 +327,7 @@ def tmp_settings(tmp_path: Path) -> Settings:
         communities_parquet_path=cache / "communities.parquet",
         user_friction_parquet_path=cache / "user_friction",
         skills_catalog_parquet_path=cache / "skills_catalog.parquet",
-        checkpoint_db_path=cache / "claude_sql.duckdb",
-        hnsw_db_path=cache / "hnsw.duckdb",
+        checkpoint_db_path=cache / "state.db",
         duckdb_temp_dir=cache / "duckdb_tmp",
         user_skills_dir=cache / "skills",
         plugins_cache_dir=cache / "plugins_cache",

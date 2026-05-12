@@ -58,12 +58,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import duckdb
 import numpy as np
 import polars as pl
 from loguru import logger
 
 from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files
 
 if TYPE_CHECKING:
     import duckdb
@@ -84,27 +84,23 @@ def _load_session_centroids(
 ) -> tuple[list[str], np.ndarray]:
     """Return ``(session_ids, centroids)`` where centroids is ``(N_sessions, dim)`` float32.
 
-    Joins the embeddings parquet to the v1 ``messages`` view on uuid, then
-    aggregates inside DuckDB (unnest with position → ``avg`` per (session,
-    dim_index) → ordered ``list``). The L2-normalize step stays in numpy
-    where ``np.linalg.norm`` is faster on a contiguous (N, dim) matrix than
-    a per-row SQL norm. The previous Python double-loop over ~50K rows is
-    replaced with a single vectorized DuckDB query.
+    Joins the ``message_embeddings`` view (LanceDB-backed via ``register_vss``)
+    to the v1 ``messages`` view on uuid, then aggregates inside DuckDB
+    (unnest with position → ``avg`` per (session, dim_index) → ordered
+    ``list``). The L2-normalize step stays in numpy where
+    ``np.linalg.norm`` is faster on a contiguous (N, dim) matrix.
+
+    ``embeddings_parquet_path`` is accepted for back-compat with callers that
+    still pass it but is no longer consulted — the connection's
+    ``message_embeddings`` view is the source of truth.
     """
+    del embeddings_parquet_path  # legacy kwarg — view is the source of truth now
     logger.info("Loading message embeddings and joining to sessions...")
-    parts = iter_part_files(embeddings_parquet_path)
-    if not parts:
-        raise RuntimeError(
-            f"No embeddings parquet at {embeddings_parquet_path} - run `claude-sql embed`."
-        )
-    # DDL doesn't accept prepared params for read_parquet's file list, so
-    # escape inline. Single-quotes inside paths get doubled per SQL rules.
-    path_literals = ", ".join("'{}'".format(str(p).replace("'", "''")) for p in parts)
-    sql = f"""
+    sql = """
         WITH joined AS (
             SELECT CAST(m.session_id AS VARCHAR) AS session_id,
                    e.embedding::FLOAT[] AS emb
-              FROM read_parquet([{path_literals}]) e
+              FROM message_embeddings e
               JOIN messages m
                 ON CAST(m.uuid AS VARCHAR) = e.uuid
         ),
@@ -124,11 +120,20 @@ def _load_session_centroids(
          GROUP BY 1
          ORDER BY 1
     """
-    df = con.execute(sql).pl()
+    try:
+        df = con.execute(sql).pl()
+    except duckdb.CatalogException as exc:
+        # ``message_embeddings`` view isn't bound on this connection — happens
+        # when the caller skipped ``register_vss`` and there's no Lance
+        # dataset. Surface the same shape the legacy parquet path raised.
+        raise RuntimeError(
+            "No embeddings parquet (or Lance dataset) reachable — register_vss "
+            "must be called first or `claude-sql embed` must produce data."
+        ) from exc
     if len(df) == 0:
         raise RuntimeError(
             "No rows returned joining embeddings to messages - check that the "
-            "embeddings parquet exists and the messages view is registered."
+            "Lance embeddings exist and the messages view is registered."
         )
 
     sids = df["session_id"].to_list()

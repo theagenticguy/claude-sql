@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import duckdb
 
 from claude_sql.checkpointer import (
     PIPELINE_NAMES,
@@ -17,7 +16,7 @@ from claude_sql.checkpointer import (
 
 
 def test_pipeline_names_covers_llm_workers() -> None:
-    assert set(PIPELINE_NAMES) == {"classify", "trajectory", "conflicts"}
+    assert set(PIPELINE_NAMES) == {"classify", "trajectory", "conflicts", "user_friction"}
 
 
 def test_load_as_map_missing_db(tmp_path: Path) -> None:
@@ -145,22 +144,23 @@ def test_table_created_with_primary_key(tmp_path: Path) -> None:
     db = tmp_path / "ckpt.duckdb"
     t0 = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
     mark_completed(db, pipeline="classify", rows=[("sess-a", t0, t0)])
-    # Query the raw DB to confirm the primary key constraint landed.
-    con = duckdb.connect(str(db))
+    # Query the raw SQLite DB to confirm the schema + primary key landed.
+    con = sqlite3.connect(str(db))
     try:
-        cols = con.execute(
-            "SELECT column_name FROM duckdb_columns() "
-            "WHERE table_name = 'session_checkpoint' ORDER BY column_index"
-        ).fetchall()
+        cols = con.execute("PRAGMA table_info(session_checkpoint)").fetchall()
     finally:
         con.close()
-    assert [c[0] for c in cols] == [
+    assert [c[1] for c in cols] == [
         "session_id",
         "pipeline",
         "last_ts_processed",
         "last_mtime_processed",
         "completed_at",
     ]
+    # PK on (session_id, pipeline) — both columns flagged.
+    pk_flags = {c[1]: c[5] for c in cols}
+    assert pk_flags["session_id"] > 0
+    assert pk_flags["pipeline"] > 0
 
 
 def test_checkpoint_persists_across_connections(tmp_path: Path) -> None:
