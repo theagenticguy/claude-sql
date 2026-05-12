@@ -1983,6 +1983,10 @@ def register_analytics(
                     registered.add(view_name)
                     continue
                 except duckdb.Error:
+                    # Fallback ``SELECT *`` itself raised — the parquet is
+                    # corrupt or the file is gone. Fall through to the
+                    # ``logger.exception`` below so the operator sees the
+                    # original curated-projection failure with a stack trace.
                     pass
             logger.exception("Failed to register analytics view {} from {}", view_name, path)
 

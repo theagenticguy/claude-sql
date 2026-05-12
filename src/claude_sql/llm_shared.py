@@ -547,6 +547,10 @@ def _parse_structured_payload(payload: dict) -> dict:
                     try:
                         return json.loads(stripped)
                     except json.JSONDecodeError:
+                        # Stripped payload still isn't valid JSON — fall
+                        # through to the RuntimeError below so the caller
+                        # surfaces "unexpected response shape" with the
+                        # raw payload instead of swallowing the parse miss.
                         pass
         # Shape 3b: message with only non-text blocks (thinking, tool_use)
         # but a stop_reason of end_turn — no structured payload to parse.

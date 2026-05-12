@@ -204,6 +204,9 @@ def parse_judge_response(text: str) -> tuple[int | None, str]:
             if isinstance(obj, dict) and "score" in obj:
                 score = int(obj["score"])
         except (ValueError, TypeError):
+            # JSON-fallback parse miss — judge response wasn't a JSON object
+            # with an integer ``score`` field. Leave ``score`` as None; the
+            # caller treats that as a refusal and logs the raw rationale.
             pass
     r = _RATIONALE_RE.search(text)
     rationale = r.group(1).strip() if r else text.strip()
