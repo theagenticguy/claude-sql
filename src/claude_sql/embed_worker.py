@@ -78,6 +78,26 @@ def _is_retryable(exc: BaseException) -> bool:
     return code in _RETRY_CODES
 
 
+def _ingest_stamps_view_present(con: duckdb.DuckDBPyConnection) -> bool:
+    """Probe whether the ``ingest_stamps`` view is registered on ``con``.
+
+    ``register_analytics_views`` only binds ``ingest_stamps`` when its
+    parquet exists on disk (parquet-existence-gate pattern); on a fresh
+    install the view is absent. Probing the catalog before injecting the
+    LEFT JOIN avoids a binder error in that default state.
+
+    The empty-stub-view alternative (always register ``ingest_stamps``,
+    even as an empty stub, so the JOIN is always safe) lives in
+    ``sql_views.py`` and is the cleaner long-term fix; until that lands,
+    a local catalog probe keeps the join opt-in and the tests pin the
+    fall-through behaviour.
+    """
+    row = con.execute(
+        "SELECT count(*) FROM duckdb_views() WHERE view_name = 'ingest_stamps'"
+    ).fetchone()
+    return row is not None and int(row[0]) > 0
+
+
 def discover_unembedded(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -87,10 +107,21 @@ def discover_unembedded(
 ) -> list[tuple[str, str]]:
     """Return ``(uuid, text)`` pairs that have no embedding yet.
 
+    When the ``ingest_stamps`` view is registered (i.e. the user has run
+    ``claude-sql ingest``), the candidate set is left-joined against it
+    and rows whose ``canonical_uuid`` points at a *different* uuid are
+    dropped. The canonical row of each near-duplicate cluster is still
+    embedded; queries against a near-dup's content fall back to the
+    canonical's vector. ``LEFT JOIN`` semantics keep unstamped rows in
+    the candidate set (NULL canonical_uuid → "embed it"), so a partial
+    ingest run never starves the embed pipeline.
+
     Parameters
     ----------
     con
         An open DuckDB connection with the ``messages_text`` view registered.
+        Optionally also has ``ingest_stamps`` registered (the dedup gate
+        is opt-in via catalog probe).
     lance_uri
         Path to the LanceDB local dataset directory backing the embeddings.
         May not exist yet — empty Lance == "no embeddings".
@@ -119,7 +150,24 @@ def discover_unembedded(
         # DuckDB refuses to prepare an INTERVAL parameter; inline the coerced int.
         where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
 
-    sql = f"SELECT mt.uuid, mt.text_content FROM messages_text mt WHERE {' AND '.join(where)}"
+    # Inject the canonical-uuid skip only when ``ingest_stamps`` is bound;
+    # otherwise the LEFT JOIN errors with a binder-time catalog miss. The
+    # absent-view branch is the fresh-install default and must produce the
+    # full unfiltered candidate set.
+    if _ingest_stamps_view_present(con):
+        join_clause = "LEFT JOIN ingest_stamps ist ON mt.uuid = ist.uuid"
+        # NULL canonical_uuid (unstamped row) → keep; canonical pointing at
+        # the row itself → keep; canonical pointing elsewhere → skip.
+        where.append("(ist.canonical_uuid IS NULL OR ist.canonical_uuid = mt.uuid)")
+    else:
+        join_clause = ""
+
+    sql = (
+        f"SELECT mt.uuid, mt.text_content "
+        f"FROM messages_text mt "
+        f"{join_clause} "
+        f"WHERE {' AND '.join(where)}"
+    )
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
 
