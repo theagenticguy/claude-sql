@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql"
-version = "0.7.0"
+version = "1.0.0"
 description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -16,7 +16,7 @@ keywords = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -305,7 +305,7 @@ version_provider = "uv"
 version_scheme = "pep440"
 tag_format = "v$version"
 update_changelog_on_bump = true
-major_version_zero = true
+major_version_zero = false
 annotated_tag = true
 changelog_incremental = true
 changelog_merge_prerelease = true
