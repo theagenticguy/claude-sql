@@ -436,7 +436,10 @@ def test_ingest_dry_run_with_filters(tmp_path: Path, capsys: pytest.CaptureFixtu
 # ---------------------------------------------------------------------------
 
 
-def _patch_mkstemp_for_duckdb(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def _patch_mkstemp_for_duckdb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
     """Patch ``tempfile.mkstemp`` to return a fresh, never-created path.
 
     DuckDB rejects a zero-byte file at the path with ``IOException``.
@@ -446,11 +449,13 @@ def _patch_mkstemp_for_duckdb(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     path that doesn't yet exist so DuckDB initializes a fresh database.
     """
     db_path = tmp_path / "shell_test.duckdb"
-    # Don't create the file — let duckdb.connect create a fresh DB.
-    fd_holder = os.open(os.devnull, os.O_RDONLY)
 
     def _fake_mkstemp(*_a: object, **_kw: object) -> tuple[int, str]:
-        return fd_holder, str(db_path)
+        # Open a fresh fd per call — the CLI's `os.close(fd)` (cli.py:674)
+        # owns the close. Opening inside the closure keeps each invocation
+        # self-contained so CodeQL's py/file-not-closed sees the producer
+        # and consumer paired.
+        return os.open(os.devnull, os.O_RDONLY), str(db_path)
 
     monkeypatch.setattr(cli.tempfile, "mkstemp", _fake_mkstemp)
     return db_path
