@@ -43,3 +43,32 @@ after the last cache breakpoint.
 
 **When you hit this**: you added `cache_control` but cache hit rate is
 0%. Check the Bedrock usage response, not the tiktoken estimate.
+
+## 2026-05-13 update
+
+**Sonnet 4.6 cache minimum bumped 1024 → 2048 tokens.** The Anthropic
+prompt-caching docs (live, May 2026) now list:
+
+  - Claude Opus 4 / Opus 4.1 / Sonnet 4 / Sonnet 4.5 / Sonnet 4.6: **2048 tokens**
+  - Claude Haiku 4.5 / Haiku 3.5: **4096 tokens**
+
+The 1024 floor in the body of this note was correct for Sonnet 3.7 /
+4 / 4.5 at the time of writing but does NOT apply to Sonnet 4.6 anymore.
+Re-pad the safety margin: at the empirical 0.78 ratio, 2048 Anthropic
+tokens ≈ 2625 cl100k tokens — anything below that on cl100k is at risk
+of silent zero-cache.
+
+**ttl="1h" on Bedrock — AWS docs are canonical, Anthropic docs are
+stale.** The Anthropic prompt-caching reference still says "Bedrock
+doesn't support 1h cache control"; that's wrong for `global.anthropic.
+claude-sonnet-4-6` as of 2026-05. The AWS Bedrock User Guide
+("Prompt caching for faster model inference") explicitly lists `ttl:
+"1h"` as supported on the global CRIS profile. When the two docs
+disagree on a Bedrock-specific feature, treat the AWS source as
+authoritative — Anthropic's docs trail Bedrock's GA milestones by
+weeks.
+
+References:
+- https://docs.claude.com/en/docs/build-with-claude/prompt-caching (2048 floor, by-model table)
+- https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html (Bedrock-side ttl=1h availability)
+- claude-sql v1.0 windowed-pipelines session, 2026-05-13.
