@@ -140,8 +140,9 @@ def _patch_classify_one(
         thinking_mode: str,
         sem: Any,
         system: str | None = None,
+        pipeline: str = "classifier",
     ) -> dict:
-        del client, model_id, schema, max_tokens, thinking_mode, sem, system
+        del client, model_id, schema, max_tokens, thinking_mode, sem, system, pipeline
         seen.append(text)
         result = response_factory(text)
         if isinstance(result, BaseException):

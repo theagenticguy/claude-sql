@@ -30,6 +30,7 @@ from claude_sql.llm_shared import (
     _count_pending_sessions,
     _estimate_cost,
     classify_one,
+    pipeline_cache_stats,
 )
 from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import SESSION_CLASSIFICATION_SCHEMA
@@ -111,6 +112,7 @@ async def _classify_sessions_async(
                 thinking_mode=thinking_mode,
                 sem=sem,
                 system=CLASSIFY_SYSTEM_PROMPT,
+                pipeline="classify",
             )
             for _, text in chunk
         ]
@@ -240,12 +242,13 @@ def classify_sessions(
             "dry_run": True,
         }
 
-    return asyncio.run(
-        _classify_sessions_async(
-            con,
-            settings,
-            since_days=since_days,
-            limit=limit,
-            thinking_mode=thinking_mode,
+    with pipeline_cache_stats("classify"):
+        return asyncio.run(
+            _classify_sessions_async(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                thinking_mode=thinking_mode,
+            )
         )
-    )

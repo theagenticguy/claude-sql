@@ -194,6 +194,7 @@ async def _conflicts_async(
                 thinking_mode=thinking_mode,
                 sem=sem,
                 system=CONFLICTS_SYSTEM_PROMPT,
+                pipeline="conflicts",
             )
             for _, text in chunk
         ]

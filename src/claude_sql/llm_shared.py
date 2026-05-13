@@ -408,6 +408,7 @@ def _invoke_classifier_sync(
     max_tokens: int,
     thinking_mode: str,
     system: str | None = None,
+    pipeline: str = "classifier",
 ) -> dict:
     """One Bedrock ``invoke_model`` call with ``output_config.format`` structured output.
 
@@ -478,7 +479,7 @@ def _invoke_classifier_sync(
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     payload = json.loads(resp["body"].read())
     maybe_log_bedrock_call(
-        pipeline=schema.get("title", "classifier") if isinstance(schema, dict) else "classifier",
+        pipeline=pipeline,
         model_id=model_id,
         payload=payload,
         elapsed_ms=elapsed_ms,
@@ -569,6 +570,7 @@ async def classify_one(
     thinking_mode: str,
     sem: asyncio.Semaphore | anyio.CapacityLimiter,
     system: str | None = None,
+    pipeline: str = "classifier",
 ) -> dict:
     """Run one classification call under the concurrency limiter.
 
@@ -589,6 +591,7 @@ async def classify_one(
                 max_tokens=max_tokens,
                 thinking_mode=thinking_mode,
                 system=system,
+                pipeline=pipeline,
             )
         )
 

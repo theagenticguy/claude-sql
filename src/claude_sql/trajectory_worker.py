@@ -640,6 +640,7 @@ async def _classify_chunk(
             thinking_mode=thinking_mode,
             sem=sem,
             system=TRAJECTORY_SYSTEM_PROMPT,
+            pipeline="trajectory",
         )
     except BedrockRefusalError as exc:
         return exc

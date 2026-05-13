@@ -56,6 +56,7 @@ from claude_sql.llm_shared import (
     _build_bedrock_client,
     _estimate_cost,
     classify_one,
+    pipeline_cache_stats,
 )
 from claude_sql.parquet_shards import read_all, write_part
 from claude_sql.schemas import USER_FRICTION_SCHEMA
@@ -556,6 +557,7 @@ async def _classify_async(
                 thinking_mode=thinking_mode,
                 sem=sem,
                 system=USER_FRICTION_SYSTEM_PROMPT,
+                pipeline="friction",
             )
             for prompt in prompts
         ]
@@ -724,15 +726,16 @@ def detect_user_friction(
             "dry_run": True,
         }
 
-    return asyncio.run(
-        _classify_async(
-            con,
-            settings,
-            since_days=since_days,
-            limit=limit,
-            thinking_mode=thinking_mode,
+    with pipeline_cache_stats("friction"):
+        return asyncio.run(
+            _classify_async(
+                con,
+                settings,
+                since_days=since_days,
+                limit=limit,
+                thinking_mode=thinking_mode,
+            )
         )
-    )
 
 
 __all__ = ["detect_user_friction", "regex_fast_path", "sql_stamp"]
