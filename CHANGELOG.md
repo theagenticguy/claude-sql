@@ -1,3 +1,9 @@
+## v1.0.0 (2026-05-13)
+
+### Feat
+
+- v1.0 windowed pipelines (turn_window, ingest stamps, trajectory rewrite, CLAUDE_SQL_HOME) (#42)
+
 ## v0.7.0 (2026-05-12)
 
 ### Feat
