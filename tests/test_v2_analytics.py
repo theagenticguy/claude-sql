@@ -19,9 +19,9 @@ import pytest
 
 from claude_sql.config import Settings
 from claude_sql.schemas import (
-    MESSAGE_TRAJECTORY_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
+    TRAJECTORY_ARRAY_SCHEMA,
 )
 from claude_sql.sql_views import (
     register_analytics,
@@ -41,7 +41,7 @@ def test_schemas_no_ref() -> None:
     for schema in (
         SESSION_CLASSIFICATION_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
-        MESSAGE_TRAJECTORY_SCHEMA,
+        TRAJECTORY_ARRAY_SCHEMA,
     ):
         text = json.dumps(schema)
         assert "$ref" not in text
@@ -68,7 +68,7 @@ def test_schemas_additional_properties_false() -> None:
     for schema in (
         SESSION_CLASSIFICATION_SCHEMA,
         SESSION_CONFLICTS_SCHEMA,
-        MESSAGE_TRAJECTORY_SCHEMA,
+        TRAJECTORY_ARRAY_SCHEMA,
     ):
         _walk(schema)
 
@@ -103,10 +103,10 @@ class _FakeBedrockClient:
 
 def test_llm_worker_invoke_body_shape_adaptive_thinking() -> None:
     """Body must use output_config.format (not tool_use) and include thinking."""
-    from claude_sql import llm_worker
+    from claude_sql import llm_shared
 
     fake = _FakeBedrockClient({"output": {"autonomy_tier": "autonomous"}})
-    result = llm_worker._invoke_classifier_sync(
+    result = llm_shared._invoke_classifier_sync(
         fake,
         "global.anthropic.claude-sonnet-4-6",
         SESSION_CLASSIFICATION_SCHEMA,
@@ -127,10 +127,10 @@ def test_llm_worker_invoke_body_shape_adaptive_thinking() -> None:
 
 def test_llm_worker_no_thinking_flag() -> None:
     """thinking_mode='disabled' must omit the thinking field entirely."""
-    from claude_sql import llm_worker
+    from claude_sql import llm_shared
 
     fake = _FakeBedrockClient({"output": {"foo": "bar"}})
-    llm_worker._invoke_classifier_sync(
+    llm_shared._invoke_classifier_sync(
         fake,
         "x",
         SESSION_CLASSIFICATION_SCHEMA,

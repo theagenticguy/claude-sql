@@ -64,6 +64,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "messages",
     "content_blocks",
     "messages_text",
+    "turn_window",
     "tool_calls",
     "tool_results",
     "todo_events",
@@ -81,6 +82,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "session_goals",
     "message_trajectory",
     "session_conflicts",
+    "conflicts_summary",
     "message_clusters",
     "cluster_terms",
     "session_communities",
@@ -88,6 +90,7 @@ VIEW_NAMES: tuple[str, ...] = (
     "user_friction",
     "skills_catalog",
     "skill_usage",
+    "ingest_stamps",
 )
 
 # Hand-maintained column schema for the v1 (transcript-derived) views.
@@ -129,6 +132,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("ts", "TIMESTAMP"),
         ("type", "VARCHAR"),
         ("is_sidechain", "BOOLEAN"),
+        ("is_compact_summary", "BOOLEAN"),
         ("role", "VARCHAR"),
         ("model", "VARCHAR"),
         ("stop_reason", "VARCHAR"),
@@ -144,6 +148,8 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("message_uuid", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
+        ("message_type", "VARCHAR"),
+        ("is_compact_summary", "BOOLEAN"),
         ("block_type", "VARCHAR"),
         ("text", "VARCHAR"),
         ("tool_use_id_field", "VARCHAR"),
@@ -158,7 +164,19 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("role", "VARCHAR"),
+        ("is_compact_summary", "BOOLEAN"),
         ("text_content", "VARCHAR"),
+    ),
+    "turn_window": (
+        ("session_id", "VARCHAR"),
+        ("prev_uuid", "VARCHAR"),
+        ("prev_role", "VARCHAR"),
+        ("prev_ts", "TIMESTAMP"),
+        ("curr_uuid", "VARCHAR"),
+        ("curr_role", "VARCHAR"),
+        ("curr_ts", "TIMESTAMP"),
+        ("gap_ms", "BIGINT"),
+        ("window_idx", "BIGINT"),
     ),
     "tool_calls": (
         ("message_uuid", "VARCHAR"),
@@ -289,12 +307,14 @@ ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
     "session_goals",
     "message_trajectory",
     "session_conflicts",
+    "conflicts_summary",
     "message_clusters",
     "cluster_terms",
     "session_communities",
     "community_profile",
     "user_friction",
     "skills_catalog",
+    "ingest_stamps",
 )
 
 # Macro names registered by :func:`register_macros`.  ``ago`` is the
@@ -323,6 +343,7 @@ MACRO_NAMES: tuple[str, ...] = (
     "friction_rate",
     "friction_examples",
     "unused_skills",
+    "canonical_uuid_resolve",
 )
 
 
@@ -362,6 +383,7 @@ MACRO_SIGNATURES: dict[str, tuple[str, ...]] = {
     "friction_rate": ("since_days",),
     "friction_examples": ("label_name", "n"),
     "unused_skills": ("last_n_days",),
+    "canonical_uuid_resolve": (),
 }
 
 
@@ -431,6 +453,7 @@ _RAW_EVENT_COLUMNS: dict[str, str] = {
     "type": "VARCHAR",
     "timestamp": "TIMESTAMP",
     "isSidechain": "BOOLEAN",
+    "isCompactSummary": "BOOLEAN",
     "cwd": "VARCHAR",
     "gitBranch": "VARCHAR",
     "message": _MESSAGE_STRUCT_TYPE,
@@ -656,6 +679,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 timestamp::TIMESTAMP                      AS ts,
                 type,
                 isSidechain                               AS is_sidechain,
+                coalesce(isCompactSummary, false)         AS is_compact_summary,
                 message.role                              AS role,
                 message.model                             AS model,
                 message.stop_reason                       AS stop_reason,
@@ -679,6 +703,8 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 m.uuid                                      AS message_uuid,
                 m.ts,
                 m.role,
+                m.type                                      AS message_type,
+                m.is_compact_summary,
                 json_extract_string(block, '$.type')        AS block_type,
                 json_extract_string(block, '$.text')        AS text,
                 json_extract_string(block, '$.id')          AS tool_use_id_field,
@@ -706,16 +732,47 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 any_value(cb.session_id) AS session_id,
                 any_value(cb.ts)         AS ts,
                 any_value(cb.role)       AS role,
+                any_value(cb.is_compact_summary) AS is_compact_summary,
                 string_agg(cb.text, '\n\n')  AS text_content
             FROM content_blocks cb
             WHERE cb.block_type = 'text'
               AND cb.text IS NOT NULL
               AND length(cb.text) > 0
+              AND cb.message_type != 'attachment'
             GROUP BY cb.message_uuid
             HAVING length(string_agg(cb.text, '\n\n')) >= 32;
             """
         )
         logger.debug("Registered view: messages_text")
+
+        # Adjacent-turn window over ``messages_text`` per session, ordered by
+        # (ts, uuid) for stable tie-break.  Compact-summary rows are excluded
+        # so the LAG() previous-turn pointer never lands on a synthetic
+        # checkpoint row injected by Claude Code's own context-compaction
+        # path.  ``gap_ms`` is the millisecond delta between turn timestamps,
+        # NULL on the first row of each session (LAG() yields NULL there).
+        # Used by v1.0 friction / trajectory pipelines that need adjacent
+        # (prev, curr) pairs without re-deriving the LAG window in every
+        # caller.
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW turn_window AS
+            SELECT
+                session_id,
+                LAG(uuid) OVER w  AS prev_uuid,
+                LAG(role) OVER w  AS prev_role,
+                LAG(ts)   OVER w  AS prev_ts,
+                uuid              AS curr_uuid,
+                role              AS curr_role,
+                ts                AS curr_ts,
+                date_diff('millisecond', LAG(ts) OVER w, ts) AS gap_ms,
+                row_number() OVER w AS window_idx
+            FROM messages_text
+            WHERE is_compact_summary = false
+            WINDOW w AS (PARTITION BY session_id ORDER BY ts, uuid);
+            """
+        )
+        logger.debug("Registered view: turn_window")
 
         con.execute(
             """
@@ -1111,6 +1168,7 @@ _ANALYTICS_MACRO_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "friction_rate": ("user_friction_parquet_path",),
     "friction_examples": ("user_friction_parquet_path",),
     "unused_skills": ("skills_catalog_parquet_path",),
+    "canonical_uuid_resolve": ("ingest_stamps_parquet_path",),
 }
 
 
@@ -1169,7 +1227,7 @@ def register_macros(
     v2 analytics macros (created via :func:`_safe_macro`, skipped when their
     backing analytics view is missing): ``autonomy_trend``, ``work_mix``,
     ``success_rate_by_work``, ``cluster_top_terms``, ``community_top_topics``,
-    ``sentiment_arc``.
+    ``sentiment_arc``, ``canonical_uuid_resolve``.
 
     ``semantic_search(query_vec, k)`` is a table macro that returns the top-k
     uuids by cosine distance to ``query_vec`` using the HNSW index.
@@ -1452,16 +1510,30 @@ def register_macros(
             );
             """,
         ),
-        # Sentiment arc for a single session: per-message (ts, role,
-        # delta, transition flag, confidence) in chronological order.
+        # Sentiment arc for a single session: per-window (ts, role,
+        # current-turn sentiment, numeric delta, transition_kind, filler
+        # flag, confidence) in chronological order.
+        #
+        # v1.0 windowed rewrite (RFC 0002 §3.4): the macro now joins on
+        # ``mt.curr_uuid`` (the per-window anchor turn) instead of the
+        # pre-rewrite per-message ``mt.uuid`` column. Output columns are
+        # ``(ts, role, curr_sentiment, delta, transition_kind,
+        # is_transition, confidence)`` — ``sentiment_delta`` (the old
+        # column name) is gone.
         (
             "sentiment_arc",
             """
             CREATE OR REPLACE MACRO sentiment_arc(sid) AS TABLE (
-                SELECT m.ts, m.role, mt.sentiment_delta, mt.is_transition, mt.confidence
+                SELECT m.ts,
+                       m.role,
+                       mt.curr_sentiment,
+                       mt.delta,
+                       mt.transition_kind,
+                       mt.is_transition,
+                       mt.confidence
                   FROM messages m
                   JOIN message_trajectory mt
-                    ON CAST(m.uuid AS VARCHAR) = mt.uuid
+                    ON CAST(m.uuid AS VARCHAR) = mt.curr_uuid
                  WHERE CAST(m.session_id AS VARCHAR) = sid
                  ORDER BY m.ts
             );
@@ -1573,6 +1645,28 @@ def register_macros(
                  WHERE used.skill_id IS NULL
                    AND cat.source_kind IN ('user-skill', 'plugin-skill', 'plugin-command')
                  ORDER BY cat.plugin NULLS FIRST, cat.name
+            );
+            """,
+        ),
+        # Canonical-UUID resolution over the ``ingest_stamps`` view.  Pairs
+        # rows whose 64-bit SimHash differs by ≤ 3 bits (top-16-bit bucket
+        # gates the self-join so it doesn't blow up on large corpora) and
+        # picks the earliest-seen row as canonical.  ``xor`` is the bit-XOR
+        # builtin (DuckDB's ``^`` is exponentiation, not XOR).  Materialised
+        # as a table macro so callers can ``SELECT * FROM
+        # canonical_uuid_resolve()`` without re-deriving the join.
+        (
+            "canonical_uuid_resolve",
+            """
+            CREATE OR REPLACE MACRO canonical_uuid_resolve() AS TABLE (
+                SELECT a.uuid AS uuid,
+                       MIN(b.uuid) AS canonical_uuid
+                  FROM ingest_stamps a
+                  JOIN ingest_stamps b
+                    ON (a.simhash64 >> 48) = (b.simhash64 >> 48)
+                   AND bit_count(xor(a.simhash64, b.simhash64)) <= 3
+                   AND b.first_seen_ts <= a.first_seen_ts
+                 GROUP BY a.uuid
             );
             """,
         ),
@@ -1811,6 +1905,7 @@ def register_analytics(
         "skills_catalog": skills_catalog_parquet
         if skills_catalog_parquet is not None
         else resolved.skills_catalog_parquet_path,
+        "ingest_stamps": resolved.ingest_stamps_parquet_path,
     }
 
     # View projections keyed by view name. A ``None`` projection means
@@ -1822,8 +1917,20 @@ def register_analytics(
         "session_classifications": (
             "*, autonomy_tier AS autonomy, success AS success_outcome, work_category AS category"
         ),
-        "message_trajectory": ("*, sentiment_delta AS sentiment, is_transition AS transition"),
-        "session_conflicts": ("*, resolution AS conflict_resolution"),
+        # v1.0 windowed shape: ``(session_id, prev_uuid, curr_uuid,
+        # prev_sentiment, curr_sentiment, delta, is_transition,
+        # transition_kind, confidence, classified_at)``. The legacy
+        # ``sentiment_delta`` alias is gone — see RFC 0002 §3.4.
+        # ``sentiment`` is kept as a convenience alias for the *current*
+        # turn's polarity (the load-bearing one for sentiment-arc plots).
+        "message_trajectory": "*, curr_sentiment AS sentiment, is_transition AS transition",
+        # v1.0 pair-keyed shape: ``(session_id, turn_a_uuid, turn_b_uuid,
+        # conflict_kind, severity, agent_position, user_position,
+        # confidence, detected_at)``.  Sessions with no conflicts produce
+        # zero rows -- the legacy ``empty=True`` sentinel is gone, and
+        # the legacy ``resolution AS conflict_resolution`` alias with it
+        # (RFC 0002 §3.4).
+        "session_conflicts": None,
     }
 
     registered: set[str] = set()
@@ -1851,7 +1958,36 @@ def register_analytics(
             )
             logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)
-        except duckdb.Error:
+        except duckdb.Error as exc:
+            # Curated projection failed — most commonly because the on-disk
+            # parquet predates a schema rewrite (e.g. v1.0 trajectory rip-
+            # and-replace) and the column the projection aliases against
+            # doesn't exist yet. Fall back to bare ``SELECT *`` so the
+            # legacy view binds for read-only inspection; the next worker
+            # run purges the stale shards and the curated projection
+            # comes back on the following ``register_analytics``.
+            if projection != "*":
+                try:
+                    con.execute(
+                        f"CREATE OR REPLACE VIEW {view_name} AS "
+                        f"SELECT * FROM read_parquet([{path_literals}]);"
+                    )
+                    logger.warning(
+                        "register_analytics: {} bound with fallback SELECT * "
+                        "(legacy schema detected at {}; run the matching worker "
+                        "to refresh): {}",
+                        view_name,
+                        path,
+                        exc,
+                    )
+                    registered.add(view_name)
+                    continue
+                except duckdb.Error:
+                    # Fallback ``SELECT *`` itself raised — the parquet is
+                    # corrupt or the file is gone. Fall through to the
+                    # ``logger.exception`` below so the operator sees the
+                    # original curated-projection failure with a stack trace.
+                    pass
             logger.exception("Failed to register analytics view {} from {}", view_name, path)
 
     # ``session_goals`` is a thin projection of ``session_classifications``;
@@ -1868,6 +2004,26 @@ def register_analytics(
             logger.debug("Registered analytics view: session_goals")
         except duckdb.Error:
             logger.exception("Failed to register session_goals view")
+
+    # ``conflicts_summary`` is the v1.0 replacement for the old
+    # ``empty=True`` sentinel scheme.  Sessions with zero conflict rows
+    # in ``session_conflicts`` simply do not appear here -- callers that
+    # want every session in the result set must LEFT JOIN this view onto
+    # ``sessions`` and coalesce the missing count to 0.  See RFC 0002
+    # §3.4 for the rationale.
+    if "session_conflicts" in registered:
+        try:
+            con.execute(
+                """
+                CREATE OR REPLACE VIEW conflicts_summary AS
+                SELECT session_id, count(*) AS conflict_count
+                FROM session_conflicts
+                GROUP BY session_id;
+                """
+            )
+            logger.debug("Registered analytics view: conflicts_summary")
+        except duckdb.Error:
+            logger.exception("Failed to register conflicts_summary view")
 
     # ``skill_usage`` joins ``skill_invocations`` (always-on) against the
     # catalog for human-readable labels + ``is_builtin`` tagging.  When the

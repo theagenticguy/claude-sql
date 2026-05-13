@@ -25,6 +25,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from claude_sql import (
     skills_catalog as _skills_catalog,
     ungrounded_worker as _ungrounded_worker,
 )
+from claude_sql.classify_worker import classify_sessions
 from claude_sql.cluster_worker import run_clustering
 from claude_sql.community_worker import (
     ResolutionLevel,
@@ -59,10 +61,16 @@ from claude_sql.community_worker import (
     run_communities,
 )
 from claude_sql.config import Settings
+from claude_sql.conflicts_worker import detect_conflicts
 from claude_sql.embed_worker import embed_query, run_backfill
 from claude_sql.friction_worker import detect_user_friction
+from claude_sql.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.ingest import (
+    count_pending as _ingest_count_pending,
+    resolve_canonicals as _ingest_resolve_canonicals,
+    stamp_messages as _ingest_stamp_messages,
+)
 from claude_sql.install_source import format_version
-from claude_sql.llm_worker import classify_sessions, detect_conflicts, trajectory_messages
 from claude_sql.logging_setup import configure_logging
 from claude_sql.output import (
     EXIT_CODES,
@@ -92,8 +100,10 @@ from claude_sql.sql_views import (
     register_all,
     register_raw,
     register_views,
+    register_vss,
 )
 from claude_sql.terms_worker import run_terms
+from claude_sql.trajectory_worker import trajectory_messages
 
 _APP_HELP = """\
 Zero-copy SQL + Cohere Embed v4 semantic search + Sonnet 4.6 analytics over
@@ -257,6 +267,56 @@ def _resolve_memory_limit(limit: str) -> str:
     return f"{target_mib}MiB"
 
 
+_MIGRATION_MARKER = ".migration_complete"
+
+
+def _maybe_migrate_legacy_caches() -> None:
+    """One-time move of recognized caches from ``~/.claude/`` → ``CLAUDE_SQL_HOME``.
+
+    Runs at most once per ``CLAUDE_SQL_HOME`` directory: a sentinel file
+    (``.migration_complete``) in the home short-circuits subsequent calls.
+    Every move is wrapped in ``shutil.move`` and the whole loop is guarded
+    against ``OSError`` so a hostile filesystem (read-only mount, EACCES
+    on a single subtree) can't crash startup — we log a warning and the
+    user can rerun ``claude-sql`` later or migrate manually.
+
+    Idempotent. Safe to call from any subcommand entry point. The first
+    successful run stamps the marker; later runs are no-ops.
+    """
+    home = claude_sql_home()
+    marker = home / _MIGRATION_MARKER
+    if marker.exists():
+        return
+    legacy = recognized_legacy_caches()
+    # When the new home already holds caches (e.g. a fresh install on a
+    # box that never had the old layout) we still want to stamp the
+    # marker so we don't keep probing legacy on every invocation.
+    if not legacy:
+        try:
+            marker.touch()
+        except OSError as exc:
+            logger.warning("could not stamp migration marker at {}: {}", marker, exc)
+        return
+    try:
+        names = ", ".join(sorted(legacy))
+        logger.info("migrating claude-sql caches: ~/.claude/{{{}}} -> {}/", names, home)
+        for name, src in legacy.items():
+            dst = home / name
+            if dst.exists():
+                # Already populated under the new home — leave the legacy
+                # copy in place rather than overwriting; the user can
+                # reconcile manually if they care.
+                logger.warning("skipping migrate {}: destination {} already exists", src, dst)
+                continue
+            shutil.move(str(src), str(dst))
+        marker.touch()
+    except OSError as exc:
+        # Defensive: any IO error here aborts the migration but does NOT
+        # crash startup. The next invocation will retry from a clean
+        # state (marker not stamped → loop runs again).
+        logger.warning("legacy cache migration skipped: {}", exc)
+
+
 def _apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
     """Set the tuning PRAGMAs both connection helpers share.
 
@@ -293,6 +353,7 @@ def _open_connection_full(settings: Settings, *, sql: str = "") -> duckdb.DuckDB
     command which builds its own VSS-bearing SQL after the connection is
     already open.
     """
+    _maybe_migrate_legacy_caches()
     con = duckdb.connect(":memory:")
     _apply_duckdb_pragmas(con, settings)
     skip_vss = bool(sql) and not _sql_uses_vss(sql)
@@ -308,6 +369,7 @@ def _open_connection_introspect(settings: Settings) -> duckdb.DuckDBPyConnection
     ``SELECT current_timestamp`` don't reference any view). Returning a
     bare connection avoids the ~25 s :func:`register_all` chain entirely.
     """
+    _maybe_migrate_legacy_caches()
     con = duckdb.connect(":memory:")
     _apply_duckdb_pragmas(con, settings)
     return con
@@ -331,6 +393,51 @@ def _refresh_analytics_views(con: duckdb.DuckDBPyConnection, settings: Settings)
     from claude_sql.sql_views import register_analytics
 
     register_analytics(con, settings=settings)
+
+
+def _rebind_vss(con: duckdb.DuckDBPyConnection, settings: Settings, *, stage: str) -> None:
+    """Re-bind ``message_embeddings`` against the (possibly mutated) Lance namespace.
+
+    The ``analyze`` chain shares one DuckDB connection across stages (T1.3).
+    ``register_vss`` runs once at connection-open time and binds
+    ``message_embeddings`` against whatever Lance namespace state exists then.
+    After ``embed`` populates LanceDB the previously-bound view still points at
+    the empty namespace -- subsequent stages (``community`` is the load-bearing
+    one) read 0 rows. RFC §9.6 names this as the analyze stale-connection bug.
+
+    Calling :func:`register_vss` again issues a ``CREATE OR REPLACE VIEW``
+    against the live Lance dataset, which is the cheap fix.
+
+    Drops any prior ``message_embeddings`` object first so the second bind is
+    free to switch type. The first :func:`register_vss` call against an empty
+    Lance namespace creates a fallback **table**; the second call (after embed
+    populates Lance) wants to bind a **view** -- DuckDB rejects
+    ``CREATE OR REPLACE VIEW`` over an existing table of the same name, so we
+    drop both shapes proactively. ``DETACH lance_store`` clears any prior
+    ``ATTACH`` so :func:`register_vss` can reissue it without an alias clash.
+    """
+    # Drop whichever shape (TABLE or VIEW) the prior register_vss created.
+    # DuckDB's ``DROP VIEW IF EXISTS`` still errors if the existing object is a
+    # Table (and vice versa) -- ``IF EXISTS`` only suppresses the not-found
+    # error, not the type-mismatch error. Try VIEW first; on type mismatch fall
+    # through to dropping the TABLE shape.
+    try:
+        con.execute("DROP VIEW IF EXISTS message_embeddings;")
+    except duckdb.Error:
+        # Existing object is a TABLE, not a VIEW -- drop it as TABLE.
+        con.execute("DROP TABLE IF EXISTS message_embeddings;")
+    # No prior ATTACH on this connection (first rebind, or skip_vss path) -->
+    # DETACH against a missing alias raises; nothing to clean up.
+    with contextlib.suppress(duckdb.Error):
+        con.execute("DETACH lance_store;")
+    register_vss(
+        con,
+        embeddings_parquet=settings.embeddings_parquet_path,
+        lance_uri=settings.lance_uri,
+        dim=int(settings.output_dimension),
+        metric=settings.hnsw_metric,
+    )
+    logger.debug("register_vss re-bind after {}", stage)
 
 
 # Tokens that imply a SQL statement needs the VSS extension and the
@@ -593,7 +700,7 @@ def _profile_path_for(label: str) -> Path:
     (DuckDB writes the JSON itself; we just read it back to confirm the
     file landed and surface its location to the user).
     """
-    profiling_dir = Path(os.path.expanduser("~/.claude/profiling/"))
+    profiling_dir = claude_sql_home() / "profiling"
     profiling_dir.mkdir(parents=True, exist_ok=True)
     safe_label = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "profile"
     return profiling_dir / f"{safe_label}-{int(time.time() * 1000)}.json"
@@ -901,7 +1008,7 @@ def list_cache(*, common: Common | None = None) -> None:
     _configure(common)
     settings = _resolve_settings(common)
     fmt = resolve_format(_fmt(common))
-    entries = [
+    entries: list[dict[str, object]] = [
         _describe_lance_entry(settings.lance_uri),
         _describe_cache_entry("embeddings_legacy", settings.embeddings_parquet_path),
         _describe_cache_entry("session_classifications", settings.classifications_parquet_path),
@@ -913,8 +1020,25 @@ def list_cache(*, common: Common | None = None) -> None:
         _describe_cache_entry("community_profile", settings.community_profile_parquet_path),
         _describe_cache_entry("user_friction", settings.user_friction_parquet_path),
         _describe_cache_entry("skills_catalog", settings.skills_catalog_parquet_path),
+        _describe_cache_entry("ingest_stamps", settings.ingest_stamps_parquet_path),
         _describe_checkpoint_entry(settings.checkpoint_db_path),
     ]
+    # One-time deprecation breadcrumb: surface any caches that still live
+    # under the old ``~/.claude/`` root after the auto-migration ran. This
+    # is rare (auto-migration would have moved them) but possible if the
+    # marker file got stamped before a manual restore — flag it so the
+    # user can ``claude-sql cache migrate`` or move them by hand.
+    for name, legacy_path in recognized_legacy_caches().items():
+        entries.append(
+            {
+                "name": f"legacy:{name}",
+                "path": str(legacy_path),
+                "exists": True,
+                "bytes": None,
+                "mtime": None,
+                "rows": None,
+            }
+        )
 
     if fmt is OutputFormat.TABLE:
         df = pl.DataFrame(entries)
@@ -1650,6 +1774,74 @@ def friction(
 
 
 @app.command
+def ingest(
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+    dry_run: bool = True,
+    common: Common | None = None,
+) -> None:
+    """Stamp every message with ``approx_tokens`` / ``simhash64`` / canonical_uuid.
+
+    Pipeline
+    --------
+    1. Pull messages_text rows whose ``uuid`` is not in ``ingest_stamps``.
+    2. Compute ``approx_tokens`` (cl100k × 0.78 Anthropic ratio) and
+       ``simhash64`` (blake2b over word 3-grams) for each.
+    3. Write to ``~/.claude/ingest_stamps/part-<ts>.parquet`` shards.
+    4. Run ``canonical_uuid_resolve`` (DuckDB self-join with bit_count(xor)
+       ≤ 3 over a top-16-bit bucket) and rewrite the parquet with the
+       resolved ``canonical_uuid`` column populated.
+
+    Cost: zero (CPU-only, no Bedrock).  Defaults to ``--dry-run`` so an
+    agent can preview the pending count before writing anything.
+
+    Flags
+    -----
+    --since-days N      Only stamp messages newer than N days.
+    --limit N           Cap stamped rows this run.
+    --dry-run           (DEFAULT) emit plan JSON, no parquet writes.
+    --no-dry-run        Stamp + resolve.
+
+    Dry-run output (stdout JSON)
+    ----------------------------
+    ``{"pipeline":"ingest","candidates":N,"since_days":...,"limit":...,
+       "dry_run":true}``
+
+    Real-run output: ``{"pipeline":"ingest","rows_processed":N,
+    "dry_run":false}``.
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    con = _open_connection_full(settings)
+    try:
+        if dry_run:
+            n = _ingest_count_pending(con, settings, since_days=since_days, limit=limit)
+            logger.info("ingest --dry-run: {} pending rows", n)
+            _emit_worker_result(
+                {
+                    "pipeline": "ingest",
+                    "candidates": n,
+                    "since_days": since_days,
+                    "limit": limit,
+                    "dry_run": True,
+                },
+                common,
+                pipeline="ingest",
+            )
+            return
+        stamped = _ingest_stamp_messages(con, settings, since_days=since_days, limit=limit)
+        # Re-bind the analytics views so resolve_canonicals (and any later
+        # query in the same process) sees the freshly-written shards.
+        _refresh_analytics_views(con, settings)
+        resolved = _ingest_resolve_canonicals(con, settings)
+        logger.info("ingest: stamped={} resolved={}", stamped, resolved)
+        _emit_worker_result(stamped, common, pipeline="ingest")
+    finally:
+        con.close()
+
+
+@app.command
 def cluster(*, force: bool = False, common: Common | None = None) -> None:
     """Cluster message embeddings with UMAP (8D) + HDBSCAN. Writes clusters.parquet.
 
@@ -1857,6 +2049,7 @@ def analyze(
     limit: int | None = None,
     dry_run: bool = True,
     no_thinking: bool = False,
+    skip_ingest: bool = False,
     skip_embed: bool = False,
     skip_classify: bool = False,
     skip_trajectory: bool = False,
@@ -1874,14 +2067,15 @@ def analyze(
     Stages (in order)
     -----------------
     0. skills sync  (filesystem walk; zero-cost; produces skills_catalog.parquet)
-    1. embed        (Bedrock Cohere Embed v4; honors --dry-run)
-    2. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
-    3. terms        (c-TF-IDF labels for clusters; zero-cost)
-    4. community    (Leiden+CPM; zero-cost; --force-community to rebuild)
-    5. classify     (Sonnet 4.6; honors --dry-run)
-    6. trajectory   (Sonnet 4.6; honors --dry-run)
-    7. conflicts    (Sonnet 4.6; honors --dry-run)
-    8. friction     (Sonnet 4.6; honors --dry-run)
+    1. ingest       (tiktoken + blake2b SimHash; zero-cost; honors --dry-run)
+    2. embed        (Bedrock Cohere Embed v4; honors --dry-run)
+    3. cluster      (UMAP+HDBSCAN; zero-cost; --force_cluster to rebuild)
+    4. terms        (c-TF-IDF labels for clusters; zero-cost)
+    5. community    (Leiden+CPM; zero-cost; --force-community to rebuild)
+    6. classify     (Sonnet 4.6; honors --dry-run)
+    7. trajectory   (Sonnet 4.6; honors --dry-run)
+    8. conflicts    (Sonnet 4.6; honors --dry-run)
+    9. friction     (Sonnet 4.6; honors --dry-run)
 
     Cost
     ----
@@ -1895,8 +2089,9 @@ def analyze(
     --dry-run / --no-dry-run  (default --dry-run)
     --no-thinking          Disable Sonnet adaptive thinking across all stages.
     --skip-<stage>         Drop a stage:
-                           embed, cluster, community, classify, trajectory,
-                           conflicts, friction. Terms is bound to cluster.
+                           ingest, embed, cluster, community, classify,
+                           trajectory, conflicts, friction. Terms is bound
+                           to cluster.
     --force-cluster        Rebuild clusters.parquet (+ terms) even if present.
     --force-community      Rebuild session_communities.parquet even if present.
     --glob / --subagent-glob  Narrow the corpus (applies to every stage).
@@ -1941,7 +2136,23 @@ def analyze(
     # the freshly written data.
     con = _open_connection_full(settings)
     try:
-        # 1. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
+        # 1. Ingest stamps (zero-cost: tiktoken + blake2b SimHash).  Always
+        # safe to run -- pure CPU, no Bedrock.  Honors --dry-run to support
+        # an agent's "preview before commit" pattern even though the cost is
+        # zero.  Resolution pass is wired so embed (next) can read the
+        # ``canonical_uuid`` column to skip near-dup messages.
+        if not skip_ingest:
+            if dry_run:
+                n = _ingest_count_pending(con, settings, since_days=since_days, limit=limit)
+                logger.info("analyze/ingest: {} candidate rows (dry_run=True)", n)
+            else:
+                stamped = _ingest_stamp_messages(con, settings, since_days=since_days, limit=limit)
+                _refresh_analytics_views(con, settings)
+                resolved = _ingest_resolve_canonicals(con, settings)
+                logger.info("analyze/ingest: stamped={} resolved={}", stamped, resolved)
+                _refresh_analytics_views(con, settings)
+
+        # 2. Embed (reuses embed_worker).  Silently skipped if the parquet is up to date.
         if not skip_embed:
             n = asyncio.run(
                 run_backfill(
@@ -1953,8 +2164,12 @@ def analyze(
                 )
             )
             logger.info("analyze/embed: {} new embeddings (dry_run={})", n, dry_run)
-            # New embeddings/part-*.parquet shards may have landed; re-bind
-            # the analytics views so cluster/terms/community see them.
+            # New embeddings landed in the Lance namespace; the
+            # ``message_embeddings`` view was bound at connection-open against
+            # the (possibly empty) prior state and is now stale. Re-bind VSS
+            # FIRST so subsequent stages see the fresh vectors, then refresh
+            # analytics so the parquet-existence gates re-evaluate (RFC §9.6).
+            _rebind_vss(con, settings, stage="embed")
             _refresh_analytics_views(con, settings)
 
         # 2. Cluster (reads embeddings parquet, writes clusters.parquet).  Non-LLM.
@@ -1977,7 +2192,14 @@ def analyze(
             )
 
         # 3. Community detection (non-LLM, runs in parallel conceptually with cluster).
+        # RFC §9.6: this is THE explicitly-named bug location -- community
+        # reads message_embeddings (via the session-centroid build) and would
+        # see an empty view if embed populated Lance after connection-open
+        # without an intervening rebind. Re-bind VSS + refresh analytics so
+        # both the Lance dataset and the cluster_terms parquet land cleanly.
         if not skip_community:
+            _rebind_vss(con, settings, stage="cluster_terms")
+            _refresh_analytics_views(con, settings)
             cstats = run_communities(con, settings, force=force_community)
             logger.info(
                 "analyze/community: {} sessions, {} communities",
@@ -1996,6 +2218,9 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/classify: {} sessions (dry_run={})", n, dry_run)
+            # Refresh so any subsequent dashboard query in the same session
+            # sees the fresh classifications parquet shard.
+            _refresh_analytics_views(con, settings)
 
         # 5. Trajectory (LLM).
         if not skip_trajectory:
@@ -2008,6 +2233,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/trajectory: {} messages (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
 
         # 6. Conflicts (LLM, requires full session context).
         if not skip_conflicts:
@@ -2020,6 +2246,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/conflicts: {} sessions (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
 
         # 7. Friction (LLM, short-message scope).
         if not skip_friction:
@@ -2032,6 +2259,7 @@ def analyze(
                 no_thinking=no_thinking,
             )
             logger.info("analyze/friction: {} rows (dry_run={})", n, dry_run)
+            _refresh_analytics_views(con, settings)
     finally:
         con.close()
 
@@ -2669,7 +2897,7 @@ def _default(*, common: Common | None = None) -> None:
     del common
     print("claude-sql - pass a subcommand or --help")
     print("  schema | query | explain | shell | list-cache")
-    print("  embed | search")
+    print("  ingest | embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
     print("  bind | resolve | review-sheet")

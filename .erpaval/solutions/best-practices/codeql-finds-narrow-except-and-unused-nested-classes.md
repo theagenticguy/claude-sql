@@ -1,11 +1,11 @@
 ---
-title: CodeQL flags two patterns ruff misses — narrow `except: pass` without a comment, and unused classes nested inside a function
+title: CodeQL flags three patterns ruff misses — narrow `except: pass` without a comment, unused classes nested inside a function, and `except BaseException` swallowing CancelledError
 track: knowledge
 category: best-practices
 module: tests/**/*.py + pyproject.toml ruff config
 component: GitHub Advanced Security CodeQL vs ruff
 severity: warning
-tags: [codeql, github-advanced-security, ruff, S110, F841, BLE001, dead-code, claude-sql]
+tags: [codeql, github-advanced-security, ruff, S110, F841, BLE001, dead-code, base-exception, anyio, cancellation, claude-sql]
 applies_when:
   - "Project has GitHub Advanced Security / CodeQL enabled on PRs"
   - "Project relies on ruff (any selector, even strict) as the local lint gate"
@@ -64,17 +64,62 @@ pattern: |
   for coverage, just keep the third one — bricolage scaffolding adds
   noise and rots.
 
-  **No ruff selector covers either gap today**, so prevention has to
-  live in two places:
+  **`py/catch-base-exception`** — `except BaseException` (not just
+  `except Exception`). Ruff's ``BLE001`` is the closest match but it
+  fires on `except Exception:` too — most projects ignore or
+  per-project-disable it because of how often the broad form shows up
+  in async dispatchers (see `pipeline-accumulator-explicit-key.md`).
+  CodeQL is stricter: catching `BaseException` swallows
+  `KeyboardInterrupt`, `SystemExit`, and crucially
+  `asyncio.CancelledError` / `anyio.get_cancelled_exc_class()`. In an
+  anyio task group, swallowing `CancelledError` *deadlocks* shutdown —
+  the parent's `aclose()` waits forever for child tasks that already
+  observed cancellation but never re-raised it. Example from
+  `trajectory_worker.py` (caught by GHAS on PR #42):
+
+  ```python
+  # WRONG — task group can't tear down cleanly
+  try:
+      ... # bedrock + parquet write
+  except BaseException as exc:  # noqa: BLE001 — never abort the task group
+      logger.warning("session {} aborted ({})", sid, exc)
+      retry_queue.enqueue(..., error=str(exc))
+      return
+  ```
+
+  ```python
+  # RIGHT — Exception covers all recoverables; CancelledError still propagates
+  try:
+      ...
+  except Exception as exc:  # noqa: BLE001 — non-cancel exceptions go to retry; CancelledError still tears down the task group
+      logger.warning("session {} aborted ({})", sid, exc)
+      retry_queue.enqueue(..., error=str(exc))
+      return
+  ```
+
+  **Heuristic for review**: when you write `except BaseException` in
+  an async dispatcher, ask "if the user hits Ctrl-C, do I want this
+  branch to run instead of the cancellation propagating?" The answer
+  is almost always no. The narrow exception list this is meant to
+  catch (network blip, parquet schema error) are all `Exception`
+  subclasses already. The only legitimate uses of `except
+  BaseException` are signal-handling shims and CLI top-level
+  fall-throughs that re-raise after logging — neither shows up in
+  worker code.
+
+  **No ruff selector covers any of the three gaps today**, so
+  prevention has to live in two places:
   1. ``CLAUDE.md`` instructions tell future Claude sessions to add an
-     explanatory comment to every ``except: pass`` and to delete unused
-     test classes before committing.
+     explanatory comment to every ``except: pass``, to delete unused
+     test classes, and to never `except BaseException` in async
+     dispatchers before committing.
   2. ``pyproject.toml`` keeps ``S``, ``BLE``, ``SIM``, ``F``, ``RUF``
      families maximally aggressive so the next ruff release that adds a
      real rule for either pattern picks up automatically.
 example_files:
   - tests/test_llm_worker_pipelines.py        # narrow except: pass + comment fix
   - tests/test_review_sheet_worker_extras.py  # unused-class deletion
+  - src/claude_sql/trajectory_worker.py       # except BaseException → except Exception in async dispatcher
   - CLAUDE.md                                 # § "CodeQL hygiene"
 counter_examples:
   - "Adding a per-file ``# noqa: S110`` to silence the ruff variant — doesn't help because ruff didn't flag it; the comment satisfies CodeQL but is wasted noise on the ruff side."
@@ -83,6 +128,10 @@ counter_examples:
 references:
   - "GitHub CodeQL py/empty-except: https://codeql.github.com/codeql-query-help/python/py-empty-except/"
   - "GitHub CodeQL py/unused-local-variable: https://codeql.github.com/codeql-query-help/python/py-unused-local-variable/"
+  - "GitHub CodeQL py/catch-base-exception: https://codeql.github.com/codeql-query-help/python/py-catch-base-exception/"
   - "ruff S110 docs: https://docs.astral.sh/ruff/rules/try-except-pass/"
-  - "claude-sql PR #22 (2026-05-09) — three findings: 1× py/empty-except, 2× py/unused-local-variable. Caught after a green ``mise run check`` because CodeQL only runs in CI."
+  - "ruff BLE001 docs: https://docs.astral.sh/ruff/rules/blind-except/"
+  - "anyio cancellation guide: https://anyio.readthedocs.io/en/stable/cancellation.html"
+  - "claude-sql PR #22 (2026-05-09) — three findings: 1× py/empty-except, 2× py/unused-local-variable."
+  - "claude-sql PR #42 (2026-05-13) — two py/catch-base-exception findings on `trajectory_worker.py:647` and `:862`. Both narrowed to `except Exception`; tests still green. Caught after a green ``mise run check`` because CodeQL only runs in CI."
 ---

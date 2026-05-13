@@ -17,11 +17,16 @@ import duckdb
 from claude_sql.cli import _capture_profile, _profile_path_for
 
 
-def test_profile_path_lands_under_home_claude_profiling(tmp_path: Path, monkeypatch) -> None:
-    """``_profile_path_for`` resolves under ``$HOME/.claude/profiling/``."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_profile_path_lands_under_claude_sql_home_profiling(tmp_path: Path, monkeypatch) -> None:
+    """``_profile_path_for`` resolves under ``$CLAUDE_SQL_HOME/profiling/``.
+
+    Per RFC 0002 §5.1, profiling artifacts live under the dedicated
+    ``CLAUDE_SQL_HOME`` parent rather than co-mingled with Claude Code's
+    own ``~/.claude/`` state.
+    """
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "csql-home"))
     out = _profile_path_for("query")
-    assert out.parent == tmp_path / ".claude" / "profiling"
+    assert out.parent == tmp_path / "csql-home" / "profiling"
     assert out.parent.exists()
     assert out.name.startswith("query-")
     assert out.suffix == ".json"

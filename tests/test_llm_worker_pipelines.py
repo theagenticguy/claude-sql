@@ -1,9 +1,9 @@
-"""Coverage for ``llm_worker`` pipelines: classify / trajectory / conflicts.
+"""Coverage for the LLM pipelines: classify / trajectory / conflicts.
 
 These tests exercise the full async pipeline machinery and the ``--dry-run``
 plan paths without touching Bedrock. They sit alongside ``test_llm_worker``
 (request-shape unit tests) and ``test_llm_worker_parser`` (response-shape
-parser tests); together the three modules push ``llm_worker`` coverage
+parser tests); together the three modules push pipeline coverage
 from 25% to >=80%.
 
 Tactics:
@@ -13,10 +13,10 @@ Tactics:
   The shared ``registered_con`` fixture also runs ``register_macros``,
   which fails on a fresh connection because ``message_embeddings`` is not
   yet bound (a pre-existing fixture bug, scope-out for this change).
-* Patch ``llm_worker._classify_one`` (the module-level reference) with
+* Patch ``<worker>.classify_one`` (the module-level reference) with
   ``unittest.mock.AsyncMock`` so the async pipeline body runs without ever
   hitting ``boto3``. Side-effects are sequenced via ``side_effect=[...]``.
-* Reset ``llm_worker._CLIENT_CACHE`` between tests via an autouse fixture
+* Reset ``llm_shared._CLIENT_CACHE`` between tests via an autouse fixture
   to keep the boto3 client identity tests deterministic.
 * Neutralize tenacity sleeps so retry paths run instantly.
 """
@@ -34,13 +34,18 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql import llm_worker, retry_queue
+from claude_sql import (
+    classify_worker,
+    conflicts_worker,
+    llm_shared,
+    retry_queue,
+    trajectory_worker,
+)
 from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files, read_all
+from claude_sql.parquet_shards import iter_part_files
 from claude_sql.sql_views import register_raw, register_views
 from conftest import (
     _seed_subagent_stub,
-    make_assistant_msg,
     make_user_msg,
     write_session_jsonl,
 )
@@ -52,10 +57,10 @@ from conftest import (
 
 @pytest.fixture(autouse=True)
 def _reset_client_cache() -> Iterator[None]:
-    """Wipe ``llm_worker._CLIENT_CACHE`` before/after every test."""
-    llm_worker._CLIENT_CACHE.clear()
+    """Wipe ``llm_shared._CLIENT_CACHE`` before/after every test."""
+    llm_shared._CLIENT_CACHE.clear()
     yield
-    llm_worker._CLIENT_CACHE.clear()
+    llm_shared._CLIENT_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -128,7 +133,7 @@ def test_count_pending_sessions_empty_already(
     basic_con: duckdb.DuckDBPyConnection, tmp_corpus: dict[str, Any]
 ) -> None:
     """Empty ``already`` set → count of distinct sessions in ``messages_text``."""
-    n = llm_worker._count_pending_sessions(basic_con, already=set(), since_days=None, limit=None)
+    n = llm_shared._count_pending_sessions(basic_con, already=set(), since_days=None, limit=None)
     # The conftest corpus has two sessions, both with text messages clearing
     # the 32-char filter.
     assert n == 2
@@ -141,11 +146,11 @@ def test_count_pending_sessions_already_subtracts(
     basic_con: duckdb.DuckDBPyConnection, tmp_corpus: dict[str, Any]
 ) -> None:
     """``already`` containing one session → count is reduced by 1."""
-    baseline = llm_worker._count_pending_sessions(
+    baseline = llm_shared._count_pending_sessions(
         basic_con, already=set(), since_days=None, limit=None
     )
     one_done = {tmp_corpus["session_ids"][0]}
-    reduced = llm_worker._count_pending_sessions(
+    reduced = llm_shared._count_pending_sessions(
         basic_con, already=one_done, since_days=None, limit=None
     )
     assert reduced == baseline - 1
@@ -155,7 +160,7 @@ def test_count_pending_sessions_limit_cap(
     basic_con: duckdb.DuckDBPyConnection,
 ) -> None:
     """``limit`` caps the returned count regardless of corpus size."""
-    capped = llm_worker._count_pending_sessions(basic_con, already=set(), since_days=None, limit=1)
+    capped = llm_shared._count_pending_sessions(basic_con, already=set(), since_days=None, limit=1)
     assert capped == 1
 
 
@@ -203,8 +208,8 @@ def test_count_pending_sessions_since_days_filter(
     )
     register_views(con)
 
-    all_n = llm_worker._count_pending_sessions(con, already=set(), since_days=None, limit=None)
-    recent_n = llm_worker._count_pending_sessions(con, already=set(), since_days=1, limit=None)
+    all_n = llm_shared._count_pending_sessions(con, already=set(), since_days=None, limit=None)
+    recent_n = llm_shared._count_pending_sessions(con, already=set(), since_days=1, limit=None)
     assert all_n == 2
     assert recent_n == 1
     con.close()
@@ -254,7 +259,7 @@ def test_classify_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings) -
     (n,) = con.execute("SELECT count(*) FROM messages_text").fetchone()
     assert n == 0
 
-    plan = llm_worker.classify_sessions(con, tmp_settings, dry_run=True)
+    plan = classify_worker.classify_sessions(con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["pipeline"] == "classify"
     assert plan["candidates"] == 0
@@ -267,7 +272,7 @@ def test_classify_dry_run_populated_corpus(
     basic_con: duckdb.DuckDBPyConnection, tmp_settings: Settings
 ) -> None:
     """Populated corpus → candidates>0, estimated_cost_usd>0, model is sonnet id."""
-    plan = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
+    plan = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["pipeline"] == "classify"
     assert plan["candidates"] > 0
@@ -285,7 +290,7 @@ def test_classify_dry_run_anti_joins_done_sessions(
     tmp_corpus: dict[str, Any],
 ) -> None:
     """Pre-write a parquet shard for one session_id → candidates is reduced."""
-    baseline = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
+    baseline = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
     base_n = baseline["candidates"]
     # Stamp a fake row for one of the corpus sessions.
     from datetime import UTC, datetime
@@ -319,7 +324,7 @@ def test_classify_dry_run_anti_joins_done_sessions(
     )  # placeholder, overwritten below
     df.write_parquet(tmp_settings.classifications_parquet_path / "part-1.parquet")
 
-    after = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
+    after = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=True)
     assert after["candidates"] == base_n - 1
 
 
@@ -351,9 +356,9 @@ def test_classify_real_run_writes_parquet_then_idempotent(
             }
         }
     )
-    monkeypatch.setattr(llm_worker, "_build_bedrock_client", lambda _settings: fake)
+    monkeypatch.setattr(classify_worker, "_build_bedrock_client", lambda _settings: fake)
 
-    written = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
+    written = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
     assert isinstance(written, int)
     assert written >= 1
 
@@ -362,7 +367,7 @@ def test_classify_real_run_writes_parquet_then_idempotent(
     assert len(parts) >= 1
 
     # Second pass is a no-op — anti-join + checkpoint skip everything.
-    second = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
+    second = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
     assert second == 0
 
 
@@ -376,32 +381,38 @@ def test_classify_retry_queue_captures_failures(
     tmp_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_classify_one`` raises for every session → retry queue grows.
+    """``classify_one`` raises for every session → retry queue grows.
 
     We can't easily target one specific session because iteration order over
     ``iter_session_texts`` isn't part of the public contract — but
     ``pending_count`` should be at least 1 once at least one session fails.
     """
-    monkeypatch.setattr(llm_worker, "_build_bedrock_client", lambda _settings: object())
+    monkeypatch.setattr(classify_worker, "_build_bedrock_client", lambda _settings: object())
     fail = AsyncMock(side_effect=RuntimeError("simulated parse failure"))
-    monkeypatch.setattr(llm_worker, "_classify_one", fail)
+    monkeypatch.setattr(classify_worker, "classify_one", fail)
 
-    written = llm_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
+    written = classify_worker.classify_sessions(basic_con, tmp_settings, dry_run=False)
     assert written == 0  # every call failed, nothing landed in parquet
     pending = retry_queue.pending_count(tmp_settings.checkpoint_db_path, pipeline="classify")
     assert pending >= 1
 
 
 # ===========================================================================
-# 5. trajectory_messages(dry_run=True)
+# 5. trajectory_messages(dry_run=True) — v1.0 windowed shape
 # ===========================================================================
+#
+# The detailed real-run coverage moved to ``test_trajectory_windowed.py``
+# alongside the windowed-pipeline rewrite (RFC 0002 §3.4 / §4.1). These
+# two dry-run smoke tests stay here to round out the cross-pipeline
+# matrix: classify / trajectory / conflicts / friction all share the
+# dry-run contract.
 
 
 def test_trajectory_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings) -> None:
     """Empty corpus → candidates=0, llm_calls=0."""
     con = _empty_messages_text_con(tmp_path)
 
-    plan = llm_worker.trajectory_messages(con, tmp_settings, dry_run=True)
+    plan = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["pipeline"] == "trajectory"
     assert plan["candidates"] == 0
@@ -412,140 +423,19 @@ def test_trajectory_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings)
 def test_trajectory_dry_run_populated_corpus(
     basic_con: duckdb.DuckDBPyConnection, tmp_settings: Settings
 ) -> None:
-    """Populated → candidates>0, llm_calls=candidates//2."""
-    plan = llm_worker.trajectory_messages(basic_con, tmp_settings, dry_run=True)
+    """Populated corpus → candidates is the per-session count, not per-message.
+
+    The v1.0 rewrite (RFC 0002 §3.4 / §4.1) reports per-session candidates;
+    ``llm_calls`` is the chunk count (ceil(turns / 16)).
+    """
+    plan = trajectory_worker.trajectory_messages(basic_con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["candidates"] > 0
-    assert plan["llm_calls"] == plan["candidates"] // 2
+    assert plan["llm_calls"] >= 1
     assert plan["model"] == tmp_settings.sonnet_model_id
-
-
-# ===========================================================================
-# 6. trajectory_messages real run + heuristic shortcut
-# ===========================================================================
-
-
-def test_trajectory_real_run_heuristic_shortcut(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Short transition messages bypass the LLM via the regex heuristic."""
-    sid = "traj-sess"
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid,
-                [
-                    # "ok let me check that" matches _TRANSITION_RE and is <80 chars.
-                    make_user_msg(
-                        "u-trans-1",
-                        sid,
-                        "ok let me check that file please",
-                        ts="2026-04-01T10:00:00.000Z",
-                    ),
-                    make_user_msg(
-                        "u-trans-2",
-                        sid,
-                        "great, that works for me",
-                        ts="2026-04-01T10:00:01.000Z",
-                    ),
-                    make_assistant_msg(
-                        "a-trans",
-                        sid,
-                        ts="2026-04-01T10:00:05.000Z",
-                        content=[{"type": "text", "text": "ok let me check that approach now"}],
-                    ),
-                ],
-            )
-        ],
-    )
-
-    classify_spy = AsyncMock()
-    monkeypatch.setattr(llm_worker, "_classify_one", classify_spy)
-    monkeypatch.setattr(llm_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = llm_worker.trajectory_messages(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written >= 1
-
-    # The heuristic-fast-path messages must have skipped the LLM entirely.
-    assert classify_spy.await_count == 0
-
-    # All written rows have is_transition=True from the heuristic.
-    df = read_all(tmp_settings.trajectory_parquet_path)
-    assert df is not None
-    assert df.height >= 1
-    assert df["is_transition"].to_list() == [True] * df.height
-    assert df["sentiment_delta"].to_list() == ["neutral"] * df.height
-    con.close()
-
-
-# ===========================================================================
-# 7. trajectory_messages LLM path including refusal
-# ===========================================================================
-
-
-def test_trajectory_llm_path_with_refusal_and_success(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Long messages bypass the heuristic; refusal yields a neutral placeholder."""
-    sid = "traj-llm-sess"
-    long_msg_1 = (
-        "this is a long substantive technical message that goes far past the "
-        "80-character heuristic threshold so it must hit the LLM path "
-        "directly without any regex shortcut applying"
-    )
-    long_msg_2 = (
-        "another substantive technical message also long enough to exceed "
-        "the heuristic threshold and route through the LLM classifier path"
-    )
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid,
-                [
-                    make_user_msg("u-long-1", sid, long_msg_1, ts="2026-04-01T10:00:00.000Z"),
-                    make_user_msg("u-long-2", sid, long_msg_2, ts="2026-04-01T10:00:01.000Z"),
-                ],
-            )
-        ],
-    )
-
-    # Two long user messages → two LLM dispatches. First refused, second OK.
-    refusal = llm_worker.BedrockRefusalError("policy")
-    ok_payload = {
-        "sentiment_delta": "positive",
-        "is_transition": False,
-        "confidence": 0.88,
-    }
-    classifier = AsyncMock(side_effect=[refusal, ok_payload])
-    monkeypatch.setattr(llm_worker, "_classify_one", classifier)
-    monkeypatch.setattr(llm_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = llm_worker.trajectory_messages(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written == 2
-
-    df = read_all(tmp_settings.trajectory_parquet_path)
-    assert df is not None
-    rows = df.to_dicts()
-
-    # Refused row → neutral placeholder with confidence 0.0.
-    refused_rows = [r for r in rows if float(r["confidence"]) == 0.0]
-    assert len(refused_rows) == 1
-    assert refused_rows[0]["sentiment_delta"] == "neutral"
-    assert refused_rows[0]["is_transition"] is False
-
-    # Successful row → confidence > 0.0 and the dispatched payload values.
-    success_rows = [r for r in rows if float(r["confidence"]) > 0.0]
-    assert len(success_rows) == 1
-    assert success_rows[0]["sentiment_delta"] == "positive"
-    con.close()
+    # The plan also exposes the raw text-turn count (windowed pipeline shape).
+    assert "turns" in plan
+    assert plan["turns"] >= plan["candidates"]
 
 
 # ===========================================================================
@@ -557,7 +447,7 @@ def test_conflicts_dry_run_empty_corpus(tmp_path: Path, tmp_settings: Settings) 
     """Empty corpus → candidates=0."""
     con = _empty_messages_text_con(tmp_path)
 
-    plan = llm_worker.detect_conflicts(con, tmp_settings, dry_run=True)
+    plan = conflicts_worker.detect_conflicts(con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["pipeline"] == "conflicts"
     assert plan["candidates"] == 0
@@ -568,7 +458,7 @@ def test_conflicts_dry_run_populated_corpus(
     basic_con: duckdb.DuckDBPyConnection, tmp_settings: Settings
 ) -> None:
     """Populated corpus → candidates>0, llm_calls equal, model=sonnet."""
-    plan = llm_worker.detect_conflicts(basic_con, tmp_settings, dry_run=True)
+    plan = conflicts_worker.detect_conflicts(basic_con, tmp_settings, dry_run=True)
     assert isinstance(plan, dict)
     assert plan["candidates"] > 0
     assert plan["llm_calls"] == plan["candidates"]
@@ -578,90 +468,12 @@ def test_conflicts_dry_run_populated_corpus(
 
 
 # ===========================================================================
-# 9. detect_conflicts real run
+# 9. detect_conflicts real-run coverage lives in test_conflicts_storage_v2.py
 # ===========================================================================
-
-
-def test_conflicts_real_run_sentinel_and_populated_rows(
-    tmp_path: Path,
-    tmp_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Empty conflicts → sentinel ``empty=True``; populated → ``empty=False``."""
-    sid_a = "sess-clean"
-    sid_b = "sess-conflict"
-    # Unique markers in the message bodies so the stub _classify_one can
-    # tell which session it's classifying. Assembled session text doesn't
-    # carry the literal session id, only the message bodies + ts headers.
-    marker_a = "MARKER_NO_CONFLICT_AAA"
-    marker_b = "MARKER_HAS_CONFLICT_BBB"
-    con, _ = _build_con(
-        tmp_path,
-        [
-            (
-                sid_a,
-                [
-                    make_user_msg(
-                        "u-clean",
-                        sid_a,
-                        f"{marker_a} let's pick a simple plan with no disagreement",
-                        ts="2026-04-01T10:00:00.000Z",
-                    )
-                ],
-            ),
-            (
-                sid_b,
-                [
-                    make_user_msg(
-                        "u-conf",
-                        sid_b,
-                        f"{marker_b} I think we should ship the simple version now",
-                        ts="2026-04-02T10:00:00.000Z",
-                    )
-                ],
-            ),
-        ],
-    )
-
-    populated_payload = {
-        "conflicts": [
-            {
-                "stance_a": "Ship the simple version now.",
-                "stance_b": "Wait for cleanup first.",
-                "resolution": "resolved",
-            }
-        ]
-    }
-
-    async def _by_marker(*_args: Any, **kwargs: Any) -> dict[str, Any]:
-        # ``_classify_one(client, model_id, schema, text, ...)`` — pull the
-        # text and route on the unique marker we embedded above.
-        text = _args[3] if len(_args) >= 4 else kwargs.get("text", "")
-        if marker_b in text:
-            return populated_payload
-        return {"conflicts": []}
-
-    monkeypatch.setattr(llm_worker, "_classify_one", AsyncMock(side_effect=_by_marker))
-    monkeypatch.setattr(llm_worker, "_build_bedrock_client", lambda _settings: object())
-
-    written = llm_worker.detect_conflicts(con, tmp_settings, dry_run=False)
-    assert isinstance(written, int)
-    assert written == 2
-
-    df = read_all(tmp_settings.conflicts_parquet_path)
-    assert df is not None
-    rows = df.to_dicts()
-    sentinel = [r for r in rows if r["session_id"] == sid_a]
-    populated = [r for r in rows if r["session_id"] == sid_b]
-    assert len(sentinel) == 1
-    assert sentinel[0]["empty"] is True
-    assert sentinel[0]["stance_a"] is None
-
-    assert len(populated) == 1
-    assert populated[0]["empty"] is False
-    assert populated[0]["stance_a"] == "Ship the simple version now."
-    assert populated[0]["resolution"] == "resolved"
-    con.close()
+#
+# The legacy ``empty=True`` sentinel was removed in v1.0 (RFC 0002 §3.4).
+# Real-run coverage for the new ``(turn_a_uuid, turn_b_uuid)`` schema lives
+# in ``tests/test_conflicts_storage_v2.py``.
 
 
 # ===========================================================================
@@ -686,16 +498,16 @@ def test_build_bedrock_client_cache_identity(
         counter["n"] += 1
         return object()
 
-    monkeypatch.setattr("claude_sql.llm_worker.boto3.client", _fake_boto_client)
+    monkeypatch.setattr("claude_sql.llm_shared.boto3.client", _fake_boto_client)
 
-    a = llm_worker._build_bedrock_client(tmp_settings)
-    b = llm_worker._build_bedrock_client(tmp_settings)
+    a = llm_shared._build_bedrock_client(tmp_settings)
+    b = llm_shared._build_bedrock_client(tmp_settings)
     assert a is b
     assert counter["n"] == 1  # second call hit the cache
 
     # Bumping llm_concurrency past the floor changes the pool size key.
     bumped = tmp_settings.model_copy(update={"llm_concurrency": 64})
-    c = llm_worker._build_bedrock_client(bumped)
+    c = llm_shared._build_bedrock_client(bumped)
     assert c is not a
     assert counter["n"] == 2  # cache miss for the new key
 
@@ -707,9 +519,9 @@ def test_build_bedrock_client_cache_identity(
 
 def test_maybe_log_bedrock_call_noop_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     """No trace path → function is a no-op."""
-    monkeypatch.setattr(llm_worker, "_BEDROCK_TRACE_PATH", None)
+    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", None)
     # Should not raise even with bogus payload structure.
-    llm_worker._maybe_log_bedrock_call("classify", "m-id", {"usage": {}}, 12.5)
+    llm_shared.maybe_log_bedrock_call("classify", "m-id", {"usage": {}}, 12.5)
 
 
 def test_maybe_log_bedrock_call_appends_jsonl_line(
@@ -717,7 +529,7 @@ def test_maybe_log_bedrock_call_appends_jsonl_line(
 ) -> None:
     """Trace path set → exactly one JSONL row appended per call."""
     trace = tmp_path / "trace.jsonl"
-    monkeypatch.setattr(llm_worker, "_BEDROCK_TRACE_PATH", str(trace))
+    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", str(trace))
     payload = {
         "usage": {
             "input_tokens": 1200,
@@ -731,7 +543,7 @@ def test_maybe_log_bedrock_call_appends_jsonl_line(
         },
         "stop_reason": "end_turn",
     }
-    llm_worker._maybe_log_bedrock_call("classify", "model-x", payload, 42.123)
+    llm_shared.maybe_log_bedrock_call("classify", "model-x", payload, 42.123)
 
     lines = trace.read_text().splitlines()
     assert len(lines) == 1
@@ -768,5 +580,5 @@ def test_estimate_cost_arithmetic(
     pricing: tuple[float, float],
     expected: float,
 ) -> None:
-    actual = llm_worker._estimate_cost(n, in_tok, out_tok, pricing)
+    actual = llm_shared._estimate_cost(n, in_tok, out_tok, pricing)
     assert actual == pytest.approx(expected)

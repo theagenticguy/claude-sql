@@ -1,4 +1,4 @@
-"""Unit tests for llm_worker -- uses a mock Bedrock client to verify request shape."""
+"""Unit tests for llm_shared -- uses a mock Bedrock client to verify request shape."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from claude_sql.llm_worker import _invoke_classifier_sync
+from claude_sql.llm_shared import _invoke_classifier_sync
 from claude_sql.schemas import SESSION_CLASSIFICATION_SCHEMA
 
 
@@ -120,7 +120,9 @@ def test_invoke_body_carries_system_block_with_cache_control() -> None:
     block = body["system"][0]
     assert block["type"] == "text"
     assert block["text"] == sys_prompt
-    assert block["cache_control"] == {"type": "ephemeral"}
+    # ttl="1h" landed in Act-5: see test_llm_worker_cache.py for the
+    # explicit ttl + per-pipeline accumulator coverage.
+    assert block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
@@ -133,7 +135,7 @@ def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
     a conservative guard — real tokenization tends to land 5–10% higher
     than this lower bound, so 900 here means ~990+ Anthropic tokens.
     """
-    from claude_sql.llm_worker import (
+    from claude_sql.llm_shared import (
         CLASSIFY_SYSTEM_PROMPT,
         CONFLICTS_SYSTEM_PROMPT,
         TRAJECTORY_SYSTEM_PROMPT,
@@ -151,7 +153,7 @@ def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
         # 1024-tok cache minimum and 1258 did not). Aim for 1300+ cl100k →
         # ~1014 Anthropic minimum, with a safety margin pushing each prompt
         # to 1700+ cl100k.
-        from claude_sql.llm_worker import (
+        from claude_sql.llm_shared import (
             CLASSIFY_SYSTEM_PROMPT,
             CONFLICTS_SYSTEM_PROMPT,
             TRAJECTORY_SYSTEM_PROMPT,
