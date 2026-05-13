@@ -737,117 +737,165 @@ async def _trajectory_async(
 
     client = _build_bedrock_client(settings)
     sem = anyio.CapacityLimiter(settings.llm_concurrency)
-    written = 0
+    # Shared mutable state across concurrent session tasks. Mutations to
+    # ``written`` / ``processed_sessions`` AND the parquet shard write are
+    # serialized under ``write_lock``. The Bedrock call itself (inside
+    # ``classify_one``) is NOT under this lock — that's where the
+    # CapacityLimiter does the throttling, capping in-flight chunks at
+    # ``settings.llm_concurrency``.
+    write_lock = anyio.Lock()
+    written_box = [0]  # boxed so the closure can mutate it
     processed_sessions: set[str] = set()
 
-    # Step 4: per-session chunk loop. We process one session at a time so a
-    # mid-run failure on session N doesn't block session N+1; the
-    # checkpointer stamps each session as it completes.
-    for sid, session_windows in by_session.items():
+    # Step 4: per-session worker. One task per session; chunks within a
+    # session run sequentially (per-chunk anchor caching makes
+    # within-session sequential cheaper than within-session parallel —
+    # RFC 0002 §4.1). The CapacityLimiter throttles per-CALL, so a
+    # multi-chunk session contends for the same N slots as every other
+    # in-flight chunk across the task group. Net concurrency for the
+    # Bedrock layer is exactly ``settings.llm_concurrency``.
+    async def _process_session(sid: str, session_windows: list[Any]) -> None:
         chunks = _chunk_windows(session_windows)
         all_rows: list[dict[str, Any]] = []
         session_failed = False
 
-        for chunk_idx, chunk in enumerate(chunks):
-            t0 = time.monotonic()
-            res = await _classify_chunk(
-                client,
-                settings,
-                sem,
-                chunk=chunk,
-                thinking_mode=thinking_mode,
-            )
-            now = datetime.now(UTC)
-
-            if isinstance(res, BedrockRefusalError):
-                logger.info(
-                    "trajectory: chunk {}/{} of session {} refused — neutral placeholders",
-                    chunk_idx + 1,
-                    len(chunks),
-                    sid,
-                )
-                all_rows.extend(_placeholder_row(sid, row[1], row[2], now) for row in chunk)
-                continue
-            if isinstance(res, BaseException):
-                logger.warning(
-                    "trajectory: chunk {}/{} of session {} failed ({}); enqueuing for retry",
-                    chunk_idx + 1,
-                    len(chunks),
-                    sid,
-                    res,
-                )
-                retry_queue.enqueue(
-                    settings.checkpoint_db_path,
-                    pipeline="trajectory",
-                    unit_id=sid,
-                    error=str(res),
-                )
-                session_failed = True
-                break
-
-            indexed = res
-            missing = _missing_keys(chunk, indexed)
-
-            # Bounded retry: re-request only the missing windows in one
-            # additional Sonnet call. Persistent misses become placeholders.
-            if missing:
-                logger.info(
-                    "trajectory: chunk {}/{} of session {} missing {}/{} windows — retrying",
-                    chunk_idx + 1,
-                    len(chunks),
-                    sid,
-                    len(missing),
-                    len(chunk),
-                )
-                retry_res = await _classify_chunk(
+        try:
+            for chunk_idx, chunk in enumerate(chunks):
+                t0 = time.monotonic()
+                res = await _classify_chunk(
                     client,
                     settings,
                     sem,
-                    chunk=missing,
+                    chunk=chunk,
                     thinking_mode=thinking_mode,
                 )
                 now = datetime.now(UTC)
-                if isinstance(retry_res, dict):
-                    for key, win in retry_res.items():
-                        indexed[key] = win
-                # Anything still missing after the retry → neutral placeholder.
-                still_missing = _missing_keys(chunk, indexed)
-                all_rows.extend(_placeholder_row(sid, row[1], row[2], now) for row in still_missing)
-                if still_missing:
-                    logger.warning(
-                        "trajectory: session {} chunk {}: {} window(s) "
-                        "persistently missing — stamped neutral placeholders",
-                        sid,
+
+                if isinstance(res, BedrockRefusalError):
+                    logger.info(
+                        "trajectory: chunk {}/{} of session {} refused — neutral placeholders",
                         chunk_idx + 1,
-                        len(still_missing),
+                        len(chunks),
+                        sid,
                     )
-
-            # Build rows for every window the model returned successfully.
-            for row in chunk:
-                key = (row[1], row[2])
-                win = indexed.get(key)
-                if win is None:
+                    all_rows.extend(_placeholder_row(sid, row[1], row[2], now) for row in chunk)
                     continue
-                all_rows.append(_build_row(sid, win, now))
+                if isinstance(res, BaseException):
+                    logger.warning(
+                        "trajectory: chunk {}/{} of session {} failed ({}); enqueuing for retry",
+                        chunk_idx + 1,
+                        len(chunks),
+                        sid,
+                        res,
+                    )
+                    # retry_queue.enqueue uses sqlite WAL — concurrent writers
+                    # are safe per .erpaval/solutions/best-practices/
+                    # sqlite-wal-cold-start-pragma-race.md.
+                    retry_queue.enqueue(
+                        settings.checkpoint_db_path,
+                        pipeline="trajectory",
+                        unit_id=sid,
+                        error=str(res),
+                    )
+                    session_failed = True
+                    break
 
-            logger.info(
-                "trajectory: session {} chunk {}/{} done in {:.1f}s ({} windows, {} placeholders)",
+                indexed = res
+                missing = _missing_keys(chunk, indexed)
+
+                # Bounded retry: re-request only the missing windows in one
+                # additional Sonnet call. Persistent misses become
+                # placeholders.
+                if missing:
+                    logger.info(
+                        "trajectory: chunk {}/{} of session {} missing {}/{} windows — retrying",
+                        chunk_idx + 1,
+                        len(chunks),
+                        sid,
+                        len(missing),
+                        len(chunk),
+                    )
+                    retry_res = await _classify_chunk(
+                        client,
+                        settings,
+                        sem,
+                        chunk=missing,
+                        thinking_mode=thinking_mode,
+                    )
+                    now = datetime.now(UTC)
+                    if isinstance(retry_res, dict):
+                        for key, win in retry_res.items():
+                            indexed[key] = win
+                    # Anything still missing after the retry → neutral placeholder.
+                    still_missing = _missing_keys(chunk, indexed)
+                    all_rows.extend(
+                        _placeholder_row(sid, row[1], row[2], now) for row in still_missing
+                    )
+                    if still_missing:
+                        logger.warning(
+                            "trajectory: session {} chunk {}: {} window(s) "
+                            "persistently missing — stamped neutral placeholders",
+                            sid,
+                            chunk_idx + 1,
+                            len(still_missing),
+                        )
+
+                # Build rows for every window the model returned successfully.
+                for row in chunk:
+                    key = (row[1], row[2])
+                    win = indexed.get(key)
+                    if win is None:
+                        continue
+                    all_rows.append(_build_row(sid, win, now))
+
+                logger.info(
+                    "trajectory: session {} chunk {}/{} done in {:.1f}s "
+                    "({} windows, {} placeholders)",
+                    sid,
+                    chunk_idx + 1,
+                    len(chunks),
+                    time.monotonic() - t0,
+                    len(chunk),
+                    sum(1 for r in all_rows if r["confidence"] == 0.0),
+                )
+        except BaseException as exc:  # noqa: BLE001 — never abort the task group
+            # Any exception escaping the loop (network blip post-retry,
+            # parquet schema error, etc.) goes to the retry queue and is
+            # swallowed so the task group keeps draining.
+            logger.warning(
+                "trajectory: session {} aborted ({}); enqueuing for retry",
                 sid,
-                chunk_idx + 1,
-                len(chunks),
-                time.monotonic() - t0,
-                len(chunk),
-                sum(1 for r in all_rows if r["confidence"] == 0.0),
+                exc,
             )
+            retry_queue.enqueue(
+                settings.checkpoint_db_path,
+                pipeline="trajectory",
+                unit_id=sid,
+                error=str(exc),
+            )
+            return
 
         if session_failed:
-            continue
+            return
 
         if all_rows:
+            # Critical section: serialize parquet shard writes + counter
+            # mutation. write_part itself produces a fresh part-<ts>.parquet
+            # per call (see parquet_shards.write_part), so concurrent calls
+            # don't collide on filenames — but we still keep the lock so the
+            # in-memory ``written_box`` / ``processed_sessions`` set updates
+            # in lockstep with the on-disk write.
             df = pl.DataFrame(all_rows, schema=_PARQUET_SCHEMA)
-            write_part(settings.trajectory_parquet_path, df)
-            written += len(all_rows)
-            processed_sessions.add(sid)
+            async with write_lock:
+                write_part(settings.trajectory_parquet_path, df)
+                written_box[0] += len(all_rows)
+                processed_sessions.add(sid)
+
+    async with anyio.create_task_group() as tg:
+        for sid, session_windows in by_session.items():
+            tg.start_soon(_process_session, sid, session_windows)
+
+    written = written_box[0]
 
     if processed_sessions:
         checkpointer.mark_completed(
