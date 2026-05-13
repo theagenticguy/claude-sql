@@ -76,8 +76,8 @@ parquets that exist — missing ones warn and no-op, never crash.
 ## CodeQL hygiene (the rules ruff misses)
 
 GitHub Advanced Security runs CodeQL on every PR. Ruff's 32-family
-selector catches most issues, but two CodeQL rules fire on patterns
-ruff lets through. Both have a one-line fix; both are easy to forget.
+selector catches most issues, but four CodeQL rules fire on patterns
+ruff lets through. Each has a one-line fix; each is easy to forget.
 
 - **`py/empty-except` — every `try/except: pass` block needs a comment
   explaining why.** Ruff's `S110` only fires on broad excepts
@@ -102,11 +102,38 @@ ruff lets through. Both have a one-line fix; both are easy to forget.
   don't end up using. If a class was kept "just in case" or for a
   branch that never materialized, delete it before committing.
 
-Both checks run automatically — there's no `mise run codeql` task.
-Treat the comment / unused-name discipline as part of writing the test
-in the first place. The rules below in `pyproject.toml` should be kept
-maximally aggressive so the *next* class of CodeQL findings has a
-ruff-side analog wherever one exists.
+- **`py/catch-base-exception` — never `except BaseException` in an
+  anyio task body or async dispatcher.** `BaseException` swallows
+  `KeyboardInterrupt`, `SystemExit`, and crucially
+  `asyncio.CancelledError`. In an anyio task group, swallowing
+  `CancelledError` deadlocks shutdown — the parent's `aclose()` waits
+  forever for child tasks that observed cancel but never re-raised it.
+  The fix is one character: `BaseException` → `Exception`. Recoverable
+  errors (network blip, parquet schema mismatch, refused refusal) are
+  all `Exception` subclasses; cancellation cleanly cascades. Verified
+  on PR #42 (`trajectory_worker.py:647/:862`). The only legitimate
+  `except BaseException` lives in CLI top-level `try/except` blocks
+  that re-raise after logging — never in worker code.
+
+- **`py/file-not-closed` — when monkeypatching `tempfile.mkstemp` to
+  return a `(fd, path)` tuple, open the fd inside the closure per-call,
+  not at module level.** Production code conventionally calls
+  `os.close(fd)` because mkstemp's contract gives the caller fd
+  ownership. A module-level `fd = os.open(...)` reused across calls
+  trips CodeQL's data-flow tracker (open-site and close-site are
+  decoupled) AND a per-test `addFinalizer(lambda: os.close(fd))`
+  produces `Bad file descriptor` on a double-close because the
+  consumer ALSO closes. Open inside the closure each call so producer
+  and consumer pair statically. See
+  `.erpaval/solutions/best-practices/codeql-py-file-not-closed-in-test-mkstemp-fakes.md`
+  for the full pattern.
+
+All four checks run automatically — there's no `mise run codeql` task.
+Treat the comment / unused-name / no-BaseException / per-call-mkstemp
+discipline as part of writing the test in the first place. The rules
+below in `pyproject.toml` should be kept maximally aggressive so the
+*next* class of CodeQL findings has a ruff-side analog wherever one
+exists.
 
 ## Logging: loguru only, no stdlib `logging`
 
