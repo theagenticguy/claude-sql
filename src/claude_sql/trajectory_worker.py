@@ -613,7 +613,7 @@ async def _classify_chunk(
     *,
     chunk: list[tuple[str, str | None, str, str | None, str, str | None, str]],
     thinking_mode: str,
-) -> dict[tuple[str | None, str], dict[str, Any]] | BedrockRefusalError | BaseException:
+) -> dict[tuple[str | None, str], dict[str, Any]] | BedrockRefusalError | Exception:
     """Send one chunk to Sonnet; return per-(prev,curr) result map or the raw exception.
 
     The schema reminder is concatenated into the user_text alongside the
@@ -644,7 +644,7 @@ async def _classify_chunk(
         )
     except BedrockRefusalError as exc:
         return exc
-    except BaseException as exc:  # noqa: BLE001 — propagate to caller's retry/skip logic
+    except Exception as exc:  # noqa: BLE001 — propagate to caller's retry/skip logic; CancelledError still cancels the task group
         return exc
     windows = result.get("windows") if isinstance(result, dict) else None
     if not isinstance(windows, list):
@@ -781,7 +781,7 @@ async def _trajectory_async(
                     )
                     all_rows.extend(_placeholder_row(sid, row[1], row[2], now) for row in chunk)
                     continue
-                if isinstance(res, BaseException):
+                if isinstance(res, Exception):
                     logger.warning(
                         "trajectory: chunk {}/{} of session {} failed ({}); enqueuing for retry",
                         chunk_idx + 1,
@@ -859,7 +859,7 @@ async def _trajectory_async(
                     len(chunk),
                     sum(1 for r in all_rows if r["confidence"] == 0.0),
                 )
-        except BaseException as exc:  # noqa: BLE001 — never abort the task group
+        except Exception as exc:  # noqa: BLE001 — non-cancel exceptions go to retry; CancelledError still tears down the task group
             # Any exception escaping the loop (network blip post-retry,
             # parquet schema error, etc.) goes to the retry queue and is
             # swallowed so the task group keeps draining.
