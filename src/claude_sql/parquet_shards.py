@@ -40,10 +40,12 @@ Public API
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+from loguru import logger
 
 #: Glob pattern for shard part files within a sharded cache directory.
 PART_GLOB: str = "part-*.parquet"
@@ -162,11 +164,90 @@ def count_rows(target: Path) -> int:
     return total
 
 
+def replace_sessions(
+    target: Path,
+    *,
+    key_column: str,
+    session_ids: Iterable[str],
+) -> int:
+    """Drop rows whose ``key_column`` is in ``session_ids`` across every shard.
+
+    Context
+    -------
+    Workers like :mod:`claude_sql.trajectory_worker` gate computation on a
+    ``(session_id, latest_ts, message_count)`` checkpoint that advances when
+    a session grows. When the checkpoint admits a session for re-scoring,
+    the pipeline rewrites rows it may have already produced under an earlier
+    shard — without this helper those prior rows accumulate and every
+    ``(session_id, prev_uuid, curr_uuid)`` pair duplicates on rerun.
+
+    Behavior
+    --------
+    * Shards containing *some* rows for ``session_ids`` are rewritten in place
+      with those rows filtered out; other sessions' rows are preserved.
+    * Shards that become empty are unlinked — leaving empty part files causes
+      DuckDB's ``read_parquet`` glob to bind a zero-row parquet and surfaces
+      no other harm, but the file is unreachable as data so we remove it.
+    * A shard with no matching rows is left untouched (cheap footer read).
+    * The legacy single-file branch mirrors the same shape: filter → rewrite
+      (or unlink when the filter empties the file).
+
+    Returns the total number of rows removed across the cache. Returns 0 on
+    an empty cache, a missing file, or an empty ``session_ids``.
+    """
+    ids = set(session_ids)
+    if not ids:
+        return 0
+    parts = iter_part_files(target)
+    if not parts:
+        return 0
+    removed_total = 0
+    for part in parts:
+        try:
+            df = pl.read_parquet(part)
+        except (OSError, pl.exceptions.ComputeError) as exc:
+            # A truncated or unreadable shard is worth flagging — don't
+            # silently let it block the replace. Leave it on disk; the
+            # caller's next write still lands, and the analytics view will
+            # surface the unreadable file the next time it binds.
+            logger.warning("replace_sessions: unreadable shard {} ({}); skipping", part, exc)
+            continue
+        if key_column not in df.columns or df.height == 0:
+            continue
+        mask = df[key_column].is_in(list(ids))
+        hit_count = int(mask.sum())
+        if hit_count == 0:
+            continue
+        removed_total += hit_count
+        kept = df.filter(~mask)
+        if kept.height == 0:
+            # Nothing left in this shard — remove it so the cache doesn't
+            # accumulate empty part files across reruns.
+            try:
+                part.unlink()
+            except OSError as exc:
+                logger.warning("replace_sessions: failed to unlink empty shard {}: {}", part, exc)
+            continue
+        # Rewrite in place. The legacy single-file branch lands here too
+        # (``iter_part_files`` returns ``[target]`` in that case), which is
+        # correct — we want to overwrite the same file.
+        kept.write_parquet(part)
+    if removed_total:
+        logger.info(
+            "replace_sessions: dropped {} row(s) for {} session(s) under {}",
+            removed_total,
+            len(ids),
+            target,
+        )
+    return removed_total
+
+
 __all__ = [
     "PART_GLOB",
     "count_rows",
     "is_sharded_dir",
     "iter_part_files",
     "read_all",
+    "replace_sessions",
     "write_part",
 ]

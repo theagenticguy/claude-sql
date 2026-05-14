@@ -512,6 +512,101 @@ def test_old_per_message_parquet_shard_is_deleted_on_first_run(
 
 
 # ---------------------------------------------------------------------------
+# Rerun semantics (GH #45)
+# ---------------------------------------------------------------------------
+
+
+def test_rerun_with_advancing_bounds_replaces_prior_session_shards(
+    tmp_path: Path,
+    tmp_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Growing active session: second run must not duplicate (prev, curr) pairs.
+
+    The v1.0 checkpointer gates computation on ``(session_id, latest_ts,
+    message_count)``. When new turns append to an active session those
+    bounds advance and the session goes through the pipeline again. Without
+    the writer-side replace, the new shard's rows stack on top of the prior
+    shard and every ``(session_id, prev_uuid, curr_uuid)`` pair duplicates
+    (see GH #45).
+    """
+    sid = "sess-rerun-dup"
+    proj = tmp_path / "projects" / "proj-traj"
+
+    # First run: 3 turns.
+    first_msgs = [
+        _user("u1", sid, "first opener message that clears the 32-char filter", off=0),
+        _user("u2", sid, "second substantive turn that exceeds the filter cutoff", off=1),
+        _user("u3", sid, "third substantive turn long enough to clear filtering", off=2),
+    ]
+    write_session_jsonl(proj / f"{sid}.jsonl", messages=first_msgs)
+    sa_glob, sa_meta = _seed_subagent_stub(tmp_path)
+    glob = str(tmp_path / "projects" / "*" / "*.jsonl")
+    con = duckdb.connect(":memory:")
+    register_raw(con, glob=glob, subagent_glob=sa_glob, subagent_meta_glob=sa_meta)
+    register_views(con)
+
+    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+        return {
+            (r[1], r[2]): {
+                "prev_uuid": r[1],
+                "curr_uuid": r[2],
+                "prev_sentiment": None if r[1] is None else "neutral",
+                "curr_sentiment": "neutral",
+                "delta": None if r[1] is None else 0,
+                "is_transition": False,
+                "transition_kind": "none",
+                "confidence": 0.8,
+            }
+            for r in chunk
+        }
+
+    monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
+    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
+
+    first = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
+    assert first == 3
+    df1 = read_all(tmp_settings.trajectory_parquet_path)
+    assert df1 is not None and df1.height == 3
+
+    # Second run: append two more turns. Rewriting the JSONL advances
+    # ``latest_ts`` and ``message_count``, so the checkpointer admits the
+    # session again and the pipeline re-scores ALL turns (not just the new
+    # ones — the windowed pipeline is whole-session).
+    second_msgs = [
+        *first_msgs,
+        _user("u4", sid, "fourth substantive turn padded long enough to clear filter", off=3),
+        _user("u5", sid, "fifth substantive turn padded long enough to clear filter", off=4),
+    ]
+    write_session_jsonl(proj / f"{sid}.jsonl", messages=second_msgs)
+
+    # Force DuckDB to re-read the updated JSONL on the next query.
+    con.close()
+    con = duckdb.connect(":memory:")
+    register_raw(con, glob=glob, subagent_glob=sa_glob, subagent_meta_glob=sa_meta)
+    register_views(con)
+
+    second = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
+    assert second == 5
+
+    df2 = read_all(tmp_settings.trajectory_parquet_path)
+    assert df2 is not None
+
+    # Invariant: one row per (session_id, curr_uuid). No duplicates.
+    # (prev_uuid is part of the true key but curr_uuid is sufficient here
+    # since our fake never reassigns prev within a session.)
+    pair_counts = (
+        df2.group_by(["session_id", "curr_uuid"]).agg(pl.len().alias("n")).filter(pl.col("n") > 1)
+    )
+    assert pair_counts.height == 0, (
+        f"duplicate (session_id, curr_uuid) rows after rerun: {pair_counts.to_dicts()}"
+    )
+    # Total row count is exactly the final turn count — no accumulation.
+    assert df2.filter(pl.col("session_id") == sid).height == 5
+    con.close()
+
+
+# ---------------------------------------------------------------------------
 # Cache-stat summary
 # ---------------------------------------------------------------------------
 

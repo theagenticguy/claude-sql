@@ -51,7 +51,7 @@ from claude_sql.llm_shared import (
     classify_one,
     pipeline_cache_stats,
 )
-from claude_sql.parquet_shards import iter_part_files, write_part
+from claude_sql.parquet_shards import iter_part_files, replace_sessions, write_part
 from claude_sql.schemas import TRAJECTORY_ARRAY_SCHEMA
 from claude_sql.session_text import session_bounds
 
@@ -886,8 +886,20 @@ async def _trajectory_async(
             # don't collide on filenames — but we still keep the lock so the
             # in-memory ``written_box`` / ``processed_sessions`` set updates
             # in lockstep with the on-disk write.
+            #
+            # replace_sessions drops any prior rows for ``sid`` still sitting
+            # in the cache from earlier runs. The checkpointer gates
+            # computation on advancing (latest_ts, message_count) bounds but
+            # does NOT touch the parquet cache; without this step a growing
+            # active session duplicates its (prev_uuid, curr_uuid) pairs
+            # on every rerun. See GH #45.
             df = pl.DataFrame(all_rows, schema=_PARQUET_SCHEMA)
             async with write_lock:
+                replace_sessions(
+                    settings.trajectory_parquet_path,
+                    key_column="session_id",
+                    session_ids=[sid],
+                )
                 write_part(settings.trajectory_parquet_path, df)
                 written_box[0] += len(all_rows)
                 processed_sessions.add(sid)
