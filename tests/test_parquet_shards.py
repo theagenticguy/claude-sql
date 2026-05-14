@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from claude_sql.parquet_shards import (
     count_rows,
@@ -283,3 +284,48 @@ def test_replace_sessions_is_idempotent_on_second_call(tmp_path: Path) -> None:
     df = read_all(target)
     assert df is not None
     assert df.height == 3
+
+
+def test_replace_sessions_skips_unreadable_shard(tmp_path: Path) -> None:
+    """A truncated/corrupt shard is warned about and skipped, not raised."""
+    target = tmp_path / "out"
+    target.mkdir()
+    # A valid readable shard alongside a deliberately corrupt one.
+    write_part(target, _keyed_df("S1", 2))
+    corrupt = target / "part-9999999999999999999.parquet"
+    corrupt.write_bytes(b"not a parquet file")
+
+    # Must not raise; must still process the readable shard.
+    removed = replace_sessions(target, key_column="session_id", session_ids=["S1"])
+    assert removed == 2
+    # The corrupt shard is left on disk (operator's problem — the warning
+    # logs the path). The readable shard was emptied and unlinked.
+    assert corrupt.exists()
+    assert [p for p in iter_part_files(target) if p.name.startswith("part-9999")] == [corrupt]
+
+
+def test_replace_sessions_tolerates_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``Path.unlink`` raises OSError, warn and keep going (no propagation)."""
+    target = tmp_path / "out"
+    write_part(target, _keyed_df("S1", 3))
+    [part] = iter_part_files(target)
+
+    # Stub Path.unlink so the shard that would be removed fails instead.
+    # Path is the concrete class tmp_path produces, so the patch catches it.
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == part:
+            raise OSError("simulated: read-only filesystem")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    # Must not raise. The shard that would have been unlinked stays on
+    # disk; the function still reports the right removed-row count.
+    removed = replace_sessions(target, key_column="session_id", session_ids=["S1"])
+    assert removed == 3
+    # The original shard still exists because the unlink was stubbed out.
+    assert part.exists()
