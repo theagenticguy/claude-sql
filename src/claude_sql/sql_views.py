@@ -57,8 +57,8 @@ SUBAGENT_META_GLOB: str = os.path.expanduser("~/.claude/projects/*/*/subagents/a
 
 # Business-level views emitted by ``register_views``. Used by the
 # ``claude-sql schema`` subcommand for schema dumps.  Includes the v2
-# analytics view names at the tail so ``describe_all`` can enumerate them
-# once :func:`register_analytics` has populated the corresponding parquets.
+# analytics view names at the tail; the schema dump materializes only
+# rows where :func:`register_analytics` has populated the matching parquets.
 VIEW_NAMES: tuple[str, ...] = (
     "sessions",
     "messages",
@@ -108,11 +108,11 @@ VIEW_NAMES: tuple[str, ...] = (
 # they're correctly omitted because the source of truth for those views
 # is the parquet, not this dict.
 #
-# Drift is caught by :func:`tests.test_sql_views.test_view_schema_matches_describe_all`,
-# which registers the v1 views over the fixture corpus, runs
-# :func:`describe_all`, and asserts column-level equality with this dict.
-# A contributor who edits view DDL without updating ``VIEW_SCHEMA`` gets
-# a hard CI failure rather than a runtime mystery.
+# Drift is caught by :func:`tests.test_sql_views.test_view_schema_matches_describe_inline`,
+# which registers the v1 views over the fixture corpus, runs ``DESCRIBE``
+# inline per view, and asserts column-level equality with this dict. A
+# contributor who edits view DDL without updating ``VIEW_SCHEMA`` gets a
+# hard CI failure rather than a runtime mystery.
 VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     "sessions": (
         ("session_id", "VARCHAR"),
@@ -410,7 +410,7 @@ def _sql_str(value: str) -> str:
 # Drift discipline: when a downstream view in :func:`register_views` adds a
 # new top-level field reference, add it here too — otherwise the view will
 # silently return NULL for that column. The
-# ``test_view_schema_matches_describe_all`` drift test catches the column
+# ``test_view_schema_matches_describe_inline`` drift test catches the column
 # disappearing from any of the 18 v1 views.
 _MESSAGE_STRUCT_TYPE: str = (
     "STRUCT("
@@ -599,6 +599,7 @@ def register_raw(
         )
         logger.debug("Registered v_raw_subagent_meta from glob {}", subagent_meta_glob)
     except Exception:
+        # register-or-fail-loud — any DuckDB error must surface to the caller.
         logger.exception("Failed to register raw views")
         raise
 
@@ -1072,6 +1073,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.debug("Registered view: subagent_messages")
     except Exception:
+        # register-or-fail-loud — any DuckDB error must surface to the caller.
         logger.exception("Failed to register derived views")
         raise
 
@@ -2110,49 +2112,6 @@ def register_all(
 # ---------------------------------------------------------------------------
 # Introspection
 # ---------------------------------------------------------------------------
-
-
-def describe_all(con: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[str, str]]]:
-    """Return the column schema of every business-level view.
-
-    .. deprecated::
-        Use :data:`VIEW_SCHEMA` for static introspection.  ``describe_all``
-        opens a DuckDB connection and runs ``DESCRIBE`` per view, which on
-        the live corpus takes ~14 s -- prohibitive for the agent-facing
-        ``schema`` command.  Kept for one release as a fallback and as the
-        ground truth used by the ``test_view_schema_matches_describe_all``
-        drift test; it will be removed once that test moves to a different
-        introspection path.
-
-    Parameters
-    ----------
-    con
-        Open DuckDB connection with views registered.
-
-    Returns
-    -------
-    dict
-        ``{view_name: [(column_name, column_type), ...]}``. Views that fail to
-        describe (e.g. missing because ``register_views`` was not called) map
-        to an empty list and emit a warning.
-    """
-    import warnings
-
-    warnings.warn(
-        "describe_all is deprecated; use VIEW_SCHEMA for static "
-        "introspection. Will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    out: dict[str, list[tuple[str, str]]] = {}
-    for name in VIEW_NAMES:
-        try:
-            rows = con.execute(f"DESCRIBE {name}").fetchall()
-            out[name] = [(str(r[0]), str(r[1])) for r in rows]
-        except duckdb.Error as exc:
-            logger.warning("Could not describe {}: {}", name, exc)
-            out[name] = []
-    return out
 
 
 def list_macros(con: duckdb.DuckDBPyConnection) -> list[tuple[str, tuple[str, ...]]]:
