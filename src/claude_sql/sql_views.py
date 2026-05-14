@@ -126,7 +126,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "messages": (
         ("uuid", "VARCHAR"),
-        ("parent_uuid", "JSON"),
+        ("parent_uuid", "VARCHAR"),
         ("session_id", "VARCHAR"),
         ("ts", "TIMESTAMP"),
         ("type", "VARCHAR"),
@@ -271,7 +271,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "subagent_messages": (
         ("uuid", "VARCHAR"),
-        ("parent_uuid", "JSON"),
+        ("parent_uuid", "VARCHAR"),
         ("session_id", "VARCHAR"),
         ("parent_session_id", "VARCHAR"),
         ("agent_hex", "VARCHAR"),
@@ -663,7 +663,15 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             CREATE OR REPLACE VIEW messages AS
             SELECT
                 uuid,
-                parentUuid                                AS parent_uuid,
+                -- ``parentUuid`` is inferred as JSON when the column carries
+                -- both NULL and string-UUID values across files (DuckDB's
+                -- read_json union picks the widest type). The recursive-CTE
+                -- join in cookbook recipe 1.4 then fails with a Conversion
+                -- Error because DuckDB tries to coerce the VARCHAR RHS to
+                -- JSON. Casting at view-construction time exposes the
+                -- column as a flat VARCHAR so user-facing recursive walks
+                -- "just work" (GH #47).
+                CAST(parentUuid AS VARCHAR)               AS parent_uuid,
                 sessionId                                 AS session_id,
                 timestamp::TIMESTAMP                      AS ts,
                 type,
@@ -1055,7 +1063,10 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
             CREATE OR REPLACE VIEW subagent_messages AS
             SELECT
                 uuid,
-                parentUuid                  AS parent_uuid,
+                -- See ``messages`` view above (GH #47): keep parent_uuid
+                -- VARCHAR-typed so recursive CTEs over subagent threads
+                -- don't trip the same JSON-coercion landmine.
+                CAST(parentUuid AS VARCHAR) AS parent_uuid,
                 sessionId                   AS session_id,
                 parent_session_id,
                 agent_hex,
