@@ -417,23 +417,6 @@ def test_todo_events_forward_compat(fixtures_dir: Path) -> None:
     assert rows == [("Explore", "pending")]
 
 
-def test_task_spawns_deprecated_alias_unions_both(fixtures_dir: Path) -> None:
-    """The deprecated ``task_spawns`` alias unions subagent_spawns +
-    task_creations. TaskCreate rows have NULL subagent_type/prompt by design.
-    """
-    con = _connect(fixtures_dir)
-    rows = con.execute(
-        "SELECT spawn_tool, subagent_type, description "
-        "FROM task_spawns WHERE session_id = ? "
-        "ORDER BY spawn_tool",
-        [SESSION_IDS[1]],
-    ).fetchall()
-    assert rows == [
-        ("Agent", "Explore", "Scan code"),
-        ("TaskCreate", None, "Check for unused imports across src/"),
-    ]
-
-
 def test_subagent_spawns_detected(fixtures_dir: Path) -> None:
     """``Agent`` (the v2.1.63+ rename of Task) lands in subagent_spawns with
     subagent_type + prompt populated.
@@ -569,7 +552,6 @@ def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
         "task_creations",
         "task_updates",
         "tasks_state_current",
-        "task_spawns",  # deprecated alias, still in VIEW_NAMES for one release
         "subagent_sessions",
         "subagent_messages",
     }
