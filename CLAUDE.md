@@ -95,6 +95,18 @@ ruff lets through. Each has a one-line fix; each is easy to forget.
       pass
   ```
 
+  **Bare-reraise wrappers don't trip `BLE001`.** A `try / except
+  Exception: log; raise` block is treated as clean by ruff (the
+  exception isn't swallowed). `# noqa: BLE001 — <reason>` on that
+  line trips `RUF100` (unused noqa). Put the rationale **on the
+  line above** the except as a plain comment instead — same intent,
+  no false noqa. Used at `sql_views.py:601` (register_raw),
+  `sql_views.py:1075` (register_views), `checkpointer.py:209`
+  (bulk-INSERT rollback). The `# noqa: BLE001 — <reason>` form is
+  still load-bearing on broad excepts whose body **doesn't**
+  re-raise (best-effort migrations, log-and-skip workers); see
+  `sql_views.py:1751`, `judge_worker.py:339`, `trajectory_worker.py:647`.
+
 - **`py/unused-local-variable` — classes / functions defined inside a
   test function must be referenced.** Ruff's `F841` only flags assigned
   names, not nested `class Foo: …` declarations. Don't define test
@@ -246,6 +258,16 @@ Between releases, query commit history directly:
 - `mise run bump:dry-run` — preview next version + the bullets `cz bump`
   would write.
 - `git log --oneline v0.7.0..HEAD` — raw conventional-commit list.
+
+**Pick `refactor:` (not `chore:`) for deprecation-removal commits.**
+The default cz changelog filter surfaces `feat`, `fix`, and
+`refactor`; `chore` is invisible. When a commit deletes a
+deprecated public API (a view, a Settings field, an introspection
+helper), label it `refactor(<area>): drop deprecated <name>` so
+the auto changelog mentions it. `refactor:` keeps the bump at
+PATCH for routine cleanup releases. Use `chore:` for
+private-only refactors that don't need to surface to users
+(internal helpers, lefthook tweaks, gitignore changes).
 
 Version management is driven by `cz bump`, which reads commit history,
 picks MAJOR/MINOR/PATCH from the conventional-commits types, updates
