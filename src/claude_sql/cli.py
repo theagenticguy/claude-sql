@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import duckdb
 import polars as pl
@@ -1055,6 +1055,168 @@ def list_cache(*, common: Common | None = None) -> None:
         emit_dataframe(pl.DataFrame(entries), OutputFormat.CSV)
         return
     emit_json(entries, fmt)
+
+
+_PEEK_SAMPLE_CHARS = 240
+_PEEK_TOP_TOOLS = 10
+
+
+def _peek_truncate(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return text if len(text) <= _PEEK_SAMPLE_CHARS else text[: _PEEK_SAMPLE_CHARS - 1] + "…"
+
+
+@app.command
+def peek(session_id: str, /, *, common: Common | None = None) -> None:
+    """One-shot summary of a session: lines, role mix, top tools, samples.
+
+    When to use
+    -----------
+    Quick session introspection -- replaces the recurring "open JSONL,
+    count lines, peek at first/last messages" inline-Python pattern.
+    Reads the catalog only; no Bedrock, no parquet caches.
+
+    Output (JSON)
+    -------------
+    ``{session_id, source_file, total_lines, first_ts, last_ts,
+    roles{role: count}, top_tools[{name, count}],
+    samples{first_user, last_user, first_assistant_text}}``
+
+    Each ``samples`` slot is ``null`` when no qualifying message exists
+    (e.g. session has only short text, where ``messages_text`` drops
+    rows under 32 characters).
+
+    Exit codes
+    ----------
+    * 64  invalid_input  malformed --glob
+    * 65  not_found      session_id absent from the corpus
+    * 70  runtime_error  any other DuckDB failure
+    """
+    _configure(common)
+    settings = _resolve_settings(common)
+    fmt = resolve_format(_fmt(common))
+    con = _open_connection_full(settings, sql="FROM messages")
+    try:
+        header_row = run_or_die(
+            lambda: con.execute(
+                "SELECT COUNT(*) AS total_lines, "
+                "MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
+                "ANY_VALUE(source_file) AS source_file "
+                "FROM messages WHERE session_id = ?",
+                [session_id],
+            ).fetchone(),
+            fmt=fmt,
+        )
+        total_lines = int((header_row or (0,))[0] or 0)
+        if total_lines == 0:
+            err = ClassifiedError(
+                kind="not_found",
+                exit_code=EXIT_CODES["catalog_error"],
+                message=f"session_id {session_id!r} not found in corpus",
+                hint=(
+                    'run `claude-sql query "SELECT session_id FROM sessions LIMIT 5"` for valid ids'
+                ),
+            )
+            emit_error(err, fmt)
+            sys.exit(err.exit_code)
+
+        roles_rows = run_or_die(
+            lambda: con.execute(
+                "SELECT role, COUNT(*) AS n FROM messages "
+                "WHERE session_id = ? GROUP BY role ORDER BY n DESC, role",
+                [session_id],
+            ).fetchall(),
+            fmt=fmt,
+        )
+        tools_rows = run_or_die(
+            lambda: con.execute(
+                "SELECT tool_name, COUNT(*) AS n FROM tool_calls "
+                "WHERE session_id = ? AND tool_name IS NOT NULL "
+                "GROUP BY tool_name ORDER BY n DESC, tool_name LIMIT ?",
+                [session_id, _PEEK_TOP_TOOLS],
+            ).fetchall(),
+            fmt=fmt,
+        )
+        samples_rows = run_or_die(
+            lambda: con.execute(
+                "WITH ordered AS ("
+                " SELECT role, ts, text_content,"
+                "        row_number() OVER (PARTITION BY role ORDER BY ts, uuid) AS rn_asc,"
+                "        row_number() OVER ("
+                "          PARTITION BY role ORDER BY ts DESC, uuid DESC"
+                "        ) AS rn_desc"
+                " FROM messages_text WHERE session_id = ?"
+                ") "
+                "SELECT 'first_user' AS slot, ts, text_content FROM ordered "
+                "WHERE role = 'user' AND rn_asc = 1 "
+                "UNION ALL "
+                "SELECT 'last_user', ts, text_content FROM ordered "
+                "WHERE role = 'user' AND rn_desc = 1 "
+                "UNION ALL "
+                "SELECT 'first_assistant_text', ts, text_content FROM ordered "
+                "WHERE role = 'assistant' AND rn_asc = 1",
+                [session_id],
+            ).fetchall(),
+            fmt=fmt,
+        )
+        samples: dict[str, dict[str, str | None] | None] = {
+            "first_user": None,
+            "last_user": None,
+            "first_assistant_text": None,
+        }
+        for slot, ts, text in samples_rows:
+            samples[str(slot)] = {
+                "ts": str(ts) if ts is not None else None,
+                "text": _peek_truncate(str(text)) if text is not None else None,
+            }
+
+        payload: dict[str, Any] = {
+            "session_id": session_id,
+            "source_file": header_row[3] if header_row else None,
+            "total_lines": total_lines,
+            "first_ts": (str(header_row[1]) if header_row and header_row[1] is not None else None),
+            "last_ts": (str(header_row[2]) if header_row and header_row[2] is not None else None),
+            "roles": {str(role): int(n) for role, n in roles_rows},
+            "top_tools": [{"name": str(name), "count": int(n)} for name, n in tools_rows],
+            "samples": samples,
+        }
+    finally:
+        con.close()
+
+    if fmt is OutputFormat.TABLE:
+        _peek_render_table(payload)
+        return
+    emit_json(payload, fmt)
+
+
+def _peek_render_table(p: dict[str, Any]) -> None:
+    print(
+        f"session: {p['session_id']}   ({p['total_lines']} lines, {p['first_ts']} → {p['last_ts']})"
+    )
+    print(f"source : {p['source_file']}")
+    print()
+    print("roles:")
+    for role, n in p["roles"].items():
+        print(f"  {role:<12} {n}")
+    print()
+    print("top tools:")
+    if not p["top_tools"]:
+        print("  (none)")
+    for entry in p["top_tools"]:
+        print(f"  {entry['name']:<24} {entry['count']}")
+    print()
+    print("samples:")
+    label = {
+        "first_user": "first user",
+        "last_user": "last  user",
+        "first_assistant_text": "first asst",
+    }
+    for slot, sample in p["samples"].items():
+        if sample is None:
+            print(f"  [{label[slot]}] (none)")
+            continue
+        print(f"  [{label[slot]}, {sample['ts']}] {sample['text']}")
 
 
 # ---------------------------------------------------------------------------
@@ -2896,7 +3058,7 @@ def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
     del common
     print("claude-sql - pass a subcommand or --help")
-    print("  schema | query | explain | shell | list-cache")
+    print("  schema | query | explain | shell | list-cache | peek")
     print("  ingest | embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
