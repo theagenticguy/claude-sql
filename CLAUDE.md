@@ -607,8 +607,6 @@ for the full table. The common overrides:
 - `CLAUDE_SQL_EMBED_CONCURRENCY` — parallel Cohere Embed v4 calls
   (default 8 — sustained on global CRIS without throttling)
 - `CLAUDE_SQL_LLM_CONCURRENCY` — parallel Sonnet 4.6 calls (default 2)
-- `CLAUDE_SQL_CONCURRENCY` — DEPRECATED: aliases onto both pipelines
-  with a `DeprecationWarning`. Removed in the next release.
 - `CLAUDE_SQL_DUCKDB_THREADS` — override worker threads (default
   `os.cpu_count()`)
 - `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` — `'70%'` of host RAM by default;

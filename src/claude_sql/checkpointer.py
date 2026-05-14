@@ -207,6 +207,8 @@ def _migrate_from_duckdb_if_present(new_path: Path) -> None:
                     )
                 con.execute("COMMIT")
             except Exception:
+                # Rollback-and-reraise: any mid-bulk-INSERT failure must abort
+                # the txn cleanly and surface to the caller.
                 con.execute("ROLLBACK")
                 raise
     finally:

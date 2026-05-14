@@ -14,7 +14,6 @@ from claude_sql.sql_views import (
     MACRO_NAMES,
     MACRO_SIGNATURES,
     VIEW_SCHEMA,
-    describe_all,
     list_macros,
     register_macros,
     register_raw,
@@ -417,23 +416,6 @@ def test_todo_events_forward_compat(fixtures_dir: Path) -> None:
     assert rows == [("Explore", "pending")]
 
 
-def test_task_spawns_deprecated_alias_unions_both(fixtures_dir: Path) -> None:
-    """The deprecated ``task_spawns`` alias unions subagent_spawns +
-    task_creations. TaskCreate rows have NULL subagent_type/prompt by design.
-    """
-    con = _connect(fixtures_dir)
-    rows = con.execute(
-        "SELECT spawn_tool, subagent_type, description "
-        "FROM task_spawns WHERE session_id = ? "
-        "ORDER BY spawn_tool",
-        [SESSION_IDS[1]],
-    ).fetchall()
-    assert rows == [
-        ("Agent", "Explore", "Scan code"),
-        ("TaskCreate", None, "Check for unused imports across src/"),
-    ]
-
-
 def test_subagent_spawns_detected(fixtures_dir: Path) -> None:
     """``Agent`` (the v2.1.63+ rename of Task) lands in subagent_spawns with
     subagent_type + prompt populated.
@@ -549,13 +531,9 @@ def test_explain_has_pushdown_markers(fixtures_dir: Path) -> None:
     assert any(m in plan for m in markers), plan
 
 
-def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
+def test_v1_views_register_with_columns(fixtures_dir: Path) -> None:
+    """Every v1 business view must register and report at least one column."""
     con = _connect(fixtures_dir)
-    # describe_all is deprecated in favor of VIEW_SCHEMA; the test still
-    # exercises it as a behavioral regression for the v1 view set.
-    with pytest.warns(DeprecationWarning, match=r"describe_all is deprecated"):
-        views = describe_all(con)
-    # v1 business views must always be present with at least one column.
     v1_views = {
         "sessions",
         "messages",
@@ -569,16 +547,12 @@ def test_describe_all_covers_every_view(fixtures_dir: Path) -> None:
         "task_creations",
         "task_updates",
         "tasks_state_current",
-        "task_spawns",  # deprecated alias, still in VIEW_NAMES for one release
         "subagent_sessions",
         "subagent_messages",
     }
-    assert v1_views <= set(views.keys())
     for name in v1_views:
-        assert views[name], f"v1 view {name} reported empty columns"
-    # v2 analytics views appear in VIEW_NAMES but only materialize when their
-    # parquets exist; this fixture uses a bare connection so describe_all
-    # returns [] for them, which is expected.
+        rows = con.execute(f"DESCRIBE {name}").fetchall()
+        assert rows, f"v1 view {name} reported empty columns"
 
 
 def test_list_macros_includes_all(fixtures_dir: Path) -> None:
@@ -644,8 +618,8 @@ def test_macro_signatures_match_ddl() -> None:
     )
 
 
-def test_view_schema_matches_describe_all(fixtures_dir: Path) -> None:
-    """Every entry in :data:`VIEW_SCHEMA` must match ``describe_all``'s output.
+def test_view_schema_matches_describe_inline(fixtures_dir: Path) -> None:
+    """Every entry in :data:`VIEW_SCHEMA` must match an inline ``DESCRIBE``.
 
     Drift catcher: if a contributor edits view DDL (adding a column,
     renaming, changing types) without updating ``VIEW_SCHEMA``, this
@@ -655,12 +629,11 @@ def test_view_schema_matches_describe_all(fixtures_dir: Path) -> None:
     parquet, not this dict.
     """
     con = _connect(fixtures_dir)
-    with pytest.warns(DeprecationWarning, match=r"describe_all is deprecated"):
-        observed = describe_all(con)
     for view_name, expected_cols in VIEW_SCHEMA.items():
-        observed_cols = tuple(observed.get(view_name, []))
+        rows = con.execute(f"DESCRIBE {view_name}").fetchall()
+        observed_cols = tuple((str(r[0]), str(r[1])) for r in rows)
         assert observed_cols == expected_cols, (
-            f"VIEW_SCHEMA[{view_name!r}] diverges from describe_all output.\n"
+            f"VIEW_SCHEMA[{view_name!r}] diverges from DESCRIBE output.\n"
             f"  expected: {expected_cols}\n  observed: {observed_cols}"
         )
 

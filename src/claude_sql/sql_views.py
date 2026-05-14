@@ -57,8 +57,8 @@ SUBAGENT_META_GLOB: str = os.path.expanduser("~/.claude/projects/*/*/subagents/a
 
 # Business-level views emitted by ``register_views``. Used by the
 # ``claude-sql schema`` subcommand for schema dumps.  Includes the v2
-# analytics view names at the tail so ``describe_all`` can enumerate them
-# once :func:`register_analytics` has populated the corresponding parquets.
+# analytics view names at the tail; the schema dump materializes only
+# rows where :func:`register_analytics` has populated the matching parquets.
 VIEW_NAMES: tuple[str, ...] = (
     "sessions",
     "messages",
@@ -73,7 +73,6 @@ VIEW_NAMES: tuple[str, ...] = (
     "task_creations",
     "task_updates",
     "tasks_state_current",
-    "task_spawns",
     "skill_invocations",
     "subagent_sessions",
     "subagent_messages",
@@ -109,11 +108,11 @@ VIEW_NAMES: tuple[str, ...] = (
 # they're correctly omitted because the source of truth for those views
 # is the parquet, not this dict.
 #
-# Drift is caught by :func:`tests.test_sql_views.test_view_schema_matches_describe_all`,
-# which registers the v1 views over the fixture corpus, runs
-# :func:`describe_all`, and asserts column-level equality with this dict.
-# A contributor who edits view DDL without updating ``VIEW_SCHEMA`` gets
-# a hard CI failure rather than a runtime mystery.
+# Drift is caught by :func:`tests.test_sql_views.test_view_schema_matches_describe_inline`,
+# which registers the v1 views over the fixture corpus, runs ``DESCRIBE``
+# inline per view, and asserts column-level equality with this dict. A
+# contributor who edits view DDL without updating ``VIEW_SCHEMA`` gets a
+# hard CI failure rather than a runtime mystery.
 VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     "sessions": (
         ("session_id", "VARCHAR"),
@@ -250,16 +249,6 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("status", "VARCHAR"),
         ("created_at", "TIMESTAMP"),
         ("last_updated_at", "TIMESTAMP"),
-    ),
-    "task_spawns": (
-        ("session_id", "VARCHAR"),
-        ("spawned_at", "TIMESTAMP"),
-        ("message_uuid", "VARCHAR"),
-        ("tool_use_id", "VARCHAR"),
-        ("spawn_tool", "VARCHAR"),
-        ("subagent_type", "VARCHAR"),
-        ("description", "VARCHAR"),
-        ("prompt", "VARCHAR"),
     ),
     "skill_invocations": (
         ("session_id", "VARCHAR"),
@@ -421,7 +410,7 @@ def _sql_str(value: str) -> str:
 # Drift discipline: when a downstream view in :func:`register_views` adds a
 # new top-level field reference, add it here too — otherwise the view will
 # silently return NULL for that column. The
-# ``test_view_schema_matches_describe_all`` drift test catches the column
+# ``test_view_schema_matches_describe_inline`` drift test catches the column
 # disappearing from any of the 18 v1 views.
 _MESSAGE_STRUCT_TYPE: str = (
     "STRUCT("
@@ -610,6 +599,7 @@ def register_raw(
         )
         logger.debug("Registered v_raw_subagent_meta from glob {}", subagent_meta_glob)
     except Exception:
+        # register-or-fail-loud — any DuckDB error must surface to the caller.
         logger.exception("Failed to register raw views")
         raise
 
@@ -626,8 +616,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
     ``sessions``, ``messages``, ``content_blocks``, ``messages_text``,
     ``tool_calls``, ``tool_results``, ``todo_events``, ``todo_state_current``,
     ``subagent_spawns``, ``task_creations``, ``task_updates``,
-    ``tasks_state_current``, ``task_spawns`` (deprecated alias),
-    ``subagent_sessions``, ``subagent_messages``.
+    ``tasks_state_current``, ``subagent_sessions``, ``subagent_messages``.
 
     The split between ``subagent_spawns`` and ``task_creations`` reflects
     the Claude Code v2.1.63 ``Task``→``Agent`` rename and the v2.1.16
@@ -973,30 +962,6 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.debug("Registered view: tasks_state_current")
 
-        # DEPRECATED: ``task_spawns`` predates the Task→Agent rename (v2.1.63)
-        # and the TodoWrite→TaskCreate split (v2.1.16). It conflated subagent
-        # launchers with task-tracker creation. Kept as a UNION ALL alias for
-        # one release; new analytics should use ``subagent_spawns`` or
-        # ``task_creations`` directly. Removed in the next minor release.
-        con.execute(
-            """
-            CREATE OR REPLACE VIEW task_spawns AS
-            SELECT
-                session_id, spawned_at, message_uuid, tool_use_id,
-                spawn_tool, subagent_type, description, prompt
-            FROM subagent_spawns
-            UNION ALL
-            SELECT
-                session_id, created_at AS spawned_at, message_uuid, tool_use_id,
-                create_tool AS spawn_tool,
-                NULL AS subagent_type,
-                description,
-                NULL AS prompt
-            FROM task_creations;
-            """
-        )
-        logger.debug("Registered view: task_spawns (deprecated)")
-
         # Every Skill / slash-command invocation observable in the transcripts,
         # unioned across the two shapes they take:
         #
@@ -1108,6 +1073,7 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         )
         logger.debug("Registered view: subagent_messages")
     except Exception:
+        # register-or-fail-loud — any DuckDB error must surface to the caller.
         logger.exception("Failed to register derived views")
         raise
 
@@ -2146,49 +2112,6 @@ def register_all(
 # ---------------------------------------------------------------------------
 # Introspection
 # ---------------------------------------------------------------------------
-
-
-def describe_all(con: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[str, str]]]:
-    """Return the column schema of every business-level view.
-
-    .. deprecated::
-        Use :data:`VIEW_SCHEMA` for static introspection.  ``describe_all``
-        opens a DuckDB connection and runs ``DESCRIBE`` per view, which on
-        the live corpus takes ~14 s -- prohibitive for the agent-facing
-        ``schema`` command.  Kept for one release as a fallback and as the
-        ground truth used by the ``test_view_schema_matches_describe_all``
-        drift test; it will be removed once that test moves to a different
-        introspection path.
-
-    Parameters
-    ----------
-    con
-        Open DuckDB connection with views registered.
-
-    Returns
-    -------
-    dict
-        ``{view_name: [(column_name, column_type), ...]}``. Views that fail to
-        describe (e.g. missing because ``register_views`` was not called) map
-        to an empty list and emit a warning.
-    """
-    import warnings
-
-    warnings.warn(
-        "describe_all is deprecated; use VIEW_SCHEMA for static "
-        "introspection. Will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    out: dict[str, list[tuple[str, str]]] = {}
-    for name in VIEW_NAMES:
-        try:
-            rows = con.execute(f"DESCRIBE {name}").fetchall()
-            out[name] = [(str(r[0]), str(r[1])) for r in rows]
-        except duckdb.Error as exc:
-            logger.warning("Could not describe {}: {}", name, exc)
-            out[name] = []
-    return out
 
 
 def list_macros(con: duckdb.DuckDBPyConnection) -> list[tuple[str, tuple[str, ...]]]:

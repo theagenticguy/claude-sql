@@ -11,7 +11,6 @@ suite. The full integration with ``register_all`` is already covered by
 from __future__ import annotations
 
 import os
-import warnings
 from pathlib import Path
 
 import duckdb
@@ -25,7 +24,6 @@ def test_default_per_pipeline_concurrency() -> None:
     s = Settings()
     assert s.embed_concurrency == 8
     assert s.llm_concurrency == 16
-    assert s.concurrency is None
 
 
 def test_env_override_embed_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,30 +40,10 @@ def test_env_override_llm_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.llm_concurrency == 4
 
 
-def test_deprecated_concurrency_aliases_both(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Setting only the deprecated ``concurrency`` field mirrors onto both modern fields."""
-    monkeypatch.setenv("CLAUDE_SQL_CONCURRENCY", "5")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        s = Settings()
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
-    assert s.embed_concurrency == 5
-    assert s.llm_concurrency == 5
-
-
-def test_explicit_pipeline_field_wins_over_deprecated_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A non-default ``embed_concurrency`` is preserved even when ``concurrency`` is set."""
-    monkeypatch.setenv("CLAUDE_SQL_CONCURRENCY", "5")
-    monkeypatch.setenv("CLAUDE_SQL_EMBED_CONCURRENCY", "12")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        s = Settings()
-    # Explicit modern field stays; the alias only fills llm_concurrency,
-    # which was at its default 16.
-    assert s.embed_concurrency == 12
-    assert s.llm_concurrency == 5
+def test_concurrency_field_removed_in_v1_0_1() -> None:
+    """``Settings.concurrency`` was deprecated in v0.x and removed in v1.0.1."""
+    s = Settings()
+    assert not hasattr(s, "concurrency")
 
 
 def test_duckdb_threads_default_matches_cpu_count() -> None:
@@ -97,7 +75,7 @@ def test_settings_field_smoke() -> None:
     fields = Settings.model_fields.keys()
     assert "embed_concurrency" in fields
     assert "llm_concurrency" in fields
-    assert "concurrency" in fields  # back-compat alias still present
+    assert "concurrency" not in fields  # removed in v1.0.1
     assert "duckdb_threads" in fields
     assert "duckdb_memory_limit" in fields
     assert "duckdb_temp_dir" in fields

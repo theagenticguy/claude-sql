@@ -1,3 +1,16 @@
+## v1.0.1 (2026-05-14)
+
+### Fix
+
+- **trajectory**: replace prior session shards on rerun (#45) (#54)
+
+### Refactor
+
+- **config**: drop Settings.concurrency + _resolve_concurrency_alias
+- **views**: drop describe_all and migrate drift test inline
+- **views**: drop deprecated task_spawns view
+- **embed**: consolidate _build_bedrock_client
+
 ## v1.0.0 (2026-05-13)
 
 ### Feat

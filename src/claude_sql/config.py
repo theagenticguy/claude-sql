@@ -8,7 +8,6 @@ Defaults are picked for a single-user devbox install pointing at
 from __future__ import annotations
 
 import os
-import warnings
 from pathlib import Path
 from typing import Literal, Self
 
@@ -179,10 +178,6 @@ class Settings(BaseSettings):
     #: concurrency=16 scales that linearly with negligible throttle.
     #: Drop to 2–4 if a future model has a smaller TPM bucket.
     llm_concurrency: int = 16
-    #: DEPRECATED: use ``embed_concurrency`` / ``llm_concurrency``. Kept for
-    #: one release as a back-compat alias — when set explicitly (env or
-    #: kwarg), it overrides both. Removed once downstream callers migrate.
-    concurrency: int | None = None
     batch_size: int = 96
 
     embeddings_parquet_path: Path = Field(default_factory=_default_embeddings_parquet)
@@ -379,32 +374,6 @@ class Settings(BaseSettings):
             "subagent_meta_glob",
             f"{resolved}/*/projects/*/subagents/agent-*.meta.json",
         )
-        return self
-
-    @model_validator(mode="after")
-    def _resolve_concurrency_alias(self) -> Settings:
-        """Honor the deprecated ``concurrency`` field as an alias for both pipelines.
-
-        When ``concurrency`` is set explicitly (env or kwarg) and the modern
-        per-pipeline fields are at their defaults, mirror it onto both. We
-        only override when the user clearly didn't set the new fields, so
-        ``embed_concurrency=8, concurrency=4`` keeps the explicit 8.
-        """
-        if self.concurrency is None:
-            return self
-        warnings.warn(
-            "CLAUDE_SQL_CONCURRENCY / Settings.concurrency is deprecated. "
-            "Use CLAUDE_SQL_EMBED_CONCURRENCY (default 8) and "
-            "CLAUDE_SQL_LLM_CONCURRENCY (default 2) instead. The single "
-            "knob will be removed in the next release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Only apply the alias to fields still at their default value.
-        if self.embed_concurrency == 8:
-            object.__setattr__(self, "embed_concurrency", self.concurrency)
-        if self.llm_concurrency == 16:
-            object.__setattr__(self, "llm_concurrency", self.concurrency)
         return self
 
     @property

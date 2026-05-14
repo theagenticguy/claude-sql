@@ -22,9 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import boto3
 import polars as pl
-from botocore.config import Config as BotoConfig
 from botocore.exceptions import (
     ClientError,
     ConnectionError as BotoConnectionError,
@@ -42,6 +40,7 @@ from tenacity import (
 
 from claude_sql import lance_store
 from claude_sql.config import Settings
+from claude_sql.llm_shared import _build_bedrock_client
 from claude_sql.logging_setup import loguru_before_sleep
 
 if TYPE_CHECKING:
@@ -177,31 +176,6 @@ def discover_unembedded(
     if anti_in_python:
         pairs = [(u, t) for u, t in pairs if u not in embedded]
     return pairs
-
-
-def _build_bedrock_client(settings: Settings) -> Any:
-    """Construct a boto3 ``bedrock-runtime`` client from settings.
-
-    Parameters
-    ----------
-    settings
-        Application settings providing the target AWS region.
-
-    Returns
-    -------
-    botocore client
-        A low-level ``bedrock-runtime`` client.
-    """
-    # Disable botocore's internal retry layer so tenacity sees throttling
-    # immediately — otherwise botocore silently absorbs 4 retries and our
-    # retry policy never kicks in.  Also bump read_timeout for large batches.
-    boto_cfg = BotoConfig(
-        region_name=settings.region,
-        retries={"max_attempts": 0, "mode": "standard"},
-        read_timeout=60,
-        connect_timeout=10,
-    )
-    return boto3.client("bedrock-runtime", config=boto_cfg)
 
 
 @retry(
