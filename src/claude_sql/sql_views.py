@@ -1899,6 +1899,23 @@ def register_analytics(
         "session_conflicts": None,
     }
 
+    # Read-side dedup clauses. Belt-and-suspenders companion to the
+    # writer-side replace-then-append in trajectory_worker (#54): if a
+    # prior corpus state or a future write-path bug ever lands duplicate
+    # ``(session_id, prev_uuid, curr_uuid)`` rows in the parquet shards,
+    # the latest ``classified_at`` wins at read time. The fallback
+    # ``SELECT *`` path below intentionally drops the QUALIFY because
+    # legacy shards may not carry ``classified_at`` -- the fallback is
+    # for read-only inspection of stale schemas, not analytics.
+    view_qualify: dict[str, str] = {
+        "message_trajectory": (
+            "row_number() OVER ("
+            "PARTITION BY session_id, prev_uuid, curr_uuid "
+            "ORDER BY classified_at DESC NULLS LAST"
+            ") = 1"
+        ),
+    }
+
     registered: set[str] = set()
     for view_name, path in view_to_path.items():
         if not _parquet_is_populated(path):
@@ -1913,6 +1930,8 @@ def register_analytics(
             )
             continue
         projection = view_projections.get(view_name) or "*"
+        qualify = view_qualify.get(view_name)
+        qualify_clause = f" QUALIFY {qualify}" if qualify else ""
         # Sharded directories list every part file; legacy single-file paths
         # become a one-element list. ``read_parquet`` accepts both.
         parts = [p for p in iter_part_files(path) if p.stat().st_size > 16]
@@ -1920,7 +1939,8 @@ def register_analytics(
         try:
             con.execute(
                 f"CREATE OR REPLACE VIEW {view_name} AS "
-                f"SELECT {projection} FROM read_parquet([{path_literals}]);"
+                f"SELECT {projection} FROM read_parquet([{path_literals}])"
+                f"{qualify_clause};"
             )
             logger.debug("Registered analytics view: {} (source={})", view_name, path)
             registered.add(view_name)

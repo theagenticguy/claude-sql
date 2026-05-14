@@ -270,6 +270,25 @@ def _make_cluster_terms_parquet(path: Path) -> None:
     ).write_parquet(path)
 
 
+_TRAJECTORY_PARQUET_SCHEMA: dict[str, Any] = {
+    "session_id": pl.Utf8,
+    "prev_uuid": pl.Utf8,
+    "curr_uuid": pl.Utf8,
+    "prev_sentiment": pl.Utf8,
+    "curr_sentiment": pl.Utf8,
+    "delta": pl.Float64,
+    "is_transition": pl.Boolean,
+    "transition_kind": pl.Utf8,
+    "confidence": pl.Float32,
+    "classified_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _make_trajectory_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write a v1.0 trajectory shard. Schema mirrors trajectory_worker._PARQUET_SCHEMA."""
+    pl.DataFrame(rows, schema=_TRAJECTORY_PARQUET_SCHEMA).write_parquet(path)
+
+
 @pytest.fixture
 def analytics_settings(tmp_path: Path) -> Settings:
     _make_classifications_parquet(tmp_path / "cls.parquet")
@@ -344,6 +363,178 @@ def test_register_analytics_handles_sharded_directory(tmp_path: Path) -> None:
     # ``_make_classifications_parquet`` reuse the same session_id range so
     # the count is intentionally larger than the per-shard ``n``.
     assert count == 7
+
+
+# ---------------------------------------------------------------------------
+# message_trajectory read-side dedup (issue #46)
+#
+# Belt-and-suspenders companion to the writer-side replace-then-append in
+# trajectory_worker (PR #54). The view applies a row_number() QUALIFY filter
+# so duplicate ``(session_id, prev_uuid, curr_uuid)`` rows -- whether from
+# legacy corpus state or future write-path bugs -- collapse to one row, with
+# the latest ``classified_at`` winning.
+# ---------------------------------------------------------------------------
+
+
+def _trajectory_settings(tmp_path: Path, traj_dir: Path) -> Settings:
+    """Settings pointing trajectory at ``traj_dir`` and every other parquet
+    at a missing path so register_analytics only binds the trajectory view."""
+    return Settings(
+        trajectory_parquet_path=traj_dir,
+        classifications_parquet_path=tmp_path / "missing_cls",
+        clusters_parquet_path=tmp_path / "missing_clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "missing_ter.parquet",
+        conflicts_parquet_path=tmp_path / "missing_conf",
+        communities_parquet_path=tmp_path / "missing_comm.parquet",
+        user_friction_parquet_path=tmp_path / "missing_friction",
+    )
+
+
+def test_message_trajectory_dedups_within_shard(tmp_path: Path) -> None:
+    """Two rows in one shard sharing the partition key collapse to one row;
+    the surviving row carries the latest ``classified_at``."""
+    earlier = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+    later = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    traj_dir = tmp_path / "trajectory"
+    traj_dir.mkdir()
+    _make_trajectory_parquet(
+        traj_dir / "part-1000000000000000000.parquet",
+        rows=[
+            {
+                "session_id": "sess-a",
+                "prev_uuid": "u-prev",
+                "curr_uuid": "u-curr",
+                "prev_sentiment": "neutral",
+                "curr_sentiment": "negative",
+                "delta": -0.4,
+                "is_transition": True,
+                "transition_kind": "frustration_spike",
+                "confidence": 0.7,
+                "classified_at": earlier,
+            },
+            {
+                "session_id": "sess-a",
+                "prev_uuid": "u-prev",
+                "curr_uuid": "u-curr",
+                "prev_sentiment": "neutral",
+                "curr_sentiment": "positive",
+                "delta": 0.2,
+                "is_transition": False,
+                "transition_kind": "none",
+                "confidence": 0.9,
+                "classified_at": later,
+            },
+        ],
+    )
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=_trajectory_settings(tmp_path, traj_dir))
+    rows = con.execute(
+        "SELECT curr_sentiment, transition_kind, confidence "
+        "FROM message_trajectory ORDER BY curr_uuid"
+    ).fetchall()
+    assert len(rows) == 1
+    # Latest classified_at wins -> the second row's values survive.
+    assert rows[0] == ("positive", "none", pytest.approx(0.9))
+
+
+def test_message_trajectory_dedups_across_shards(tmp_path: Path) -> None:
+    """Two shards with overlapping partition keys -- the QUALIFY filter spans
+    the union, not one shard at a time."""
+    earlier = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+    later = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    traj_dir = tmp_path / "trajectory"
+    traj_dir.mkdir()
+    # Old shard (lower ts_ns prefix) carries the stale row; newer shard
+    # carries the freshly-classified row. Without dedup, the view would
+    # surface both.
+    _make_trajectory_parquet(
+        traj_dir / "part-1000000000000000000.parquet",
+        rows=[
+            {
+                "session_id": "sess-a",
+                "prev_uuid": "u-prev",
+                "curr_uuid": "u-curr",
+                "prev_sentiment": "neutral",
+                "curr_sentiment": "negative",
+                "delta": -0.5,
+                "is_transition": True,
+                "transition_kind": "frustration_spike",
+                "confidence": 0.6,
+                "classified_at": earlier,
+            },
+        ],
+    )
+    _make_trajectory_parquet(
+        traj_dir / "part-2000000000000000000.parquet",
+        rows=[
+            {
+                "session_id": "sess-a",
+                "prev_uuid": "u-prev",
+                "curr_uuid": "u-curr",
+                "prev_sentiment": "neutral",
+                "curr_sentiment": "positive",
+                "delta": 0.3,
+                "is_transition": False,
+                "transition_kind": "resolution",
+                "confidence": 0.85,
+                "classified_at": later,
+            },
+        ],
+    )
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=_trajectory_settings(tmp_path, traj_dir))
+    # Discriminate via ``confidence`` rather than ``classified_at`` -- DuckDB
+    # materializes TIMESTAMPTZ via pytz, which the test environment may not
+    # carry.  ``confidence`` is unique per row and proves the dedup picked
+    # the later shard.
+    rows = con.execute(
+        "SELECT curr_sentiment, transition_kind, confidence FROM message_trajectory"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "positive"
+    assert rows[0][1] == "resolution"
+    assert rows[0][2] == pytest.approx(0.85)
+
+
+def test_message_trajectory_clean_cache_passes_through(tmp_path: Path) -> None:
+    """A shard with no duplicate keys is unaffected by the dedup filter and
+    every additive alias column (``sentiment``, ``transition``) still binds.
+    Sanity check that the QUALIFY rewrite preserves the macro contract."""
+    classified = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    traj_dir = tmp_path / "trajectory"
+    traj_dir.mkdir()
+    _make_trajectory_parquet(
+        traj_dir / "part-1000000000000000000.parquet",
+        rows=[
+            {
+                "session_id": f"sess-{i}",
+                "prev_uuid": f"u-prev-{i}",
+                "curr_uuid": f"u-curr-{i}",
+                "prev_sentiment": "neutral",
+                "curr_sentiment": "neutral",
+                "delta": 0.0,
+                "is_transition": False,
+                "transition_kind": "none",
+                "confidence": 0.5,
+                "classified_at": classified,
+            }
+            for i in range(3)
+        ],
+    )
+    con = duckdb.connect(":memory:")
+    register_analytics(con, settings=_trajectory_settings(tmp_path, traj_dir))
+    # ``sentiment`` and ``transition`` are the curated aliases (curr_sentiment,
+    # is_transition); ``curr_uuid`` is the load-bearing join key for the
+    # ``sentiment_arc`` macro -- selecting them all proves the QUALIFY
+    # rewrite preserved the full column contract.
+    rows = con.execute(
+        "SELECT sentiment, transition, curr_uuid, delta, transition_kind, confidence "
+        "FROM message_trajectory ORDER BY curr_uuid"
+    ).fetchall()
+    assert len(rows) == 3
+    assert {r[2] for r in rows} == {"u-curr-0", "u-curr-1", "u-curr-2"}
+    assert all(r[0] == "neutral" for r in rows)
+    assert all(r[1] is False for r in rows)
 
 
 def test_analytics_macros_register_safely(analytics_settings: Settings, tmp_path: Path) -> None:
