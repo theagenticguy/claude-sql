@@ -638,6 +638,62 @@ def test_view_schema_matches_describe_inline(fixtures_dir: Path) -> None:
         )
 
 
+def test_messages_parent_uuid_is_varchar(fixtures_dir: Path) -> None:
+    """``parent_uuid`` MUST be VARCHAR-typed at the view layer (GH #47).
+
+    DuckDB's ``read_json`` union-by-name infers the column as JSON when
+    files contribute both NULL and string-UUID values, which trips a
+    Conversion Error on any recursive-CTE join that compares
+    ``m.parent_uuid = t.descendant_uuid``. Casting at view-construction
+    time exposes a flat VARCHAR.
+    """
+    con = _connect(fixtures_dir)
+    cols = {row[0]: row[1] for row in con.execute("DESCRIBE messages").fetchall()}
+    assert cols["parent_uuid"] == "VARCHAR", (
+        f"messages.parent_uuid must be VARCHAR; got {cols['parent_uuid']!r} "
+        "-- the recursive-CTE thread walker (cookbook 1.4) will crash again"
+    )
+
+
+def test_thread_walker_recursive_cte_runs(fixtures_dir: Path) -> None:
+    """Cookbook recipe 1.4 verbatim: recursive walk over ``parent_uuid``
+    must execute without a Conversion Error (GH #47). The fixture has
+    one thread root per session (the user message) plus one assistant
+    descendant, so the count-by-depth result has at least depth 0 and
+    depth 1 buckets per session.
+    """
+    con = _connect(fixtures_dir)
+    rows = con.execute(
+        """
+        WITH RECURSIVE thread AS (
+            SELECT uuid AS thread_root_uuid, uuid AS descendant_uuid,
+                   session_id, 0 AS depth
+            FROM messages
+            WHERE parent_uuid IS NULL
+              AND session_id = ?
+            UNION ALL
+            SELECT t.thread_root_uuid, m.uuid AS descendant_uuid,
+                   m.session_id, t.depth + 1 AS depth
+            FROM thread t
+            JOIN messages m ON m.parent_uuid = t.descendant_uuid
+            WHERE m.session_id = ?
+        )
+        SELECT depth, count(*) AS n
+        FROM thread
+        GROUP BY depth
+        ORDER BY depth
+        """,
+        [SESSION_IDS[0], SESSION_IDS[0]],
+    ).fetchall()
+    # The walk must produce at least one row at depth 0 (the root) and
+    # the assertion is "did it complete" -- prior to the GH #47 fix the
+    # query raised ``Conversion Error: Malformed JSON ...`` and never
+    # returned any rows.
+    assert len(rows) >= 1
+    assert rows[0][0] == 0
+    assert rows[0][1] >= 1
+
+
 def _ago_only_connection() -> duckdb.DuckDBPyConnection:
     """Bare DuckDB connection with only the ``ago`` macro registered.
 
