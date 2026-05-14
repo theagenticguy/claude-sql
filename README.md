@@ -325,7 +325,6 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension |
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Parallel Cohere Embed v4 calls (global CRIS) |
 | `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Parallel Sonnet 4.6 calls (global CRIS) |
-| `CLAUDE_SQL_CONCURRENCY` | `None` | DEPRECATED single knob — aliases onto both pipelines with a warning |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Cohere batch size |
 | `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings/` | Embeddings cache (sharded directory of `part-*.parquet`) |
 | `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction/` | Friction cache (sharded) |
