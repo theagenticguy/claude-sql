@@ -235,16 +235,21 @@ def test_discover_unembedded_limit_cap(views_con: Any, tmp_path: Path) -> None:
 
 
 def test_build_bedrock_client_config(tmp_settings: Any) -> None:
+    # embed_worker re-exports the cached pool-aware builder from llm_shared
+    # (v1.0.1 consolidation). Asserts the unified config: 600s read_timeout,
+    # adaptive retries, max_pool_connections sized off the concurrency knobs.
     client = _build_bedrock_client(tmp_settings)
     cfg = client._client_config
     assert cfg.region_name == tmp_settings.region
-    assert cfg.read_timeout == 60
+    assert cfg.read_timeout == 600
     assert cfg.connect_timeout == 10
-    # botocore retries disabled (tenacity owns the retry policy). botocore
-    # normalizes ``max_attempts: 0`` away — verify via the explicit
-    # ``total_max_attempts`` it does keep, or fall back to checking the mode.
     retries = cfg.retries or {}
-    assert retries.get("mode") == "standard"
+    assert retries.get("mode") == "adaptive"
+    expected_pool = max(
+        32,
+        max(tmp_settings.embed_concurrency, tmp_settings.llm_concurrency) * 2,
+    )
+    assert cfg.max_pool_connections == expected_pool
 
 
 # ---------------------------------------------------------------------------
