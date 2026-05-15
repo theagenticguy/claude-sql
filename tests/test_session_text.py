@@ -20,15 +20,15 @@ from typing import TYPE_CHECKING, Any
 import duckdb
 import pytest
 
-from claude_sql.config import Settings
-from claude_sql.session_text import (
+from claude_sql.core.config import Settings
+from claude_sql.core.session_text import (
     SessionTextCorpus,
     _tool_input_preview,
     _tool_result_preview,
     iter_session_texts,
     session_text_corpus,
 )
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.core.sql_views import register_raw, register_views
 from conftest import (
     _seed_subagent_stub,
     make_assistant_msg,
@@ -320,7 +320,7 @@ def test_assemble_returns_empty_for_unknown_session(
 
 def test_assemble_skips_rows_with_none_body(tmp_settings: Settings) -> None:
     """A timeline row whose ``body`` is ``None`` is skipped silently."""
-    from claude_sql.session_text import _TimelineRow
+    from claude_sql.core.session_text import _TimelineRow
 
     sid = "synthetic"
     corpus = SessionTextCorpus(
@@ -426,7 +426,7 @@ def test_session_bounds_retries_once_on_io_error(
     session_text_corpus_con: duckdb.DuckDBPyConnection,
 ) -> None:
     """First execute raises ``duckdb.IOException``; the second pass succeeds."""
-    from claude_sql import session_text as st
+    from claude_sql.core import session_text as st
 
     flaky = _FlakyConWrapper(session_text_corpus_con)
     bounds = st.session_bounds(flaky)  # type: ignore[arg-type]

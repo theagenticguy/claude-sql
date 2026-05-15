@@ -9,9 +9,9 @@ import numpy as np
 import polars as pl
 import pytest
 
-from claude_sql import lance_store
-from claude_sql.cluster_worker import run_clustering
-from claude_sql.config import Settings
+from claude_sql.analytics.cluster_worker import run_clustering
+from claude_sql.core import lance_store
+from claude_sql.core.config import Settings
 
 
 def _make_synthetic_embeddings(

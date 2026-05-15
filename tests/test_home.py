@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql.config import Settings
-from claude_sql.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.core.config import Settings
+from claude_sql.core.home import claude_sql_home, recognized_legacy_caches
 
 _ENV_VARS_TO_PURGE: tuple[str, ...] = (
     "CLAUDE_SQL_HOME",

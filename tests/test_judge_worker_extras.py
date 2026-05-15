@@ -23,7 +23,7 @@ import polars as pl
 import pytest
 from botocore.exceptions import ClientError, SSLError
 
-from claude_sql import judge_worker as jw
+from claude_sql.evals import judge_worker as jw
 
 RUBRIC = """
 axes:

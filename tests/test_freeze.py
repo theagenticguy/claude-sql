@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql import freeze
+from claude_sql.evals import freeze
 
 
 @pytest.fixture

@@ -9,7 +9,7 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.output import (
+from claude_sql.core.output import (
     EXIT_CODES,
     ClassifiedError,
     OutputFormat,

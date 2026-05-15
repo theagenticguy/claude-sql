@@ -25,8 +25,8 @@ from unittest.mock import MagicMock
 
 from loguru import logger as loguru_logger
 
-from claude_sql import llm_shared
-from claude_sql.llm_shared import (
+from claude_sql.core import llm_shared
+from claude_sql.core.llm_shared import (
     _accumulate_cache_stats,
     _invoke_classifier_sync,
     cacheable_text_block,

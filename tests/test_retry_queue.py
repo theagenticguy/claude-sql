@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql.retry_queue import (
+from claude_sql.core.retry_queue import (
     MAX_ATTEMPTS_DEFAULT,
     drain,
     enqueue,
@@ -113,7 +113,7 @@ def test_persists_across_connections(tmp_path: Path) -> None:
 
 def test_enqueue_coexists_with_checkpoint_table(tmp_path: Path) -> None:
     """Both tables live in the same DB file; one shouldn't break the other."""
-    from claude_sql.checkpointer import mark_completed
+    from claude_sql.core.checkpointer import mark_completed
 
     db = tmp_path / "shared.duckdb"
     t0 = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)

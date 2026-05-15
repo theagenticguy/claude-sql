@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql import checkpointer
+from claude_sql.core import checkpointer
 
 
 def test_to_iso_none_returns_none() -> None:

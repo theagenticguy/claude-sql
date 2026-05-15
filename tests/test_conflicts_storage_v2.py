@@ -30,11 +30,12 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql import conflicts_worker, llm_shared
-from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files, read_all
-from claude_sql.schemas import SESSION_CONFLICTS_SCHEMA, ConflictPair, ConflictsResult
-from claude_sql.sql_views import register_analytics, register_raw, register_views
+from claude_sql.analytics import conflicts_worker
+from claude_sql.core import llm_shared
+from claude_sql.core.config import Settings
+from claude_sql.core.parquet_shards import iter_part_files, read_all
+from claude_sql.core.schemas import SESSION_CONFLICTS_SCHEMA, ConflictPair, ConflictsResult
+from claude_sql.core.sql_views import register_analytics, register_raw, register_views
 from conftest import _seed_subagent_stub, make_user_msg, write_session_jsonl
 
 # ---------------------------------------------------------------------------

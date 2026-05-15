@@ -21,7 +21,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from claude_sql.parquet_shards import (
+from claude_sql.core.parquet_shards import (
     count_rows,
     is_sharded_dir,
     iter_part_files,

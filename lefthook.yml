@@ -45,18 +45,30 @@ pre-commit:
       priority: 2
       fail_text: "ruff format failed — check the error above."
 
-    # ``ty`` runs over the whole ``src/`` + ``tests/`` tree because Python
-    # type-checking is semantic — changing one file can break imports
-    # elsewhere.  Still fast (~2s on this repo) because ty caches
-    # aggressively.
+    # ``ty`` runs over every workspace member's ``src/`` + ``tests/`` tree.
+    # Python type-checking is semantic — changing one file can break imports
+    # elsewhere.  pyproject [tool.ty.src.include] enumerates the paths;
+    # ``ty check`` (no args) consumes that list.
     - name: ty
-      run: "{uv} ty check src/ tests/"
+      run: "{uv} ty check"
       glob: "**/*.py"
       priority: 3
       skip:
         - merge
         - rebase
       fail_text: "ty typecheck failed — run `mise run typecheck` locally to reproduce."
+
+    # Layered DAG enforcement: core (L0) < {analytics, evals, provenance}
+    # (L1 siblings) < app (L2). Pre-commit catches accidental cross-layer
+    # imports the moment they're staged. Fast — pure import-graph walk.
+    - name: lint-imports
+      run: "{uv} lint-imports"
+      glob: "**/*.py"
+      priority: 4
+      skip:
+        - merge
+        - rebase
+      fail_text: "import-linter contract failed — review the layered DAG."
 
     # Catches the 'bumped pyproject.toml but forgot to regenerate uv.lock'
     # drift.  ms-scale check — only fires when pyproject.toml or uv.lock
@@ -86,7 +98,7 @@ pre-push:
     # configured remote default; if that fails, lefthook skips cleanly
     # rather than fabricating a diff.
     - name: pytest
-      run: "{uv} pytest tests/ --no-header -q"
+      run: "{uv} pytest --no-header -q"
       glob: "**/*.py"
       # Prefer ``@{push}`` (configured upstream) but fall back to ``HEAD~``
       # so the first push of a new branch still gates on pytest instead of

@@ -24,7 +24,7 @@ import sys
 
 import pytest
 
-from claude_sql.output import (
+from claude_sql.core.output import (
     EXIT_CODES,
     ClassifiedError as _ClassifiedError,
     InputValidationError,

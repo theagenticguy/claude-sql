@@ -16,8 +16,8 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.config import Settings
-from claude_sql.sql_views import (
+from claude_sql.core.config import Settings
+from claude_sql.core.sql_views import (
     register_analytics,
     register_macros,
     register_raw,

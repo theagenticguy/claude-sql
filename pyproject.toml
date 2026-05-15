@@ -1,59 +1,13 @@
 [project]
-name = "claude-sql"
+name = "claude-sql-workspace"
 version = "1.0.1"
-description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
+description = "Workspace root for claude-sql packages (core, analytics, evals, provenance, app). The publishable binary is `claude-sql` from packages/app."
 readme = "README.md"
 license = { text = "Apache-2.0" }
-authors = [
-    { name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }
-]
+authors = [{ name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }]
 requires-python = ">=3.13"
-keywords = [
-    "claude", "claude-code", "anthropic", "duckdb", "sql",
-    "semantic-search", "embeddings", "bedrock", "transcripts",
-    "analytics", "observability",
-]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: Developers",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
-    "Topic :: Software Development",
-    "Topic :: Database",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Topic :: Utilities",
-    "Typing :: Typed",
-]
-dependencies = [
-    "anthropic>=0.40",
-    "anyio>=4.13.0",
-    "boto3>=1.42.91",
-    "cyclopts>=4.10.2",
-    # 1.5.1 floor: lance core extension (used by embeddings store) became core. Upper-bounded to <2 to stay on the 1.x train.
-    "duckdb>=1.5.2,<2",
-    "hdbscan>=0.8.40",
-    "igraph>=1.0.0,<2.0",
-    "lancedb>=0.30,<0.31",
-    "leidenalg>=0.11.0,<0.12",
-    "loguru>=0.7.3",
-    "numpy>=2.4.4",
-    "packaging>=26.2",
-    "polars>=1.40.0",
-    "pyarrow>=23.0.1",
-    "pydantic>=2.13.2",
-    "pydantic-settings>=2.13.1",
-    "pyyaml>=6.0.3",
-    "scikit-learn>=1.5",
-    "scipy>=1.13",
-    "tenacity>=9.1.4",
-    "tiktoken>=0.12.0",
-    "umap-learn>=0.5.12",
-]
-
-[project.scripts]
-claude-sql = "claude_sql.cli:main"
+# Virtual root: no runtime deps. The five workspace members own those.
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/theagenticguy/claude-sql"
@@ -61,14 +15,49 @@ Repository = "https://github.com/theagenticguy/claude-sql"
 Issues = "https://github.com/theagenticguy/claude-sql/issues"
 Changelog = "https://github.com/theagenticguy/claude-sql/blob/main/CHANGELOG.md"
 
-[build-system]
-requires = ["uv_build>=0.11.6,<0.12.0"]
-build-backend = "uv_build"
+# ---------------------------------------------------------------------------
+# uv — reproducibility + host-python independence + workspace topology.
+# ---------------------------------------------------------------------------
+#
+# `package = false` makes this a virtual project: uv does NOT try to build
+# or install the workspace root as a package. The five members under
+# packages/* are the publishable units; the root is the conductor.
+#
+# `[tool.uv.workspace]` + `[tool.uv.sources]` wire each member as an
+# editable workspace dependency. uv resolves a single uv.lock for every
+# member, and `uv sync` installs the whole graph editable.
+[tool.uv]
+required-version = ">=0.11.7"
+resolution = "highest"
+python-preference = "only-managed"
+python-downloads = "automatic"
+compile-bytecode = true
+link-mode = "clone"
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+claude-sql-core = { workspace = true }
+claude-sql-analytics = { workspace = true }
+claude-sql-evals = { workspace = true }
+claude-sql-provenance = { workspace = true }
+claude-sql = { workspace = true }
+
+# Named indexes for ``uv publish --index <name>``.  TestPyPI is the
+# dry-run target; production PyPI is the implicit default.
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true
 
 [dependency-groups]
 dev = [
     "bandit[sarif]>=1.9.4",
     "commitizen>=4.13.10",
+    "import-linter>=2.3",
     "lefthook>=2.1.6",
     "moto[bedrock-runtime,s3]>=5.2.0",
     "pytest>=9.0.3",
@@ -78,45 +67,14 @@ dev = [
 ]
 
 # ---------------------------------------------------------------------------
-# uv — reproducibility + host-python independence.
+# ruff — workspace-wide config; paths expanded for packages/*/src layout.
 # ---------------------------------------------------------------------------
-#
-# required-version gates parsing before any command runs, so older uv
-# binaries can't silently ignore newer keys.  only-managed refuses to bind
-# against whatever python3 happens to be on PATH — contributors get the
-# exact CPython mise installed.  compile-bytecode = true moves .pyc
-# generation to install time, which matters for a `uv tool install claude-sql`
-# end-user path.  link-mode = clone is the Linux/macOS default; pinning it
-# makes intent explicit across machines.
-[tool.uv]
-required-version = ">=0.11.7"
-resolution = "highest"
-python-preference = "only-managed"
-python-downloads = "automatic"
-compile-bytecode = true
-link-mode = "clone"
-
-# Named indexes for ``uv publish --index <name>``.  TestPyPI is the
-# dry-run target; production PyPI is the implicit default and doesn't
-# need a block.  ``publish-url`` is the legacy upload endpoint;
-# ``url`` is the PEP-503 simple index used for ``--check-url``
-# idempotent retries (uv skips files already present at that URL).
-# ``explicit = true`` means uv won't pull *resolution* from TestPyPI —
-# it's publish-only, never a source of truth for installs.
-[[tool.uv.index]]
-name = "testpypi"
-url = "https://test.pypi.org/simple/"
-publish-url = "https://test.pypi.org/legacy/"
-explicit = true
-
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-src = ["src", "tests"]
+src = ["packages/core/src", "packages/analytics/src", "packages/evals/src", "packages/provenance/src", "packages/app/src", "tests"]
 
 [tool.ruff.lint]
-# Expanded from the original E,F,I,N,UP,B,SIM baseline.  See
-# docs/adr/0015-stack-modernization.md for the rationale behind each family.
 select = [
     "E", "W", "F", "I", "N", "UP", "B", "SIM",
     "ANN", "ASYNC", "BLE", "C4", "DTZ", "ERA", "FBT", "G",
@@ -124,26 +82,15 @@ select = [
     "RET", "RSE", "S", "T20", "TID", "TRY", "PGH", "RUF",
 ]
 ignore = [
-    # Formatter overlap — ruff docs say don't select these alongside the formatter.
     "E501", "ISC001", "COM812",
-    # ANN-lite: drop dogmatic noise.  ANN101/102 are removed rules.
     "ANN401",
-    # Tryceratops: the two chronically-noisy rules.
     "TRY003", "TRY300",
-    # PL sensible subset: drop refactor-metrics + magic-value; keep PLE/PLW/PLC + useful PLR.
     "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",
-    # Lazy imports are intentional for expensive/optional deps (boto3, hnsw, umap, duckdb VSS).
     "PLC0415",
-    # Bandit: subprocess rules that don't apply to this project.
     "S603", "S607",
-    # DuckDB SQL f-strings are the local read-only query pattern, not SQL injection.
     "S608",
-    # Non-ASCII chars (→, —, curly quotes) in docstrings / comments are intentional.
     "RUF001", "RUF002", "RUF003",
-    # os.path.expanduser is heavily used; migration to Path.expanduser adds churn without
-    # signal — many call sites immediately coerce back to str for DuckDB.
     "PTH111",
-    # PERF203: try/except in loop is intentional for DuckDB IOException retry.
     "PERF203",
 ]
 
@@ -155,14 +102,14 @@ ignore = [
     "SLF001", "PT011", "PT018", "D",
 ]
 "**/__init__.py" = ["F401", "E402"]
-"src/claude_sql/cli.py" = ["T20"]
-"src/claude_sql/output.py" = ["T20"]
+# Glob-style keys so the ignores travel with the file regardless of which
+# package it lands in. ``cli.py`` and ``output.py`` legitimately call
+# print() at the CLI boundary; T20 must not fire there.
+"**/cli.py" = ["T20"]
+"**/output.py" = ["T20"]
 "scripts/**/*" = ["T20", "S101", "ANN"]
 
 [tool.ruff.lint.isort]
-# ``conftest`` is on the test pythonpath and grouped with claude_sql so isort
-# keeps the test-helper imports adjacent to the package imports rather than
-# above them as third-party.
 known-first-party = ["claude_sql", "conftest"]
 combine-as-imports = true
 split-on-trailing-comma = true
@@ -171,13 +118,9 @@ split-on-trailing-comma = true
 ban-relative-imports = "all"
 
 # Forbid stdlib `logging` everywhere in claude-sql. The whole package logs
-# via loguru, including tenacity retry hooks (which historically pulled
-# stdlib `logging` in just to satisfy `before_sleep_log`'s LoggerProtocol —
-# now superseded by `claude_sql.logging_setup.loguru_before_sleep`).
-# Mixing the two leads to messages that disappear from the loguru sink
-# the user actually sees. Ban at the import boundary.
+# via loguru. See best-practices/loguru-only-no-stdlib-logging.md.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"logging".msg = "Use loguru via `from loguru import logger`. For tenacity retry callbacks use `claude_sql.logging_setup.loguru_before_sleep('LEVEL')`."
+"logging".msg = "Use loguru via `from loguru import logger`. For tenacity retry callbacks use `claude_sql.core.logging_setup.loguru_before_sleep('LEVEL')`."
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
@@ -205,35 +148,30 @@ docstring-code-format = true
 docstring-code-line-length = "dynamic"
 
 # ---------------------------------------------------------------------------
-# ty — strictest defensible type-checking.
+# ty — workspace-wide; root expands to every member's src + tests.
 # ---------------------------------------------------------------------------
-#
-# `rules.all = "error"` promotes every warn-default diagnostic to error, so
-# newly-added rules in ty's alpha stream land as CI failures the moment
-# they surface instead of drifting into acknowledged-warning noise.  The
-# only rule we deliberately silence is `division-by-zero`, which Astral
-# themselves disable by default because of the false-positive rate.
-#
-# `src.include = ["src", "tests"]` closes the test-directory blind spot
-# (the old `ty check src/` invocation missed test-only regressions).
-# `error-on-warning = true` makes CI fail on any future warn rule, not
-# just errors — future-proofing the strict stance.
-#
-# Overrides: tests do legitimately unsafe things (duckdb fetchone() is
-# typed as Optional, tests immediately subscript without the intermediate
-# assert).  Scope the relaxation to tests/** so src/ stays tight.
 [tool.ty.environment]
 python-version = "3.13"
 python-platform = "linux"
 python = ".venv"
-# Both ./src and ./tests are on the import root so tests can import
-# helpers from ``conftest`` (pytest auto-loads it as a top-level module
-# at collection time — ty needs the path on its module-discovery list to
-# resolve the same import statically).
-root = ["./src", "./tests"]
+root = [
+    "./packages/core/src",
+    "./packages/analytics/src",
+    "./packages/evals/src",
+    "./packages/provenance/src",
+    "./packages/app/src",
+    "./tests",
+]
 
 [tool.ty.src]
-include = ["src", "tests"]
+include = [
+    "packages/core/src",
+    "packages/analytics/src",
+    "packages/evals/src",
+    "packages/provenance/src",
+    "packages/app/src",
+    "tests",
+]
 respect-ignore-files = true
 
 [tool.ty.terminal]
@@ -248,57 +186,33 @@ division-by-zero = "ignore"
 include = ["tests/**"]
 
 [tool.ty.overrides.rules]
-not-subscriptable = "ignore"         # duckdb fetchone() returns Optional; tests subscript directly
-not-iterable = "ignore"              # same pattern: Optional result of DuckDB SELECT COUNT(*)
-unsupported-operator = "ignore"      # polars Decimal-union arithmetic in test assertions
-invalid-argument-type = "ignore"     # test helpers pass looser dict shapes than production signatures
+not-subscriptable = "ignore"
+not-iterable = "ignore"
+unsupported-operator = "ignore"
+invalid-argument-type = "ignore"
 possibly-unresolved-reference = "warn"
 possibly-missing-attribute = "warn"
 unused-ignore-comment = "warn"
 
+# ---------------------------------------------------------------------------
+# bandit — invoked via `bandit -r packages -c pyproject.toml`.
+# ---------------------------------------------------------------------------
 [tool.bandit]
-# Defense-in-depth alongside ruff's flake8-bandit (S) selectors. Ruff S is
-# the fast pre-commit gate; bandit -r src is the SARIF-emitting CI gate.
-# Coverage overlap is ~70% — bandit catches AST-heavy detectors ruff S
-# skips (B610 SQL injection, B701 jinja2 autoescape variants, some B102
-# exec_used / B411 xmlrpc forms). Per-scanner SARIF dedups in code
-# scanning UI via category (`bandit` vs `ruff`).
 exclude_dirs = ["tests", ".venv", ".erpaval", "docs"]
-# Principled skips — each ignore here matches an existing ruff S ignore
-# elsewhere in this file. If you ever flip ruff to enforce these, drop
-# the bandit skip too.
-#   B101: `assert` for type-narrowing (binding.py:739 `assert note is not
-#         None`); also used in tests. Production never relies on
-#         assertions for runtime safety; ruff ignores S101 per-test-file.
-#   B404: `import subprocess` is required for binding.py's git plumbing
-#         and freeze.py / hooks tooling.  The subprocess.run() calls
-#         themselves use list-form + check=False + explicit returncode
-#         inspection (no shell=True).
-#   B603/B607: subprocess.run() without shell=True is the read-only
-#         pattern; bandit flags every call.  Ruff ignores S603/S607.
-#   B608: DuckDB SQL via f-strings is the read-only pattern across
-#         sql_views.py / cli.py / freeze.py — DuckDB's table-function
-#         arguments don't accept prepared parameters.  See CLAUDE.md
-#         §"Resilience patterns to preserve" + ruff ignore S608.
 skips = ["B101", "B404", "B603", "B607", "B608"]
 
+# ---------------------------------------------------------------------------
+# pytest — single tree at workspace root.
+# ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Put tests/ on sys.path so test modules can ``from conftest import …``
-# the shared fixtures defined in ``tests/conftest.py``. Pytest auto-loads
-# conftest as a plugin, but doesn't expose its symbols as a regular import
-# unless the directory is on the import path.
 pythonpath = ["tests"]
 
 # ---------------------------------------------------------------------------
-# Commitizen — conventional commits + version bumping.
+# Commitizen — Strategy A: single workspace-root cz, lockstep release.
+# Per .erpaval/sessions/session-444fc0/research-uv-recipes.md §5d: defer
+# per-package CHANGELOG to a future repo split.
 # ---------------------------------------------------------------------------
-#
-# version_provider = "uv" keeps pyproject.toml[project.version] and uv.lock
-# in sync on every ``cz bump``, so we don't maintain a separate
-# ``__version__.py``.  update_changelog_on_bump writes CHANGELOG.md from
-# commit history using the conventional-commits parser.  major_version_zero
-# keeps us in 0.x until the first intentional breaking release.
 [tool.commitizen]
 name = "cz_conventional_commits"
 version_provider = "uv"
@@ -312,7 +226,36 @@ changelog_merge_prerelease = true
 allow_abort = false
 allowed_prefixes = ["Merge", "Revert", "Pull request", "fixup!", "squash!"]
 bump_message = "chore(release): $current_version → $new_version"
-# pre/post bump hooks keep uv.lock + .venv in sync with the bump commit, so
-# `mise run cli` works immediately after a release without an extra sync.
 pre_bump_hooks = ["uv lock"]
 post_bump_hooks = ["uv sync"]
+
+# ---------------------------------------------------------------------------
+# import-linter — layered DAG enforcement.
+# core (L0) < {analytics, evals, provenance} (L1 siblings) < app (L2).
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = [
+    "claude_sql.core",
+    "claude_sql.analytics",
+    "claude_sql.evals",
+    "claude_sql.provenance",
+    "claude_sql.app",
+]
+
+[[tool.importlinter.contracts]]
+name = "claude-sql layered architecture"
+type = "layers"
+layers = [
+    "claude_sql.app",
+    "claude_sql.analytics | claude_sql.evals | claude_sql.provenance",
+    "claude_sql.core",
+]
+
+[[tool.importlinter.contracts]]
+name = "analytics / evals / provenance are independent siblings"
+type = "independence"
+modules = [
+    "claude_sql.analytics",
+    "claude_sql.evals",
+    "claude_sql.provenance",
+]

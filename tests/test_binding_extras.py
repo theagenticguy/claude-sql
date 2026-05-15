@@ -29,7 +29,7 @@ from typing import Any
 
 import pytest
 
-from claude_sql import binding
+from claude_sql.provenance import binding
 
 # ---------------------------------------------------------------------------
 # Skip-if-git-too-old gate (mirrors test_binding.py)

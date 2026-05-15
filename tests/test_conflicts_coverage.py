@@ -31,10 +31,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from claude_sql import checkpointer, conflicts_worker, llm_shared, retry_queue
-from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files, read_all
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.analytics import conflicts_worker
+from claude_sql.core import checkpointer, llm_shared, retry_queue
+from claude_sql.core.config import Settings
+from claude_sql.core.parquet_shards import iter_part_files, read_all
+from claude_sql.core.sql_views import register_raw, register_views
 from conftest import _seed_subagent_stub, make_user_msg, write_session_jsonl
 
 # ---------------------------------------------------------------------------

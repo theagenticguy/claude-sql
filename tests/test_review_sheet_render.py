@@ -8,7 +8,7 @@ asymmetric correction shapes, empty tools_used / exploration, and the
 
 from __future__ import annotations
 
-from claude_sql.review_sheet_render import (
+from claude_sql.provenance.review_sheet_render import (
     _format_corrections,
     _format_inline_code_list,
     _format_refusal_lines,

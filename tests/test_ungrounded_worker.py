@@ -6,7 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
-from claude_sql import ungrounded_worker as uw
+from claude_sql.evals import ungrounded_worker as uw
 
 
 def test_extract_path_claim() -> None:

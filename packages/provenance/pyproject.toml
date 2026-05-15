@@ -1,0 +1,18 @@
+[project]
+name = "claude-sql-provenance"
+version = "1.0.1"
+description = "claude-sql provenance: transcript-to-PR binding via commit trailers + git notes; single-shot PR review-sheet."
+readme = "../../README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "claude-sql-core",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "claude_sql.provenance"

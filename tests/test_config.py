@@ -16,8 +16,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from claude_sql.cli import _resolve_memory_limit
-from claude_sql.config import Settings
+from claude_sql.app.cli import _resolve_memory_limit
+from claude_sql.core.config import Settings
 
 
 def test_default_per_pipeline_concurrency() -> None:

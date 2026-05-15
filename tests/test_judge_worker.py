@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import polars as pl
 import pytest
 
-from claude_sql import judge_worker as jw
+from claude_sql.evals import judge_worker as jw
 
 RUBRIC_YAML = """
 axes:

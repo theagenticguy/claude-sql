@@ -7,8 +7,8 @@ from pathlib import Path
 
 import polars as pl
 
-from claude_sql import skills_catalog
-from claude_sql.config import Settings
+from claude_sql.analytics import skills_catalog
+from claude_sql.core.config import Settings
 
 
 def _write_skill(dir_: Path, name: str, description: str) -> None:

@@ -27,9 +27,9 @@ from typing import Any
 
 import pytest
 
-from claude_sql import cli
-from claude_sql.cli import Common
-from claude_sql.output import OutputFormat
+from claude_sql.app import cli
+from claude_sql.app.cli import Common
+from claude_sql.core.output import OutputFormat
 
 
 @pytest.fixture(autouse=True)

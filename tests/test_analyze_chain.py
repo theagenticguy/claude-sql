@@ -35,10 +35,10 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql import lance_store
-from claude_sql.cli import _rebind_vss
-from claude_sql.config import Settings
-from claude_sql.sql_views import register_vss
+from claude_sql.app.cli import _rebind_vss
+from claude_sql.core import lance_store
+from claude_sql.core.config import Settings
+from claude_sql.core.sql_views import register_vss
 
 
 def _seed_lance_row(lance_uri: Path, uuid: str, *, dim: int = 4) -> None:
@@ -224,7 +224,7 @@ def test_analyze_chain_stage_order(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     """
     import asyncio
 
-    from claude_sql import cli as cli_mod
+    from claude_sql.app import cli as cli_mod
 
     settings = _make_settings(tmp_path, dim=256)
     # Seed Lance with one row so register_vss does the table->view switch

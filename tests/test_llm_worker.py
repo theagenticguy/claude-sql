@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from claude_sql.llm_shared import _invoke_classifier_sync
-from claude_sql.schemas import SESSION_CLASSIFICATION_SCHEMA
+from claude_sql.core.llm_shared import _invoke_classifier_sync
+from claude_sql.core.schemas import SESSION_CLASSIFICATION_SCHEMA
 
 
 def _make_mock_client(return_payload: dict) -> MagicMock:
@@ -135,7 +135,7 @@ def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
     a conservative guard — real tokenization tends to land 5–10% higher
     than this lower bound, so 900 here means ~990+ Anthropic tokens.
     """
-    from claude_sql.llm_shared import (
+    from claude_sql.core.llm_shared import (
         CLASSIFY_SYSTEM_PROMPT,
         CONFLICTS_SYSTEM_PROMPT,
         TRAJECTORY_SYSTEM_PROMPT,
@@ -153,7 +153,7 @@ def test_module_system_prompts_cross_anthropic_cache_threshold() -> None:
         # 1024-tok cache minimum and 1258 did not). Aim for 1300+ cl100k →
         # ~1014 Anthropic minimum, with a safety margin pushing each prompt
         # to 1700+ cl100k.
-        from claude_sql.llm_shared import (
+        from claude_sql.core.llm_shared import (
             CLASSIFY_SYSTEM_PROMPT,
             CONFLICTS_SYSTEM_PROMPT,
             TRAJECTORY_SYSTEM_PROMPT,
