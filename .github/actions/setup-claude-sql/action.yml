@@ -45,4 +45,8 @@ runs:
 
     - name: uv sync
       shell: bash
-      run: uv sync --locked --all-extras --all-groups
+      # `--all-packages` is required under uv workspaces with a virtual root
+      # (`package = false`): without it, `uv sync` resolves only the root's
+      # dev-deps and skips installing every member under packages/*.
+      # See .erpaval/solutions/api-patterns/uv-workspace-virtual-root-needs-all-packages.md
+      run: uv sync --locked --all-packages --all-extras --all-groups
