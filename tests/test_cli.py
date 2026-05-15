@@ -21,10 +21,10 @@ from typing import Any
 import polars as pl
 import pytest
 
-from claude_sql import cli
-from claude_sql.cli import Common
-from claude_sql.config import Settings
-from claude_sql.output import OutputFormat
+from claude_sql.app import cli
+from claude_sql.app.cli import Common
+from claude_sql.core.config import Settings
+from claude_sql.core.output import OutputFormat
 
 # ---------------------------------------------------------------------------
 # Cache redirection — auto-applied to every test in this module.
@@ -590,7 +590,7 @@ def test_search_with_mocked_embed(
 
     from datetime import UTC, datetime as _dt
 
-    from claude_sql import lance_store
+    from claude_sql.core import lance_store
 
     df = pl.DataFrame(
         {
@@ -737,7 +737,7 @@ def test_freeze_then_replay_roundtrip(
 
 
 def test_freeze_empty_panel_raises(tmp_corpus: dict[str, Any], tmp_path: Path) -> None:
-    from claude_sql.output import InputValidationError
+    from claude_sql.core.output import InputValidationError
 
     rubric = tmp_path / "rubric.yaml"
     rubric.write_text("axes:\n  - name: x\n    levels:\n      0: a\n", encoding="utf-8")
@@ -763,7 +763,7 @@ def test_blind_handover_cmd_strips_text(tmp_corpus: dict[str, Any], tmp_path: Pa
 
 
 def test_blind_handover_missing_columns_raises(tmp_corpus: dict[str, Any], tmp_path: Path) -> None:
-    from claude_sql.output import InputValidationError
+    from claude_sql.core.output import InputValidationError
 
     in_path = tmp_path / "bad.parquet"
     out_path = tmp_path / "out.parquet"
@@ -818,7 +818,7 @@ def test_judge_cmd_missing_columns_raises(
     cli.freeze_cmd(rubric, panel="kimi-k2.5", common=_common(tmp_corpus))
     sha = json.loads(capsys.readouterr().out)["manifest_sha"]
 
-    from claude_sql.output import InputValidationError
+    from claude_sql.core.output import InputValidationError
 
     bad = tmp_path / "bad.parquet"
     pl.DataFrame({"session_id": ["s1"]}).write_parquet(bad)
@@ -868,7 +868,7 @@ def test_ungrounded_cmd_missing_columns_raises(
     cli.freeze_cmd(rubric, panel="kimi-k2.5", common=_common(tmp_corpus))
     sha = json.loads(capsys.readouterr().out)["manifest_sha"]
 
-    from claude_sql.output import InputValidationError
+    from claude_sql.core.output import InputValidationError
 
     bad = tmp_path / "bad.parquet"
     pl.DataFrame({"session_id": ["s1"]}).write_parquet(bad)
@@ -1068,7 +1068,7 @@ def test_review_sheet_cmd_dry_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise the dry-run plan emission by mocking the binding lookup."""
-    from claude_sql import binding as _binding_mod
+    from claude_sql.provenance import binding as _binding_mod
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"sessionId": "s1"}\n', encoding="utf-8")
@@ -1099,7 +1099,7 @@ def test_review_sheet_cmd_renders_markdown_on_tty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Success path: TTY + AUTO format → render_markdown branch fires."""
-    from claude_sql import binding as _binding_mod
+    from claude_sql.provenance import binding as _binding_mod
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"sessionId": "s1"}\n', encoding="utf-8")
@@ -1153,7 +1153,7 @@ def test_review_sheet_cmd_renders_refusal_markdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Refusal path: TTY + AUTO format → render_refusal_markdown branch fires."""
-    from claude_sql import binding as _binding_mod
+    from claude_sql.provenance import binding as _binding_mod
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"sessionId": "s1"}\n', encoding="utf-8")

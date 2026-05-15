@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_sql.ingest import (
+from claude_sql.analytics.ingest import (
     _ANTHROPIC_RATIO,
     approx_tokens_batch,
     hamming_distance_64,

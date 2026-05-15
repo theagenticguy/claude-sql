@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_sql import judges
+from claude_sql.evals import judges
 
 
 def test_catalog_has_eight_primary_judges() -> None:

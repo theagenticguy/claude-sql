@@ -9,8 +9,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from claude_sql.session_text import session_bounds
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.core.session_text import session_bounds
+from claude_sql.core.sql_views import register_raw, register_views
 
 
 def _write_session_jsonl(

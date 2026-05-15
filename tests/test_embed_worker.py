@@ -35,8 +35,8 @@ from botocore.exceptions import (
     SSLError,
 )
 
-from claude_sql import embed_worker, lance_store
-from claude_sql.embed_worker import (
+from claude_sql.analytics import embed_worker
+from claude_sql.analytics.embed_worker import (
     MAX_CHARS_PER_TEXT,
     _build_bedrock_client,
     _invoke_bedrock_sync,
@@ -46,7 +46,8 @@ from claude_sql.embed_worker import (
     embed_query,
     run_backfill,
 )
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.core import lance_store
+from claude_sql.core.sql_views import register_raw, register_views
 from conftest import FakeBedrockClient, make_user_msg, write_session_jsonl
 
 

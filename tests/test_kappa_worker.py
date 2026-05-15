@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from claude_sql import kappa_worker as kw
+from claude_sql.evals import kappa_worker as kw
 
 
 def test_cohens_kappa_perfect_agreement() -> None:

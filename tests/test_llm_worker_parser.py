@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from claude_sql.llm_shared import BedrockRefusalError, _parse_structured_payload
+from claude_sql.core.llm_shared import BedrockRefusalError, _parse_structured_payload
 
 
 def test_parses_top_level_output_dict() -> None:

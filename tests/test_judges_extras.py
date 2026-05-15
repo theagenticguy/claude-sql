@@ -8,7 +8,7 @@ each one to lock in the contract.
 
 from __future__ import annotations
 
-from claude_sql import judges
+from claude_sql.evals import judges
 
 
 def test_all_primary_returns_primary_panel_tuple() -> None:

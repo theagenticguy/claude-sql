@@ -24,8 +24,8 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql import lance_store
-from claude_sql.sql_views import register_vss
+from claude_sql.core import lance_store
+from claude_sql.core.sql_views import register_vss
 
 
 def _seed_lance(lance_uri: Path, *, n_rows: int = 4, dim: int = 4) -> None:

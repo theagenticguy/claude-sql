@@ -13,10 +13,10 @@ from typing import Any
 
 import pytest
 
-from claude_sql import review_sheet_worker
-from claude_sql.config import Settings
-from claude_sql.review_sheet_render import render_markdown
-from claude_sql.schemas import PR_REVIEW_SHEET_SCHEMA, PRReviewSheet
+from claude_sql.core.config import Settings
+from claude_sql.core.schemas import PR_REVIEW_SHEET_SCHEMA, PRReviewSheet
+from claude_sql.provenance import review_sheet_worker
+from claude_sql.provenance.review_sheet_render import render_markdown
 
 # ---------------------------------------------------------------------------
 # Schema contract

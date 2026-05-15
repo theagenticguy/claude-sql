@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from claude_sql.schemas import (
+from claude_sql.core.schemas import (
     PR_REVIEW_SHEET_SCHEMA,
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,

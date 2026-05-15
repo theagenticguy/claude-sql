@@ -41,9 +41,12 @@ UV_LINK_MODE = "copy"
 # ---------------------------------------------------------------------------
 
 [tasks.install]
-description = "Install all deps from uv.lock into .venv and git hooks"
+description = "Install every workspace member + dev deps + git hooks"
 depends = ["hooks:install"]
-run = "uv sync --all-extras"
+# `--all-packages` is required under uv workspaces: the workspace root is
+# a virtual project (`package = false`), so `uv sync` alone resolves only
+# its dev-deps. Members under packages/* need explicit inclusion.
+run = "uv sync --all-packages --all-extras"
 
 [tasks.upgrade]
 description = "Upgrade every dependency to the latest compatible version"
@@ -94,12 +97,12 @@ run = "uv run cz bump --dry-run"
 
 [tasks.lint]
 description = "Lint with ruff"
-sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+sources = ["packages/*/src/**/*.py", "tests/**/*.py", "pyproject.toml", "packages/*/pyproject.toml"]
 run = "uv run ruff check ."
 
 [tasks.fmt]
 description = "Check formatting"
-sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+sources = ["packages/*/src/**/*.py", "tests/**/*.py", "pyproject.toml", "packages/*/pyproject.toml"]
 run = "uv run ruff format --check ."
 
 [tasks."fmt:write"]
@@ -107,18 +110,25 @@ description = "Apply formatting"
 run = "uv run ruff format ."
 
 [tasks.typecheck]
-description = "Type-check with ty (strict, includes tests)"
-sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
-run = "uv run ty check src/ tests/"
+description = "Type-check with ty (strict, includes every workspace member + tests)"
+sources = ["packages/*/src/**/*.py", "tests/**/*.py", "pyproject.toml", "packages/*/pyproject.toml"]
+# Drop the explicit src/ tests/ paths — pyproject [tool.ty.src.include]
+# already lists every member and the tests tree.
+run = "uv run ty check"
+
+[tasks."lint:imports"]
+description = "Enforce the layered DAG (core < {analytics,evals,provenance} < app)"
+sources = ["packages/*/src/**/*.py", "pyproject.toml"]
+run = "uv run lint-imports"
 
 [tasks.test]
 description = "Run the full pytest suite"
-sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
-run = "uv run pytest tests/ --no-header -q"
+sources = ["packages/*/src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+run = "uv run pytest --no-header -q"
 
 [tasks.check]
-description = "All quality gates: lint + fmt + typecheck + test"
-depends = ["lint", "fmt", "typecheck", "test"]
+description = "All quality gates: lint + fmt + typecheck + import-linter + test"
+depends = ["lint", "fmt", "typecheck", "lint:imports", "test"]
 
 # ---------------------------------------------------------------------------
 # Security gates — defense-in-depth SAST/SCA + secrets sweep.  Each emits
@@ -133,15 +143,15 @@ depends = ["lint", "fmt", "typecheck", "test"]
 
 [tasks."security:bandit"]
 description = "Python SAST via bandit (defense-in-depth alongside ruff S)"
-sources = ["src/**/*.py", "pyproject.toml"]
+sources = ["packages/*/src/**/*.py", "pyproject.toml"]
 run = """
 mkdir -p .sarif
-uv run bandit -r src -f sarif -o .sarif/bandit.sarif --exit-zero -c pyproject.toml
+uv run bandit -r packages -f sarif -o .sarif/bandit.sarif --exit-zero -c pyproject.toml
 """
 
 [tasks."security:semgrep"]
 description = "Multi-language SAST via Semgrep (p/auto + p/owasp-top-ten)"
-sources = ["src/**/*.py", "pyproject.toml"]
+sources = ["packages/*/src/**/*.py", "pyproject.toml"]
 run = """
 mkdir -p .sarif
 semgrep scan \
@@ -175,16 +185,19 @@ depends = ["security:bandit", "security:semgrep", "security:osv", "security:leak
 # ---------------------------------------------------------------------------
 
 [tasks.build]
-description = "Build wheel + sdist into dist/"
-run = "uv build"
+description = "Build the publishable claude-sql wheel + sdist into dist/"
+# Build only the binary package; cluster packages are not separately published.
+# The published wheel pulls in claude-sql-{core,analytics,evals,provenance}
+# via [project.dependencies] resolved through [tool.uv.sources].
+run = "uv build --package claude-sql"
 
 [tasks."tool:install"]
 description = "Install claude-sql as a uv tool (global, isolated venv)"
-run = "uv tool install --from . claude-sql --force --reinstall"
+run = "uv tool install --from packages/app claude-sql --force --reinstall"
 
 [tasks."tool:upgrade"]
 description = "Re-install claude-sql from the current working tree (use after pulling)"
-run = "uv tool install --from . claude-sql --force --reinstall"
+run = "uv tool install --from packages/app claude-sql --force --reinstall"
 
 [tasks."tool:uninstall"]
 description = "Uninstall the claude-sql uv tool"

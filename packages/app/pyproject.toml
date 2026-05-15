@@ -1,0 +1,50 @@
+[project]
+name = "claude-sql"
+version = "1.0.1"
+description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
+readme = "../../README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }]
+requires-python = ">=3.13"
+keywords = [
+    "claude", "claude-code", "anthropic", "duckdb", "sql",
+    "semantic-search", "embeddings", "bedrock", "transcripts",
+    "analytics", "observability",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "claude-sql-core",
+    "claude-sql-analytics",
+    "claude-sql-evals",
+    "claude-sql-provenance",
+    "cyclopts>=4.10.2",
+    "packaging>=26.2",
+]
+
+[project.scripts]
+claude-sql = "claude_sql.app.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/theagenticguy/claude-sql"
+Repository = "https://github.com/theagenticguy/claude-sql"
+Issues = "https://github.com/theagenticguy/claude-sql/issues"
+Changelog = "https://github.com/theagenticguy/claude-sql/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "claude_sql.app"

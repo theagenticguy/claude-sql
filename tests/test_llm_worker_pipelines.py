@@ -34,16 +34,18 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql import (
+from claude_sql.analytics import (
     classify_worker,
     conflicts_worker,
-    llm_shared,
-    retry_queue,
     trajectory_worker,
 )
-from claude_sql.config import Settings
-from claude_sql.parquet_shards import iter_part_files
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.core import (
+    llm_shared,
+    retry_queue,
+)
+from claude_sql.core.config import Settings
+from claude_sql.core.parquet_shards import iter_part_files
+from claude_sql.core.sql_views import register_raw, register_views
 from conftest import (
     _seed_subagent_stub,
     make_user_msg,
@@ -498,7 +500,7 @@ def test_build_bedrock_client_cache_identity(
         counter["n"] += 1
         return object()
 
-    monkeypatch.setattr("claude_sql.llm_shared.boto3.client", _fake_boto_client)
+    monkeypatch.setattr("claude_sql.core.llm_shared.boto3.client", _fake_boto_client)
 
     a = llm_shared._build_bedrock_client(tmp_settings)
     b = llm_shared._build_bedrock_client(tmp_settings)

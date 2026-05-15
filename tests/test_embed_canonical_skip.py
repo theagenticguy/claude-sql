@@ -28,9 +28,9 @@ from typing import Any
 import duckdb
 import polars as pl
 
-from claude_sql import lance_store
-from claude_sql.embed_worker import discover_unembedded
-from claude_sql.sql_views import register_raw, register_views
+from claude_sql.analytics.embed_worker import discover_unembedded
+from claude_sql.core import lance_store
+from claude_sql.core.sql_views import register_raw, register_views
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -25,10 +25,11 @@ from typing import Any
 import duckdb
 import pytest
 
-from claude_sql import cli, sql_views
-from claude_sql.cli import Common
-from claude_sql.config import Settings
-from claude_sql.output import OutputFormat
+from claude_sql.app import cli
+from claude_sql.app.cli import Common
+from claude_sql.core import sql_views
+from claude_sql.core.config import Settings
+from claude_sql.core.output import OutputFormat
 
 # ---------------------------------------------------------------------------
 # Cache redirection — mirrors ``test_cli.py`` so each test gets a clean

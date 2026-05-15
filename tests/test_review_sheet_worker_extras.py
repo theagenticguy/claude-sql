@@ -14,9 +14,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from claude_sql import review_sheet_worker
-from claude_sql.config import Settings
-from claude_sql.review_sheet_worker import (
+from claude_sql.core.config import Settings
+from claude_sql.provenance import review_sheet_worker
+from claude_sql.provenance.review_sheet_worker import (
     _flatten_jsonl_to_text,
     _render_content_block,
     _render_event_line,

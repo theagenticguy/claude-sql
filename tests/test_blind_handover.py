@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_sql import blind_handover
+from claude_sql.evals import blind_handover
 
 
 def test_strips_slack_user_ids() -> None:

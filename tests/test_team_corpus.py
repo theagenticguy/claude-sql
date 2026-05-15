@@ -21,13 +21,13 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from claude_sql.config import (
+from claude_sql.core.config import (
     Settings,
     _default_glob,
     _default_subagent_glob,
     _default_subagent_meta_glob,
 )
-from claude_sql.sql_views import register_all
+from claude_sql.core.sql_views import register_all
 
 # ---------------------------------------------------------------------------
 # Fixture builder — duplicated from tests/test_sql_views.py to keep test

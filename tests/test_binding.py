@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql import binding
+from claude_sql.provenance import binding
 
 # ---------------------------------------------------------------------------
 # Skip-if-git-too-old gate
@@ -416,7 +416,7 @@ def test_bind_cli_dry_run(
     monkeypatch.setenv("CLAUDE_AGENT_RUNTIME", "claude-code/test-1.0.0")
     monkeypatch.chdir(git_repo)
 
-    from claude_sql.cli import bind_cmd
+    from claude_sql.app.cli import bind_cmd
 
     bind_cmd(repo=git_repo, dry_run=True)
     out = capsys.readouterr().out
@@ -473,8 +473,8 @@ def test_detect_agent_runtime_default(monkeypatch: pytest.MonkeyPatch) -> None:
 # (this is the kind of regression where importing `binding` from `cli`
 # silently breaks because of a circular import).
 def test_binding_module_imports_via_cli() -> None:
-    from claude_sql.cli import bind_cmd, resolve_cmd
+    from claude_sql.app.cli import bind_cmd, resolve_cmd
 
     assert callable(bind_cmd)
     assert callable(resolve_cmd)
-    assert "claude_sql.cli" in sys.modules
+    assert "claude_sql.app.cli" in sys.modules
