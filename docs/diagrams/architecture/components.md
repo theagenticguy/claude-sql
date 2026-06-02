@@ -12,7 +12,7 @@ classDiagram
     class Settings {
         +active_model_id()
         +_derive_team_corpus_globs()
-        +_resolve_concurrency_alias()
+        +lance_uri
     }
     class SQLViews {
         +register_all()
@@ -63,5 +63,5 @@ classDiagram
     EmbedWorker --> Settings : reads
     TrajectoryWorker --> LLMShared : invokes
     LLMShared --> Settings : reads
-    CommunityWorker --> LanceStore : reads
+    CommunityWorker --> SQLViews : reads
 ```

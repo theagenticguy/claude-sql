@@ -4,57 +4,69 @@
 flowchart LR
     classDef external stroke-dasharray: 3 3
 
-    cli[cli]
-    ingest[ingest]
-    sql_views[sql_views]
-    embed_worker[embed_worker]
-    classify_worker[classify_worker]
-    cluster_worker[cluster_worker]
-    community_worker[community_worker]
-    llm_shared[llm_shared]
-    lance_store[lance_store]
-    parquet_shards[parquet_shards]
+    app[app]
+    core[core]
+    analytics[analytics]
+    evals[evals]
+    provenance[provenance]
 
-    duckdb[(duckdb)]:::external
+    loguru[(loguru)]:::external
     polars[(polars)]:::external
+    duckdb[(duckdb)]:::external
     bedrock[(AWS Bedrock)]:::external
-    lancedb[(lancedb)]:::external
-    cyclopts[(cyclopts)]:::external
     pydantic[(pydantic)]:::external
-    umap[(umap-learn)]:::external
-    hdbscan[(hdbscan)]:::external
-    leidenalg[(leidenalg)]:::external
+    lancedb[(lancedb)]:::external
+    pyarrow[(pyarrow)]:::external
     tenacity[(tenacity)]:::external
+    anyio[(anyio)]:::external
+    numpy[(numpy)]:::external
+    cyclopts[(cyclopts)]:::external
+    hdbscan[(hdbscan)]:::external
+    umap[(umap-learn)]:::external
+    leidenalg[(leidenalg)]:::external
+    tiktoken[(tiktoken)]:::external
 
-    cli --> ingest
-    cli --> sql_views
-    cli --> embed_worker
-    cli --> classify_worker
-    cli --> cluster_worker
-    cli --> community_worker
-    cli --> parquet_shards
-    cli --> cyclopts
+    app --> core
+    app --> analytics
+    app --> evals
+    app --> provenance
+    analytics --> core
+    evals --> core
+    provenance --> core
 
-    ingest --> parquet_shards
-    sql_views --> parquet_shards
-    sql_views --> duckdb
+    app --> cyclopts
 
-    embed_worker --> lance_store
-    embed_worker --> bedrock
-    cluster_worker --> lance_store
-    cluster_worker --> umap
-    cluster_worker --> hdbscan
+    core --> loguru
+    core --> polars
+    core --> duckdb
+    core --> bedrock
+    core --> pydantic
+    core --> lancedb
+    core --> pyarrow
+    core --> tenacity
 
-    community_worker --> leidenalg
-    community_worker --> duckdb
-
-    classify_worker --> llm_shared
-    classify_worker --> parquet_shards
-    classify_worker --> pydantic
-
-    llm_shared --> bedrock
-    llm_shared --> tenacity
-
-    lance_store --> lancedb
-    parquet_shards --> polars
+    analytics --> anyio
+    analytics --> numpy
+    analytics --> tiktoken
+    analytics --> hdbscan
+    analytics --> umap
+    analytics --> leidenalg
 ```
+
+## Legend (overflow)
+
+Elided external nodes (declared in `packages/*/pyproject.toml` but dropped to fit the 20-node budget), with the count of source files that import each:
+
+| Node | Owning package | Importing files | Note |
+|---|---|---|---|
+| scikit-learn | analytics | 1 | `terms_worker.py:65` c-TF-IDF CountVectorizer |
+| igraph | analytics | 1 (2 sites) | `community_worker.py:70` mutual-kNN graph |
+| pydantic-settings | core | 1 | `config.py` settings root |
+| scipy | analytics | declared only | `packages/analytics/pyproject.toml:17` |
+| pyyaml | core | 1 | `config.py` YAML knobs |
+| packaging | app | 1 | version parsing |
+| anthropic | core | declared only | `packages/core/pyproject.toml:10`, no source import |
+
+## See also
+
+- [claude-sql · System overview](../../architecture/system-overview.md) — 2 shared source files
