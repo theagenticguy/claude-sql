@@ -67,6 +67,22 @@ def test_settings_need_s3_when_only_subagent_glob_is_s3() -> None:
     assert settings_need_s3(settings) is True
 
 
+@pytest.fixture
+def _dummy_aws_creds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed dummy static AWS creds in the environment.
+
+    DuckDB's ``credential_chain`` provider resolves credentials eagerly at
+    ``CREATE SECRET`` time, not at query time. A bare CI runner has no AWS
+    credentials anywhere on the chain, so the secret create raises
+    ``Secret Validation Failure: Credential Chain: 'config'``. Pinning static
+    env creds makes the chain resolvable without touching the network.
+    """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+
+@pytest.mark.usefixtures("_dummy_aws_creds")
 def test_configure_s3_creates_secret_credential_chain() -> None:
     """Default (no endpoint) builds a credential_chain secret, no key material."""
     con = duckdb.connect(":memory:")
@@ -81,6 +97,7 @@ def test_configure_s3_creates_secret_credential_chain() -> None:
         con.close()
 
 
+@pytest.mark.usefixtures("_dummy_aws_creds")
 def test_configure_s3_is_idempotent() -> None:
     """CREATE OR REPLACE means a second call updates rather than duplicates."""
     con = duckdb.connect(":memory:")
@@ -103,12 +120,19 @@ def test_configure_s3_is_idempotent() -> None:
 
 
 @pytest.fixture
-def moto_s3() -> Iterator[dict[str, Any]]:
+def moto_s3(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
     """Start an in-process moto S3 server and yield connection details.
 
     httpfs uses its own HTTP client, so the in-process ``mock_aws`` decorator
     does not intercept it — a real listening endpoint is required.
+
+    Static AWS creds are pinned in the environment so DuckDB's
+    ``credential_chain`` provider (used by ``configure_s3``) resolves at
+    ``CREATE SECRET`` time — a bare CI runner has none on the chain otherwise.
     """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     server = ThreadedMotoServer(port=0)
     server.start()
     host, port = server.get_host_and_port()
