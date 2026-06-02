@@ -606,6 +606,47 @@ A spike in `max(gap_ms)` is usually a session that got abandoned and
 resumed hours or days later. Pair with `friction_rate(30)` from the
 analytics cookbook — long pauses correlate weakly with frustration.
 
+## 9. Reading transcripts from S3
+
+Any transcript glob can be an `s3://` URI instead of a local path. Point it
+at sessions mirrored to S3 by the `claude-agent-sdk` `S3SessionStore`
+(key layout `s3://{bucket}/{prefix}{project}/{session}/part-*.jsonl`) and the
+entire view + macro stack works unchanged — DuckDB reads the part files
+zero-copy over HTTP range requests, no download.
+
+```bash
+# Real AWS S3 — credentials resolve from the standard chain (AWS_PROFILE,
+# env vars, instance/role). claude-sql loads httpfs + creates a
+# credential_chain secret automatically when it sees the s3:// glob.
+export CLAUDE_SQL_DEFAULT_GLOB='s3://my-bucket/transcripts/*/*/part-*.jsonl'
+export AWS_PROFILE=your-profile
+claude-sql query "
+  SELECT session_id, started_at, record_count
+  FROM sessions
+  ORDER BY started_at DESC
+  LIMIT 10
+"
+```
+
+The `sessions` view derives `session_id` from the path: the flat local form
+(`.../<session_id>.jsonl`) keys on the basename, while the `S3SessionStore`
+part layout (`.../<session_id>/part-*.jsonl`) keys on the parent directory.
+Both resolve correctly without configuration.
+
+For a non-AWS store (MinIO) or a local mock (moto), pin the endpoint:
+
+```bash
+export CLAUDE_SQL_DEFAULT_GLOB='s3://my-bucket/transcripts/*/*/part-*.jsonl'
+export CLAUDE_SQL_S3_ENDPOINT='localhost:9000'
+export CLAUDE_SQL_S3_URL_STYLE='path'
+export CLAUDE_SQL_S3_USE_SSL='false'
+claude-sql schema
+```
+
+IAM needs `s3:GetObject` + `s3:ListBucket` on the prefix. Embeddings,
+classifications, and other derived caches still live in the local cache home —
+only the source transcripts move to S3.
+
 ## Explain: prove the pushdown
 
 ```bash

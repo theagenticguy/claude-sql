@@ -152,6 +152,30 @@ The IAM policy needs `bedrock:InvokeModel` on:
 - `inference-profile/global.cohere.embed-v4:0`
 - `inference-profile/global.anthropic.claude-sonnet-4-6`
 
+### Reading transcripts from S3
+
+claude-sql reads the local JSONL corpus by default, but any transcript glob
+can be an `s3://` URI instead — point it at sessions mirrored to S3 by the
+[`claude-agent-sdk` `S3SessionStore`](https://github.com/anthropics/claude-agent-sdk-python/tree/main/examples/session_stores)
+(layout `s3://{bucket}/{prefix}{project}/{session}/part-*.jsonl`). DuckDB reads
+the parts zero-copy over HTTP range requests — no download step — and every
+view and macro works unchanged.
+
+```bash
+# Personal corpus on S3 instead of ~/.claude/projects.
+export CLAUDE_SQL_DEFAULT_GLOB='s3://my-bucket/transcripts/*/*/part-*.jsonl'
+export AWS_PROFILE=your-profile        # credentials via the standard AWS chain
+claude-sql schema
+claude-sql query "SELECT session_id, started_at FROM sessions ORDER BY started_at DESC LIMIT 10"
+```
+
+claude-sql loads DuckDB's `httpfs` extension and creates a `credential_chain`
+S3 secret automatically when it sees an `s3://` glob — no keys are embedded
+anywhere. For a non-AWS store (MinIO) or a local mock, set
+`CLAUDE_SQL_S3_ENDPOINT`, `CLAUDE_SQL_S3_URL_STYLE=path`, and
+`CLAUDE_SQL_S3_USE_SSL=false`. The IAM policy needs `s3:GetObject` +
+`s3:ListBucket` on the prefix.
+
 ## Quick tour
 
 ```bash
@@ -319,7 +343,10 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_DEFAULT_GLOB` | `~/.claude/projects/*/*.jsonl` | Main transcript glob |
 | `CLAUDE_SQL_SUBAGENT_GLOB` | `~/.claude/projects/*/*/subagents/agent-*.jsonl` | Subagent transcripts |
 | `CLAUDE_SQL_TEAM_CORPUS_ROOT` | `None` | Team-corpus root; when set, derives all three globs from `<root>/<author>/projects/*` (replaces the personal corpus) |
-| `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region |
+| `CLAUDE_SQL_S3_ENDPOINT` | `None` | Custom S3 endpoint `host[:port]` for non-AWS stores (MinIO) or a local mock; unset uses default AWS S3. Only consulted when a glob is an `s3://` URI |
+| `CLAUDE_SQL_S3_URL_STYLE` | `vhost` | S3 addressing style (`vhost` or `path`); set `path` for MinIO / moto |
+| `CLAUDE_SQL_S3_USE_SSL` | `true` | Toggle TLS for the S3 endpoint; set `false` for a local mock |
+| `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region **and** the S3 secret region |
 | `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Embedding model |
 | `CLAUDE_SQL_SONNET_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Classification model |
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension |
