@@ -156,6 +156,28 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # S3 transcript source
+    # ------------------------------------------------------------------
+    #: When any transcript glob is an ``s3://`` URI, claude-sql loads DuckDB's
+    #: ``httpfs`` extension and creates a ``credential_chain`` S3 secret so the
+    #: existing ``read_json`` view stack reads the remote corpus zero-copy.
+    #: Point ``default_glob`` at the ``S3SessionStore`` layout, e.g.
+    #: ``CLAUDE_SQL_DEFAULT_GLOB='s3://bucket/prefix/*/*/part-*.jsonl'``.
+    #: Credentials come from the standard AWS chain (env / shared config /
+    #: instance-role) — never embedded in SQL. The three fields below override
+    #: the S3 endpoint for non-AWS stores or a local mock server; leave
+    #: ``s3_endpoint`` unset (the default) for real AWS S3.
+    s3_endpoint: str | None = Field(
+        default=None,
+        description=(
+            "Custom S3 endpoint host[:port] for non-AWS stores or a local mock "
+            "(e.g. MinIO, moto). Unset uses the default AWS S3 endpoint."
+        ),
+    )
+    s3_url_style: Literal["vhost", "path"] = "vhost"
+    s3_use_ssl: bool = True
+
+    # ------------------------------------------------------------------
     # Bedrock / embedding
     # ------------------------------------------------------------------
     region: str = "us-east-1"

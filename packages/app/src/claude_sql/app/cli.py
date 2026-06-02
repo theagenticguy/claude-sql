@@ -82,6 +82,7 @@ from claude_sql.core.parquet_shards import (
     is_sharded_dir,
     iter_part_files,
 )
+from claude_sql.core.s3_source import configure_s3, settings_need_s3
 from claude_sql.core.sql_views import (
     MACRO_NAMES,
     MACRO_SIGNATURES,
@@ -1606,6 +1607,8 @@ def embed(
     settings = _resolve_settings(common)
     con = duckdb.connect(":memory:")
     try:
+        if settings_need_s3(settings):
+            configure_s3(con, settings)
         register_raw(
             con,
             glob=settings.default_glob,

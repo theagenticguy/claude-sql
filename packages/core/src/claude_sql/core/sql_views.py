@@ -46,6 +46,7 @@ from loguru import logger
 
 from claude_sql.core.config import DEFAULT_PRICING, Settings
 from claude_sql.core.parquet_shards import iter_part_files
+from claude_sql.core.s3_source import configure_s3, settings_need_s3
 
 # ---------------------------------------------------------------------------
 # Glob constants
@@ -525,7 +526,17 @@ def register_raw(
             CREATE OR REPLACE TEMP TABLE v_raw_events AS
             SELECT *,
                    filename AS source_file,
-                   regexp_extract(filename, '([^/]+)\\.jsonl$', 1) AS session_id_file
+                   -- Two on-disk layouts produce a session id from the path:
+                   --   local : .../<session_id>.jsonl
+                   --   S3SessionStore : .../<session_id>/part-<epochMs>-<rand>.jsonl
+                   -- The part-file form keys the session on the parent
+                   -- directory; the flat form keys on the basename. Detect the
+                   -- part layout first so S3-mirrored corpora bind correctly.
+                   CASE
+                       WHEN regexp_full_match(filename, '.*/part-[^/]*\\.jsonl$')
+                       THEN regexp_extract(filename, '/([^/]+)/part-[^/]*\\.jsonl$', 1)
+                       ELSE regexp_extract(filename, '([^/]+)\\.jsonl$', 1)
+                   END AS session_id_file
             FROM read_json(
                 {_sql_str(glob)},
                 format='newline_delimited',
@@ -2120,6 +2131,8 @@ def register_all(
        raising.
     """
     settings = settings or Settings()
+    if settings_need_s3(settings):
+        configure_s3(con, settings)
     register_raw(
         con,
         glob=settings.default_glob,
