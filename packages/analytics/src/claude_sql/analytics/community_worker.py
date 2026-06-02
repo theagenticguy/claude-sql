@@ -85,10 +85,12 @@ def _load_session_centroids(
     """Return ``(session_ids, centroids)`` where centroids is ``(N_sessions, dim)`` float32.
 
     Joins the ``message_embeddings`` view (LanceDB-backed via ``register_vss``)
-    to the v1 ``messages`` view on uuid, then aggregates inside DuckDB
-    (unnest with position → ``avg`` per (session, dim_index) → ordered
-    ``list``). The L2-normalize step stays in numpy where
-    ``np.linalg.norm`` is faster on a contiguous (N, dim) matrix.
+    to the v1 ``messages`` view on uuid, pulls one ``(session_id, embedding)``
+    row per message ordered by session, then computes per-session means in
+    numpy with a single ``np.add.reduceat`` segmented sum (sessions are
+    contiguous after the ``ORDER BY``) followed by an L2-normalize. This keeps
+    the intermediate at ``N_messages`` rows rather than the ``N_messages ×
+    dim`` explosion the prior ``unnest``-per-dimension aggregation produced.
 
     ``embeddings_parquet_path`` is accepted for back-compat with callers that
     still pass it but is no longer consulted — the connection's
