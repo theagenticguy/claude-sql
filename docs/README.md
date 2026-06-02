@@ -2,7 +2,7 @@
 
 Comprehensive codebase documentation for `claude-sql`.
 
-Prose is generated; structure is mechanical. Cross-references are deterministic.
+Prose is generated; structure is mechanical. Cross-references are deterministic. Generated against commit `982595b` (5-package PEP 420 workspace).
 
 ## Architecture
 
