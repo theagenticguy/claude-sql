@@ -133,11 +133,21 @@ def _load_session_centroids(
             "Lance embeddings exist and the messages view is registered."
         )
 
-    # ``emb`` is a DuckDB FLOAT[] list column; polars surfaces it as a List
-    # (variable) or Array (fixed) dtype. ``to_numpy`` yields a contiguous
-    # (N_messages, dim) float32 matrix either way once cast through a stack.
-    emb_series = df["emb"]
-    emb_np = np.asarray(emb_series.to_list(), dtype=np.float32)
+    # ``emb`` is a DuckDB ``FLOAT[dim]`` column; polars surfaces it as a
+    # fixed-size ``Array(Float32, dim)`` dtype (occasionally a variable
+    # ``List`` if the cast was lost upstream). ``Series.to_numpy()`` extracts
+    # the buffer directly into a contiguous ``(N_messages, dim)`` matrix; for
+    # the fixed-``Array`` case it's a near-zero-copy view. The prior
+    # ``np.asarray(series.to_list(), ...)`` boxed every one of the
+    # N_messages × dim float32 values into a Python ``float`` object first —
+    # measured at 6–10× slower and ~43× higher peak RSS on a 6k–96k-message
+    # corpus (e.g. 7.4 s / 3.5 GB → 1.2 s / 83 MB at 96k). This is the
+    # read-side analog of the SQL-side ``unnest`` explosion removed in #65.
+    emb_arr = df["emb"].to_numpy()
+    if emb_arr.ndim == 1:
+        # Variable ``List`` dtype (or object array of rows) — stack to 2-D.
+        emb_arr = np.stack(list(emb_arr))
+    emb_np = np.ascontiguousarray(emb_arr, dtype=np.float32)
     sessions = df["session_id"].to_numpy()
     # ``return_index`` gives each group's first row offset on the sorted array;
     # ``np.unique`` returns the labels already sorted, matching the prior
