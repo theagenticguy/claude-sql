@@ -52,7 +52,7 @@ async def _classify_sessions_async(
 ) -> int:
     """Async implementation behind :func:`classify_sessions`."""
     already: set[str] = set()
-    done_df = read_all(settings.classifications_parquet_path)
+    done_df = read_all(settings.classifications_parquet_path, columns=["session_id"])
     if done_df is not None and done_df.height > 0:
         already = set(done_df["session_id"].to_list())
 
@@ -212,7 +212,7 @@ def classify_sessions(
 
     if dry_run:
         already: set[str] = set()
-        done_df = read_all(settings.classifications_parquet_path)
+        done_df = read_all(settings.classifications_parquet_path, columns=["session_id"])
         if done_df is not None and done_df.height > 0:
             already = set(done_df["session_id"].to_list())
         pending_count = _count_pending_sessions(

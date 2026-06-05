@@ -128,13 +128,26 @@ def write_part(target: Path, df: pl.DataFrame) -> Path:
     return target
 
 
-def read_all(target: Path, *, dtypes: dict[str, Any] | None = None) -> pl.DataFrame | None:
+def read_all(
+    target: Path,
+    *,
+    dtypes: dict[str, Any] | None = None,
+    columns: list[str] | None = None,
+) -> pl.DataFrame | None:
     """Return the union of all part files (or the legacy single file).
 
     Returns ``None`` when the cache is empty or missing. ``dtypes`` is
     accepted for forward-compatibility but currently unused — the caches we
     own all carry self-describing schemas, so an explicit dtype map only
     matters once we hit a parquet whose schema has drifted.
+
+    ``columns`` projects the read down to a subset of columns via parquet
+    column pushdown. Callers that only need a key column (e.g. the LLM
+    workers building a ``set`` of already-processed ``session_id`` /
+    ``uuid``) pass ``columns=["session_id"]`` so the wide text columns
+    (``text_snippet``, ``rationale``, ``agent_position``, …) are never
+    decoded — peak RSS scales with the projected width, not the full
+    cumulative-corpus row width.
     """
     del dtypes  # reserved for future schema-pinning; not needed today
     parts = iter_part_files(target)
@@ -143,7 +156,8 @@ def read_all(target: Path, *, dtypes: dict[str, Any] | None = None) -> pl.DataFr
     # ``pl.read_parquet`` accepts a list of paths and concatenates with
     # ``how='vertical_relaxed'`` semantics, which matches the historical
     # ``pl.concat(..., how='diagonal_relaxed')`` used by the workers.
-    return pl.read_parquet([str(p) for p in parts])
+    # ``columns=`` is forwarded to the parquet reader for column pushdown.
+    return pl.read_parquet([str(p) for p in parts], columns=columns)
 
 
 def count_rows(target: Path) -> int:

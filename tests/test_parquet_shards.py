@@ -118,6 +118,39 @@ def test_read_all_returns_none_when_cache_is_empty(tmp_path: Path) -> None:
     assert read_all(empty_dir) is None
 
 
+def test_read_all_columns_projects_subset(tmp_path: Path) -> None:
+    """``columns=`` prunes the read to the requested subset across all shards.
+
+    The LLM workers pass ``columns=["session_id"]`` / ``["uuid"]`` so the wide
+    text columns are never decoded when all they need is a key set. The
+    projected read must (a) carry only the requested column and (b) preserve
+    every key value the full read would have surfaced.
+    """
+    target = tmp_path / "out"
+    write_part(target, _df(3, base=0))
+    time.sleep(0.001)
+    write_part(target, _df(2, base=3))
+
+    full = read_all(target)
+    projected = read_all(target, columns=["uuid"])
+    assert full is not None
+    assert projected is not None
+    assert projected.columns == ["uuid"]
+    assert projected.height == full.height == 5
+    # Same keys, full union, order preserved.
+    assert projected["uuid"].to_list() == full["uuid"].to_list()
+
+
+def test_read_all_columns_projects_legacy_single_file(tmp_path: Path) -> None:
+    """Column projection also works on the legacy single-file branch."""
+    target = tmp_path / "legacy.parquet"
+    write_part(target, _df(4, base=0))
+    projected = read_all(target, columns=["v"])
+    assert projected is not None
+    assert projected.columns == ["v"]
+    assert projected["v"].to_list() == [0, 1, 2, 3]
+
+
 def test_count_rows_sums_across_parts(tmp_path: Path) -> None:
     target = tmp_path / "out"
     write_part(target, _df(2))
