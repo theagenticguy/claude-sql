@@ -193,13 +193,19 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
         noise / len(labels) if len(labels) else 0,
     )
 
+    # Hand polars the numpy arrays directly — it ingests contiguous arrays
+    # near-zero-copy. Round-tripping through ``.tolist()`` materialized N
+    # boxed Python ints/floats/bools per column just to have polars re-parse
+    # them back into the typed columns the schema already pins (mirrors the
+    # read-side boxing fix in #68, now on the write side). ``X2`` columns are
+    # sliced views, so copy to contiguous float32 before handing them over.
     df = pl.DataFrame(
         {
             "uuid": uuids,
-            "cluster_id": labels.astype(np.int32).tolist(),
-            "x": X2[:, 0].astype(np.float32).tolist(),
-            "y": X2[:, 1].astype(np.float32).tolist(),
-            "is_noise": (labels < 0).tolist(),
+            "cluster_id": labels.astype(np.int32),
+            "x": np.ascontiguousarray(X2[:, 0], dtype=np.float32),
+            "y": np.ascontiguousarray(X2[:, 1], dtype=np.float32),
+            "is_noise": labels < 0,
         },
         schema={
             "uuid": pl.Utf8,
