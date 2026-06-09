@@ -8,11 +8,11 @@ This project is near-solo. `git shortlog -sne --all` lists five identities, but 
 |---|---|---|---|
 | `.claude/skills` | Laith Al-Saadoon | 100% | 1 |
 | `.erpaval/strategy` | Laith Al-Saadoon | 100% | 1 |
-| `packages/core` | Laith Al-Saadoon | 100% | 1 |
-| `packages/analytics` | Laith Al-Saadoon | 100% | 1 |
-| `packages/evals` | Laith Al-Saadoon | 100% | 1 |
-| `packages/provenance` | Laith Al-Saadoon | 100% | 1 |
-| `packages/app` | Laith Al-Saadoon | 100% | 1 |
+| `src/claude_sql/core` | Laith Al-Saadoon | 100% | 1 |
+| `src/claude_sql/analytics` | Laith Al-Saadoon | 100% | 1 |
+| `src/claude_sql/evals` | Laith Al-Saadoon | 100% | 1 |
+| `src/claude_sql/provenance` | Laith Al-Saadoon | 100% | 1 |
+| `src/claude_sql/app` | Laith Al-Saadoon | 100% | 1 |
 | `tests` | Laith Al-Saadoon | 96% | 2 |
 | `docs` | Laith Al-Saadoon | 93% | 2 |
 | `.erpaval/solutions` | Laith Al-Saadoon | 82% | 2 |
@@ -21,9 +21,9 @@ This project is near-solo. `git shortlog -sne --all` lists five identities, but 
 
 Notes on the table:
 
-- The five `packages/*` folders each carry exactly one commit — they were all created in a single refactor, `982595b` "split into 5 PEP 420 namespace packages under uv workspace (#60)" (`git log --oneline -- packages/`). Their 100% share reflects that single bulk commit, not deep contribution history; an earlier `src/claude_sql/` tree was retired by this refactor.
+- The five `src/claude_sql/*` layer folders (`core`, `analytics`, `evals`, `provenance`, `app` — PEP 420 namespace sub-packages of the one `claude-sql` package) each carry exactly one commit — they were all created in a single refactor, `a5589ee` "collapse 5-package workspace into one claude-sql package (#81)" (`git log --oneline -- src/claude_sql/`), which folded the short-lived `packages/*` workspace (introduced by `982595b` "split into 5 PEP 420 namespace packages under uv workspace (#60)") back under one distribution. Their 100% share reflects that single bulk commit, not deep contribution history.
 - `.github/workflows` is the only folder where a human is not the top committer: `bonk-ai[bot]` (5 commits) edges Laith (4) and `dependabot[bot]` (3). It remains automation plus one human.
 
 ## Single points of failure
 
-The entire codebase is effectively one owner (see intro). With a human bus factor of one, the mitigation that matters is repository-level rather than per-folder: onboard a second human contributor, add a `CODEOWNERS` file naming a backup reviewer (none exists today), and run a knowledge-transfer pass over the `packages/*` source tree so the namespace-package layout and intent are not held by a single person.
+The entire codebase is effectively one owner (see intro). With a human bus factor of one, the mitigation that matters is repository-level rather than per-folder: onboard a second human contributor, add a `CODEOWNERS` file naming a backup reviewer (none exists today), and run a knowledge-transfer pass over the `src/claude_sql/*` layer source tree so the namespace-sub-package layout and intent are not held by a single person.

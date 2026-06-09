@@ -1,6 +1,6 @@
 # claude-sql · Public API
 
-`claude-sql` is a virtual uv workspace whose five members (`core`, `analytics`, `evals`, `provenance`, `app`) carry docstring-only barrel `__init__.py` files with no re-exports. The public surface below is the set of non-underscore symbols ranked by inbound cross-module import count across `packages/**/*.py`; ties are broken alphabetically. The `claude-sql` distribution also ships a cyclopts CLI binary (`claude-sql = claude_sql.app.cli:main`, `packages/app/pyproject.toml:37`); its command surface is documented in `reference/cli.md`. No HTTP routes exist, so no `## HTTP` section is rendered.
+`claude-sql` is a single package with five layer sub-packages (`core`, `analytics`, `evals`, `provenance`, `app`) under `src/claude_sql/`; each carries a docstring-only barrel `__init__.py` with no re-exports. The public surface below is the set of non-underscore symbols ranked by inbound cross-module import count across `src/claude_sql/**/*.py`; ties are broken alphabetically. The `claude-sql` distribution also ships a cyclopts CLI binary (`claude-sql = claude_sql.app.cli:main`, `pyproject.toml:53`); its command surface is documented in `reference/cli.md`. No HTTP routes exist, so no `## HTTP` section is rendered.
 
 ### Settings
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 ```
 
 Environment-driven settings model (env prefix `CLAUDE_SQL_`) that every package threads through; the dominant public type by inbound references.
-`packages/core/src/claude_sql/core/config.py:126`
+`src/claude_sql/core/config.py:126`
 
 ### iter_part_files
 
@@ -23,7 +23,7 @@ def iter_part_files(target: Path) -> list[Path]:
 ```
 
 Returns a sorted list of parquet files backing a sharded cache directory or a legacy single-file path.
-`packages/core/src/claude_sql/core/parquet_shards.py:72`
+`src/claude_sql/core/parquet_shards.py:72`
 
 ### write_part
 
@@ -32,7 +32,7 @@ def write_part(target: Path, df: pl.DataFrame) -> Path:
 ```
 
 Writes a DataFrame as a new shard in a sharded directory, or appends-and-rewrites the legacy single parquet file.
-`packages/core/src/claude_sql/core/parquet_shards.py:87`
+`src/claude_sql/core/parquet_shards.py:87`
 
 ### read_all
 
@@ -41,7 +41,7 @@ def read_all(target: Path, *, dtypes: dict[str, Any] | None = None) -> pl.DataFr
 ```
 
 Returns the union of all part files (or the legacy single file), or `None` when the cache is empty or missing.
-`packages/core/src/claude_sql/core/parquet_shards.py:131`
+`src/claude_sql/core/parquet_shards.py:131`
 
 ### classify_one
 
@@ -61,7 +61,7 @@ async def classify_one(
 ```
 
 Runs one structured-output Bedrock classification call under a concurrency limiter, returning the parsed payload dict.
-`packages/core/src/claude_sql/core/llm_shared.py:563`
+`src/claude_sql/core/llm_shared.py:563`
 
 ### pipeline_cache_stats
 
@@ -71,7 +71,7 @@ def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
 ```
 
 Context manager that resets, accumulates, then emits-and-clears Bedrock cache-token statistics for a named pipeline.
-`packages/core/src/claude_sql/core/llm_shared.py:259`
+`src/claude_sql/core/llm_shared.py:259`
 
 ### BedrockRefusalError
 
@@ -87,7 +87,7 @@ class BedrockRefusalError(Exception):
 ```
 
 Terminal, non-retryable exception raised when Bedrock declines to classify input under its content policy.
-`packages/core/src/claude_sql/core/llm_shared.py:490`
+`src/claude_sql/core/llm_shared.py:490`
 
 ### loguru_before_sleep
 
@@ -96,7 +96,7 @@ def loguru_before_sleep(level: str = "WARNING") -> Callable[[RetryCallState], No
 ```
 
 Returns a tenacity `before_sleep` callback that logs retry attempts via loguru instead of stdlib logging.
-`packages/core/src/claude_sql/core/logging_setup.py:53`
+`src/claude_sql/core/logging_setup.py:53`
 
 ### session_bounds
 
@@ -110,7 +110,7 @@ def session_bounds(
 ```
 
 Returns `{session_id: (last_ts, transcript_mtime)}` for the requested time window, used to detect which sessions need reprocessing.
-`packages/core/src/claude_sql/core/session_text.py:224`
+`src/claude_sql/core/session_text.py:224`
 
 ### iter_session_texts
 
@@ -125,7 +125,7 @@ def iter_session_texts(
 ```
 
 Yields `(session_id, text)` newest-first for every session with at least one text block, from a single glob scan.
-`packages/core/src/claude_sql/core/session_text.py:371`
+`src/claude_sql/core/session_text.py:371`
 
 ### claude_sql_home
 
@@ -134,7 +134,7 @@ def claude_sql_home() -> Path:
 ```
 
 Returns (creating on first call) the parent directory for every claude-sql derived cache, resolved per-platform from env vars.
-`packages/core/src/claude_sql/core/home.py:51`
+`src/claude_sql/core/home.py:51`
 
 ### run_or_die
 
@@ -148,7 +148,7 @@ def run_or_die(
 ```
 
 Invokes a callable and translates DuckDB and input-validation errors into classified errors with matching process exit codes.
-`packages/core/src/claude_sql/core/output.py:228`
+`src/claude_sql/core/output.py:228`
 
 ### register_all
 
@@ -163,7 +163,7 @@ def register_all(
 ```
 
 Registers raw views, derived views, VSS, analytics, and macros on a DuckDB connection in dependency order.
-`packages/core/src/claude_sql/core/sql_views.py:2078`
+`src/claude_sql/core/sql_views.py:2078`
 
 ### classify_sessions
 
@@ -180,7 +180,7 @@ def classify_sessions(
 ```
 
 Classifies pending sessions and returns the count of successful classifications (or a plan dict in dry-run mode).
-`packages/analytics/src/claude_sql/analytics/classify_worker.py:195`
+`src/claude_sql/analytics/classify_worker.py:195`
 
 ### detect_conflicts
 
@@ -197,7 +197,7 @@ def detect_conflicts(
 ```
 
 Detects stance conflicts per session and returns the count of sessions processed.
-`packages/analytics/src/claude_sql/analytics/conflicts_worker.py:286`
+`src/claude_sql/analytics/conflicts_worker.py:286`
 
 ### detect_user_friction
 
@@ -214,7 +214,7 @@ def detect_user_friction(
 ```
 
 Classifies short user messages for friction signals across the session corpus.
-`packages/analytics/src/claude_sql/analytics/friction_worker.py:655`
+`src/claude_sql/analytics/friction_worker.py:655`
 
 ### trajectory_messages
 
@@ -231,7 +231,7 @@ def trajectory_messages(
 ```
 
 Computes per-session windowed sentiment and transition classifications and returns the count of windows written.
-`packages/analytics/src/claude_sql/analytics/trajectory_worker.py:933`
+`src/claude_sql/analytics/trajectory_worker.py:933`
 
 ### run_clustering
 
@@ -240,7 +240,7 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
 ```
 
 Runs UMAP plus HDBSCAN over the embeddings parquet and returns a counts summary.
-`packages/analytics/src/claude_sql/analytics/cluster_worker.py:50`
+`src/claude_sql/analytics/cluster_worker.py:50`
 
 ### run_communities
 
@@ -256,7 +256,7 @@ def run_communities(
 ```
 
 Runs Leiden plus CPM community detection on session centroids and writes the primary parquet output.
-`packages/analytics/src/claude_sql/analytics/community_worker.py:472`
+`src/claude_sql/analytics/community_worker.py:472`
 
 ### neighbors_of
 
@@ -271,7 +271,7 @@ def neighbors_of(
 ```
 
 Returns the top-k cosine neighbors of a session in centroid space, bypassing Leiden.
-`packages/analytics/src/claude_sql/analytics/community_worker.py:421`
+`src/claude_sql/analytics/community_worker.py:421`
 
 ### run_terms
 
@@ -285,7 +285,7 @@ def run_terms(
 ```
 
 Computes c-TF-IDF top terms per cluster and writes the parquet output.
-`packages/analytics/src/claude_sql/analytics/terms_worker.py:29`
+`src/claude_sql/analytics/terms_worker.py:29`
 
 ### embed_query
 
@@ -294,7 +294,7 @@ def embed_query(text: str, *, settings: Settings) -> list[float]:
 ```
 
 Embeds a single query string for HNSW nearest-neighbor search, forcing a float embedding vector.
-`packages/analytics/src/claude_sql/analytics/embed_worker.py:334`
+`src/claude_sql/analytics/embed_worker.py:334`
 
 ### run_backfill
 
@@ -310,7 +310,7 @@ async def run_backfill(
 ```
 
 Discovers unembedded messages, embeds them, and appends the vectors to the embeddings parquet.
-`packages/analytics/src/claude_sql/analytics/embed_worker.py:365`
+`src/claude_sql/analytics/embed_worker.py:365`
 
 ### Judge
 
@@ -321,7 +321,7 @@ class Judge:
 ```
 
 Frozen dataclass describing one Bedrock foundation model wired into the eval judge panel.
-`packages/evals/src/claude_sql/evals/judges.py:24`
+`src/claude_sql/evals/judges.py:24`
 
 ### resolve
 
@@ -330,7 +330,7 @@ def resolve(name: str) -> Judge:
 ```
 
 Resolves a judge shortname or model ID to a `Judge`, raising `KeyError` with the full catalog on an unknown name.
-`packages/evals/src/claude_sql/evals/judges.py:198`
+`src/claude_sql/evals/judges.py:198`
 
 ### freeze
 
@@ -346,7 +346,7 @@ def freeze(
 ```
 
 Creates and persists a self-contained study manifest (rubric copy plus panel and scope) and returns the `Study`.
-`packages/evals/src/claude_sql/evals/freeze.py:115`
+`src/claude_sql/evals/freeze.py:115`
 
 ### replay
 
@@ -355,7 +355,7 @@ def replay(manifest_sha: str) -> Study:
 ```
 
 Loads a previously-frozen study by its manifest SHA.
-`packages/evals/src/claude_sql/evals/freeze.py:151`
+`src/claude_sql/evals/freeze.py:151`
 
 ### resolve_commit_to_transcript
 
@@ -369,7 +369,7 @@ def resolve_commit_to_transcript(
 ```
 
 Resolves a commit SHA to its bound transcript via the RFC 0001 trailer-first, note-fallback precedence.
-`packages/provenance/src/claude_sql/provenance/binding.py:674`
+`src/claude_sql/provenance/binding.py:674`
 
 ### render_markdown
 
@@ -378,7 +378,7 @@ def render_markdown(sheet: dict[str, Any], metadata: dict[str, Any]) -> str:
 ```
 
 Renders a structured PR review-sheet dict into the canonical Markdown shape.
-`packages/provenance/src/claude_sql/provenance/review_sheet_render.py:68`
+`src/claude_sql/provenance/review_sheet_render.py:68`
 
 ### generate_review_sheet
 
@@ -395,7 +395,7 @@ def generate_review_sheet(
 ```
 
 Produces a PR review sheet for a commit SHA by resolving its bound transcript and running an LLM pass.
-`packages/provenance/src/claude_sql/provenance/review_sheet_worker.py:342`
+`src/claude_sql/provenance/review_sheet_worker.py:342`
 
 ## See also
 
