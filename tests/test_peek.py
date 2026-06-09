@@ -148,6 +148,77 @@ def test_peek_populated_first_assistant_text(
     )
 
 
+def test_peek_isolates_session_from_corpus(
+    tmp_corpus: dict[str, Any],
+    make_session_jsonl: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """peek's tool/sample aggregation must reflect ONLY the target session.
+
+    Regression guard for the projection-scoping rewrite: peek materializes the
+    target session's messages first, then UNNESTs that slice — rather than
+    UNNESTing the whole corpus and filtering ``session_id`` late. A noisy
+    neighbour session with its own distinct tools (``Bash``/``Grep``) and a
+    long assistant reply is written into the same corpus; if the scan ever
+    leaked across sessions, those tools or that text would bleed into sid_one's
+    summary.
+    """
+    from conftest import make_assistant_msg, make_user_msg
+
+    noisy_sid = "99999999-9999-9999-9999-999999999999"
+    proj = tmp_corpus["root"]
+    make_session_jsonl(
+        proj / f"{noisy_sid}.jsonl",
+        messages=[
+            make_user_msg(
+                "n-u1",
+                noisy_sid,
+                "noisy neighbour session whose tools must not leak into sid_one",
+                ts="2026-04-09T08:00:00.000Z",
+            ),
+            make_assistant_msg(
+                "n-a1",
+                noisy_sid,
+                ts="2026-04-09T08:00:05.000Z",
+                content=[
+                    {
+                        "type": "text",
+                        "text": (
+                            "this neighbour assistant reply is long enough to clear "
+                            "the 32-char floor and would corrupt sid_one's sample "
+                            "if the session scope leaked"
+                        ),
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "n-tu1",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "n-tu2",
+                        "name": "Grep",
+                        "input": {"pattern": "x"},
+                    },
+                ],
+            ),
+        ],
+    )
+
+    sid_one = tmp_corpus["session_ids"][0]
+    cli.peek(sid_one, common=_common(tmp_corpus))
+    payload = json.loads(capsys.readouterr().out)
+
+    # sid_one still sees only its own single Read tool — Bash/Grep stay out.
+    assert payload["top_tools"] == [{"name": "Read", "count": 1}]
+    tool_names = {entry["name"] for entry in payload["top_tools"]}
+    assert "Bash" not in tool_names and "Grep" not in tool_names
+    assert payload["roles"] == {"user": 3, "assistant": 1}
+    # The neighbour's long assistant text must not appear as sid_one's sample.
+    assert payload["samples"]["first_assistant_text"] is None
+
+
 def test_peek_session_with_no_tool_calls(
     tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:

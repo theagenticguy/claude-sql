@@ -1099,13 +1099,35 @@ def peek(session_id: str, /, *, common: Common | None = None) -> None:
     fmt = resolve_format(_fmt(common))
     con = _open_connection_full(settings, sql="FROM messages")
     try:
+        # Materialize this session's messages ONCE, then derive the
+        # content-block fan-out (tools, samples) from that slice. DuckDB does
+        # not push the ``session_id`` predicate below the ``content_blocks``
+        # lateral UNNEST (verified via EXPLAIN ANALYZE: the filter lands
+        # *above* the WINDOW / HASH_GROUP_BY, so the view-based shape
+        # TABLE_SCANs + UNNESTs the *whole corpus* once for ``tool_calls`` and
+        # again for ``messages_text``). Scoping to one session first turns two
+        # full-corpus UNNEST passes into one cheap per-session pass — ~5x on a
+        # 300-session corpus, byte-identical output. The ``messages`` filter
+        # below *does* push down, so this single scan is the only corpus-wide
+        # read. The block-level columns mirror the ``content_blocks`` /
+        # ``tool_calls`` / ``messages_text`` view definitions in
+        # ``core/sql_views.py``; keep them in sync if those views change.
+        run_or_die(
+            lambda: con.execute(
+                "CREATE OR REPLACE TEMP TABLE _peek_msgs AS "
+                "SELECT uuid, ts, role, type, is_compact_summary, "
+                "       source_file, content_json "
+                "FROM messages WHERE session_id = ?",
+                [session_id],
+            ),
+            fmt=fmt,
+        )
         header_row = run_or_die(
             lambda: con.execute(
                 "SELECT COUNT(*) AS total_lines, "
                 "MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
                 "ANY_VALUE(source_file) AS source_file "
-                "FROM messages WHERE session_id = ?",
-                [session_id],
+                "FROM _peek_msgs"
             ).fetchone(),
             fmt=fmt,
         )
@@ -1124,30 +1146,50 @@ def peek(session_id: str, /, *, common: Common | None = None) -> None:
 
         roles_rows = run_or_die(
             lambda: con.execute(
-                "SELECT role, COUNT(*) AS n FROM messages "
-                "WHERE session_id = ? GROUP BY role ORDER BY n DESC, role",
-                [session_id],
+                "SELECT role, COUNT(*) AS n FROM _peek_msgs GROUP BY role ORDER BY n DESC, role"
             ).fetchall(),
+            fmt=fmt,
+        )
+        # Session-scoped ``content_blocks`` equivalent: one UNNEST over the
+        # materialized slice, shared by the tools and samples queries below.
+        run_or_die(
+            lambda: con.execute(
+                "CREATE OR REPLACE TEMP TABLE _peek_blocks AS SELECT "
+                "  uuid, ts, role, type AS message_type, "
+                "  json_extract_string(block, '$.type') AS block_type, "
+                "  json_extract_string(block, '$.text') AS text, "
+                "  json_extract_string(block, '$.name') AS tool_name "
+                "FROM _peek_msgs, "
+                "     UNNEST(json_extract(content_json, '$[*]')) AS t(block)"
+            ),
             fmt=fmt,
         )
         tools_rows = run_or_die(
             lambda: con.execute(
-                "SELECT tool_name, COUNT(*) AS n FROM tool_calls "
-                "WHERE session_id = ? AND tool_name IS NOT NULL "
+                "SELECT tool_name, COUNT(*) AS n FROM _peek_blocks "
+                "WHERE block_type = 'tool_use' AND tool_name IS NOT NULL "
                 "GROUP BY tool_name ORDER BY n DESC, tool_name LIMIT ?",
-                [session_id, _PEEK_TOP_TOOLS],
+                [_PEEK_TOP_TOOLS],
             ).fetchall(),
             fmt=fmt,
         )
         samples_rows = run_or_die(
             lambda: con.execute(
-                "WITH ordered AS ("
+                "WITH mt AS ("
+                " SELECT uuid, any_value(ts) AS ts, any_value(role) AS role,"
+                "        string_agg(text, '\n\n') AS text_content"
+                " FROM _peek_blocks"
+                " WHERE block_type = 'text' AND text IS NOT NULL"
+                "   AND length(text) > 0 AND message_type != 'attachment'"
+                " GROUP BY uuid"
+                " HAVING length(string_agg(text, '\n\n')) >= 32"
+                "), ordered AS ("
                 " SELECT role, ts, text_content,"
                 "        row_number() OVER (PARTITION BY role ORDER BY ts, uuid) AS rn_asc,"
                 "        row_number() OVER ("
                 "          PARTITION BY role ORDER BY ts DESC, uuid DESC"
                 "        ) AS rn_desc"
-                " FROM messages_text WHERE session_id = ?"
+                " FROM mt"
                 ") "
                 "SELECT 'first_user' AS slot, ts, text_content FROM ordered "
                 "WHERE role = 'user' AND rn_asc = 1 "
@@ -1156,8 +1198,7 @@ def peek(session_id: str, /, *, common: Common | None = None) -> None:
                 "WHERE role = 'user' AND rn_desc = 1 "
                 "UNION ALL "
                 "SELECT 'first_assistant_text', ts, text_content FROM ordered "
-                "WHERE role = 'assistant' AND rn_asc = 1",
-                [session_id],
+                "WHERE role = 'assistant' AND rn_asc = 1"
             ).fetchall(),
             fmt=fmt,
         )
