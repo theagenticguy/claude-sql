@@ -59,15 +59,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # Astral's first-party setup-uv pinned to v8.1.0 (2026-04 release)
-      # for reproducibility. Bumping this is mechanical when a new
-      # uv comes out — no semver concerns.
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39   # v8.2.0
+      # mise provides `uv` + the project task graph. The build step is
+      # `mise run build`, which bundles all five workspace members into ONE
+      # self-contained claude-sql wheel (see mise-tasks/build-dist). A bare
+      # `uv build` here would emit the empty workspace-root wheel; a
+      # `uv build --package claude-sql` would emit a wheel depending on the
+      # 404-on-PyPI claude-sql-* members. The bundle is the only shape that
+      # `pip install claude-sql` can actually resolve.
+      - uses: jdx/mise-action@v4
       - name: Install Python 3.13
         run: uv python install 3.13
-      - name: Build
-        run: uv build
+      - name: Build (single bundled wheel + sdist)
+        run: mise run build
       # Smoke-test BOTH artifacts: a missing transitive dep manifests
       # only on a clean install, not in the dev venv. Running
       # ``claude-sql --version`` exercises the full import graph

@@ -107,6 +107,9 @@ ignore = [
 # print() at the CLI boundary; T20 must not fire there.
 "**/cli.py" = ["T20"]
 "**/output.py" = ["T20"]
+# Build/release helper scripts print progress to stdout by design; they are
+# tooling, not package code, so the loguru-only T20 ban does not apply.
+"mise-tasks/**" = ["T20"]
 "scripts/**/*" = ["T20", "S101", "ANN"]
 
 [tool.ruff.lint.isort]
@@ -225,6 +228,19 @@ changelog_incremental = true
 changelog_merge_prerelease = true
 allow_abort = false
 allowed_prefixes = ["Merge", "Revert", "Pull request", "fixup!", "squash!"]
+# version_provider = "uv" bumps the workspace ROOT version only. The five
+# members under packages/* carry their own `version = "X.Y.Z"` and would
+# otherwise drift (left at the prior version forever), which is exactly what
+# broke the v1.1.0 release. version_files re-points each member's version line
+# to the new version on every `cz bump`. The `:version` marker scopes the
+# rewrite to the `version = "..."` line so nothing else in the file is touched.
+version_files = [
+    "packages/core/pyproject.toml:version",
+    "packages/analytics/pyproject.toml:version",
+    "packages/evals/pyproject.toml:version",
+    "packages/provenance/pyproject.toml:version",
+    "packages/app/pyproject.toml:version",
+]
 bump_message = "chore(release): $current_version → $new_version"
 pre_bump_hooks = ["uv lock"]
 post_bump_hooks = ["uv sync"]

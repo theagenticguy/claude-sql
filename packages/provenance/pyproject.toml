@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql-provenance"
-version = "1.0.1"
+version = "1.1.0"
 description = "claude-sql provenance: transcript-to-PR binding via commit trailers + git notes; single-shot PR review-sheet."
 readme = "../../README.md"
 license = { text = "Apache-2.0" }
