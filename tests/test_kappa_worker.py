@@ -52,6 +52,47 @@ def test_bootstrap_ci_is_bounded() -> None:
     assert -1.0 <= hi <= 1.0
 
 
+def test_cohens_kappa_precomputed_categories_match() -> None:
+    # Passing the category support explicitly must be byte-identical to
+    # letting cohens_kappa derive it — including categories absent from
+    # the arrays (they contribute pa*pb with pa==0).
+    a = np.array([1, 1, 0, 0, 1, 0])
+    b = np.array([1, 0, 0, 1, 1, 0])
+    auto = kw.cohens_kappa(a, b)
+    explicit = kw.cohens_kappa(a, b, sorted({0, 1}))
+    superset = kw.cohens_kappa(a, b, sorted({0, 1, 2, 3}))  # extra cats are no-ops
+    assert explicit == auto
+    assert superset == auto
+
+
+def test_bootstrap_hoisted_categories_byte_identical() -> None:
+    # The hoisted-category bootstrap must match a per-call recompute
+    # exactly. Bootstrap resamples draw with replacement from the same
+    # arrays, so their support is always a subset of the full arrays'.
+    rng = np.random.default_rng(7)
+    a = rng.integers(0, 4, size=300)
+    b = np.where(rng.random(300) < 0.7, a, rng.integers(0, 4, size=300))
+
+    def bootstrap_per_call(aa, bb, n_bootstrap, seed=kw.RNG_SEED):
+        r = np.random.default_rng(seed)
+        n = len(aa)
+        samples = np.empty(n_bootstrap, dtype=np.float64)
+        for i in range(n_bootstrap):
+            idx = r.integers(0, n, size=n)
+            # recompute support inside the loop (the pre-optimization shape)
+            cats = sorted(set(aa[idx].tolist()) | set(bb[idx].tolist()))
+            samples[i] = kw.cohens_kappa(aa[idx], bb[idx], cats)
+        return (
+            float(np.quantile(samples, 0.025)),
+            float(np.quantile(samples, 0.975)),
+        )
+
+    lo_h, hi_h = kw.bootstrap_kappa_ci(a, b, n_bootstrap=500, seed=42)
+    lo_p, hi_p = bootstrap_per_call(a, b, n_bootstrap=500, seed=42)
+    assert lo_h == lo_p
+    assert hi_h == hi_p
+
+
 def test_compute_pairwise_smoke() -> None:
     df = pl.DataFrame(
         {

@@ -54,16 +54,26 @@ class FleissKappa:
 # ---------------------------------------------------------------------------
 
 
-def cohens_kappa(a: np.ndarray, b: np.ndarray) -> float:
+def cohens_kappa(a: np.ndarray, b: np.ndarray, categories: list[int] | None = None) -> float:
     """Cohen's kappa for two rater arrays of equal length.
 
     Returns 0.0 when observers never disagree *or* agree above chance
     (i.e., ``pe == 1.0``), not NaN, so downstream stats stay valid.
+
+    ``categories`` may be passed pre-computed by a caller that evaluates
+    kappa many times over resamples of the *same* underlying arrays
+    (e.g. ``bootstrap_kappa_ci``). Each bootstrap resample draws with
+    replacement from ``a``/``b``, so its category support is always a
+    subset of the full arrays' — a category absent from a resample
+    contributes ``pa * pb`` with ``pa == 0``, leaving ``pe`` (and the
+    returned kappa) byte-identical to recomputing the set per call. When
+    ``None`` the set is derived from ``a``/``b`` as before.
     """
     assert a.shape == b.shape, f"shape mismatch: {a.shape} vs {b.shape}"  # noqa: S101 — input invariant
     if len(a) == 0:
         return 0.0
-    categories = sorted(set(a.tolist()) | set(b.tolist()))
+    if categories is None:
+        categories = sorted(set(a.tolist()) | set(b.tolist()))
     po = float(np.mean(a == b))
     pe = 0.0
     for c in categories:
@@ -110,10 +120,14 @@ def bootstrap_kappa_ci(
     n = len(a)
     if n == 0:
         return (0.0, 0.0)
+    # Category support is invariant across resamples (sampling with
+    # replacement can only drop categories, never add), so derive it once
+    # instead of rebuilding the set inside every one of n_bootstrap calls.
+    categories = sorted(set(a.tolist()) | set(b.tolist()))
     samples = np.empty(n_bootstrap, dtype=np.float64)
     for i in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
-        samples[i] = cohens_kappa(a[idx], b[idx])
+        samples[i] = cohens_kappa(a[idx], b[idx], categories)
     low = float(np.quantile(samples, (1 - confidence) / 2))
     high = float(np.quantile(samples, 1 - (1 - confidence) / 2))
     return (low, high)
