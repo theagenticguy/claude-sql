@@ -53,8 +53,8 @@ jobs:
       - uses: ./.github/actions/setup-claude-sql
       - name: pytest (+coverage)
         # pytest config drives paths via [tool.pytest.ini_options].testpaths;
-        # --cov=packages walks every workspace member's src.
-        run: uv run pytest --no-header -q --cov=packages --cov-report=xml --cov-report=term
+        # --cov=src covers the single claude-sql package tree.
+        run: uv run pytest --no-header -q --cov=src --cov-report=xml --cov-report=term
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
