@@ -21,9 +21,9 @@ This project is near-solo. `git shortlog -sne --all` lists five identities, but 
 
 Notes on the table:
 
-- The five `src/claude_sql/*` layer folders (`core`, `analytics`, `evals`, `provenance`, `app` — PEP 420 namespace sub-packages of the one `claude-sql` package) each carry exactly one commit — they were all created in a single refactor, `a5589ee` "collapse 5-package workspace into one claude-sql package (#81)" (`git log --oneline -- src/claude_sql/`), which folded the short-lived `packages/*` workspace (introduced by `982595b` "split into 5 PEP 420 namespace packages under uv workspace (#60)") back under one distribution. Their 100% share reflects that single bulk commit, not deep contribution history.
+- The five `src/claude_sql/*` layer folders are `core`, `analytics`, `evals`, `provenance`, and `app` — PEP 420 namespace sub-packages of the one `claude-sql` package. Each carries exactly one commit (`git log --oneline -- src/claude_sql/`). That commit is `a5589ee` (#81), which collapsed the short-lived `packages/*` workspace back under one distribution. The workspace itself had been introduced by `982595b` (#60). So the 100% share reflects a single bulk move, not deep contribution history.
 - `.github/workflows` is the only folder where a human is not the top committer: `bonk-ai[bot]` (5 commits) edges Laith (4) and `dependabot[bot]` (3). It remains automation plus one human.
 
 ## Single points of failure
 
-The entire codebase is effectively one owner (see intro). With a human bus factor of one, the mitigation that matters is repository-level rather than per-folder: onboard a second human contributor, add a `CODEOWNERS` file naming a backup reviewer (none exists today), and run a knowledge-transfer pass over the `src/claude_sql/*` layer source tree so the namespace-sub-package layout and intent are not held by a single person.
+The entire codebase is effectively one owner (see intro). The human bus factor is one, so the mitigation that matters is repository-level, not per-folder. Three steps help: onboard a second human contributor; add a `CODEOWNERS` file naming a backup reviewer, since none exists today; and run a knowledge-transfer pass over `src/claude_sql/*` so the layout and its intent are not held by one person.
