@@ -83,6 +83,16 @@ def test_clustering_smoke(synthetic_settings: Settings) -> None:
     df = pl.read_parquet(synthetic_settings.clusters_parquet_path)
     assert set(df.columns) == {"uuid", "cluster_id", "x", "y", "is_noise"}
     assert len(df) == 250
+    # Pin the column dtypes: the worker hands polars numpy arrays directly
+    # (no .tolist() round-trip), so guard against a numpy dtype silently
+    # widening a column past the pinned schema.
+    assert df.schema == {
+        "uuid": pl.Utf8,
+        "cluster_id": pl.Int32,
+        "x": pl.Float32,
+        "y": pl.Float32,
+        "is_noise": pl.Boolean,
+    }
 
 
 def test_clustering_skips_when_parquet_exists(synthetic_settings: Settings) -> None:
