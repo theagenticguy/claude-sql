@@ -486,7 +486,7 @@ def _sql_uses_catalog(sql: str) -> bool:
     return any(tok in lowered for tok in _VSS_TOKENS)
 
 
-def _emit_worker_result(result: int | dict, common: Common | None, pipeline: str) -> None:
+def _emit_worker_result(result: int | dict[str, Any], common: Common | None, pipeline: str) -> None:
     """Normalize worker results for stdout.
 
     Workers return either an ``int`` (rows processed) or a plan ``dict`` when

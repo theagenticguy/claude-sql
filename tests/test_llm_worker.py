@@ -11,7 +11,7 @@ from claude_sql.core.llm_shared import _invoke_classifier_sync
 from claude_sql.core.schemas import SESSION_CLASSIFICATION_SCHEMA
 
 
-def _make_mock_client(return_payload: dict) -> MagicMock:
+def _make_mock_client(return_payload: dict[str, Any]) -> MagicMock:
     """Return a MagicMock that mimics boto3 bedrock-runtime.invoke_model."""
     client = MagicMock()
     body = json.dumps(return_payload).encode()
@@ -21,7 +21,7 @@ def _make_mock_client(return_payload: dict) -> MagicMock:
     return client
 
 
-def _captured_body(client: MagicMock) -> dict:
+def _captured_body(client: MagicMock) -> dict[str, Any]:
     assert client.invoke_model.called
     kwargs = client.invoke_model.call_args.kwargs
     return json.loads(kwargs["body"])

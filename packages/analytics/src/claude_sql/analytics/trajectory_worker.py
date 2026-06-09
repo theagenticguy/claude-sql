@@ -726,7 +726,7 @@ async def _trajectory_async(
 
     # Group by session to chunk per-session (anchor-sharing requires
     # contiguous windows from the same session in chunk order).
-    by_session: dict[str, list] = defaultdict(list)
+    by_session: dict[str, list[Any]] = defaultdict(list)
     for row in raw_rows:
         by_session[row[0]].append(row)
 

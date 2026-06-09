@@ -134,7 +134,7 @@ def _patch_classify_one(
     async def fake_classify_one(
         client: Any,
         model_id: str,
-        schema: dict,
+        schema: dict[str, Any],
         text: str,
         *,
         max_tokens: int,
@@ -142,7 +142,7 @@ def _patch_classify_one(
         sem: Any,
         system: str | None = None,
         pipeline: str = "classifier",
-    ) -> dict:
+    ) -> dict[str, Any]:
         del client, model_id, schema, max_tokens, thinking_mode, sem, system, pipeline
         seen.append(text)
         result = response_factory(text)

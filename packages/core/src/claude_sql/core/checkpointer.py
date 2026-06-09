@@ -35,6 +35,7 @@ import threading
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -111,8 +112,8 @@ def _migrate_from_duckdb_if_present(new_path: Path) -> None:
         sentinel.touch()
         return
 
-    checkpoint_rows: list[tuple] = []
-    retry_rows: list[tuple] = []
+    checkpoint_rows: list[tuple[Any, ...]] = []
+    retry_rows: list[tuple[Any, ...]] = []
     try:
         old = duckdb.connect(str(legacy), read_only=True)
         try:

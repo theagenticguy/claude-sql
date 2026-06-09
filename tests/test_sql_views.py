@@ -6,6 +6,7 @@ import inspect
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -40,11 +41,11 @@ def _msg(
     *,
     role: str,
     model: str | None,
-    content: list[dict],
-    usage: dict | None = None,
+    content: list[dict[str, Any]],
+    usage: dict[str, Any] | None = None,
     type_: str = "assistant",
     parent: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Build one transcript record in the Claude Code JSONL shape."""
     return {
         "parentUuid": parent,
