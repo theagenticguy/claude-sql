@@ -296,7 +296,7 @@ wheels = [
 
 [[package]]
 name = "claude-sql"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "packages/app" }
 dependencies = [
     { name = "claude-sql-analytics" },
@@ -319,7 +319,7 @@ requires-dist = [
 
 [[package]]
 name = "claude-sql-analytics"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "packages/analytics" }
 dependencies = [
     { name = "anyio" },
@@ -348,7 +348,7 @@ requires-dist = [
 
 [[package]]
 name = "claude-sql-core"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "packages/core" }
 dependencies = [
     { name = "anthropic" },
@@ -383,7 +383,7 @@ requires-dist = [
 
 [[package]]
 name = "claude-sql-evals"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "packages/evals" }
 dependencies = [
     { name = "claude-sql-core" },
@@ -394,7 +394,7 @@ requires-dist = [{ name = "claude-sql-core", editable = "packages/core" }]
 
 [[package]]
 name = "claude-sql-provenance"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "packages/provenance" }
 dependencies = [
     { name = "claude-sql-core" },

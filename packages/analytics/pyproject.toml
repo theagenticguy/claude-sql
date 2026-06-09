@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql-analytics"
-version = "1.0.1"
+version = "1.1.0"
 description = "claude-sql analytics: embed, classify, trajectory, conflicts, friction, cluster, terms, community, ingest."
 readme = "../../README.md"
 license = { text = "Apache-2.0" }

@@ -186,10 +186,15 @@ depends = ["security:bandit", "security:semgrep", "security:osv", "security:leak
 
 [tasks.build]
 description = "Build the publishable claude-sql wheel + sdist into dist/"
-# Build only the binary package; cluster packages are not separately published.
-# The published wheel pulls in claude-sql-{core,analytics,evals,provenance}
-# via [project.dependencies] resolved through [tool.uv.sources].
-run = "uv build --package claude-sql"
+# Delegates to mise-tasks/build-dist, which bundles all five workspace members
+# (core/analytics/evals/provenance/app) into ONE self-contained claude-sql
+# wheel. A bare `uv build --package claude-sql` is WRONG here: it declares the
+# inter-member claude-sql-* packages as runtime deps (wired only via dev-only
+# [tool.uv.sources], absent from published metadata and 404 on PyPI), so
+# `pip install claude-sql` cannot resolve them. The single bundled wheel
+# matches the shape PyPI has always served for this project. See the
+# build-dist task docstring for the full rationale.
+run = "mise run build-dist"
 
 [tasks."tool:install"]
 description = "Install claude-sql as a uv tool (global, isolated venv)"

@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql-evals"
-version = "1.0.1"
+version = "1.1.0"
 description = "claude-sql eval gym: cross-lineage Bedrock judge panels with pre-registered manifests, blind handover, kappa floor."
 readme = "../../README.md"
 license = { text = "Apache-2.0" }
