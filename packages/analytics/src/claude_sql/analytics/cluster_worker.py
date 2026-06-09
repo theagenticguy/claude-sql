@@ -22,7 +22,6 @@ import numpy as np
 import polars as pl
 from loguru import logger
 
-from claude_sql.core import lance_store
 from claude_sql.core.config import Settings
 
 
@@ -33,6 +32,10 @@ def _load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
     through the DuckDB ``message_embeddings`` view) so this worker can run
     independently of view registration on the calling connection.
     """
+    # Deferred so importing this module via the CLI for a non-cluster command
+    # doesn't pull in the ~2.6s lancedb import subtree.
+    from claude_sql.core import lance_store
+
     db = lance_store.connect_db(path)
     if not lance_store._has_table(db, lance_store.TABLE_NAME):
         return [], np.zeros((0, 0), dtype=np.float32)
@@ -65,6 +68,10 @@ def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]
         ``{"total": N, "clusters": K, "noise": M}`` where K excludes the
         noise cluster (label -1).
     """
+    # Deferred (see _load_embeddings) — keeps the lancedb import off the CLI's
+    # module-load path for non-cluster commands.
+    from claude_sql.core import lance_store
+
     out_path = settings.clusters_parquet_path
     in_path = settings.lance_uri
 

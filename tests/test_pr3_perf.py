@@ -16,6 +16,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import redirect_stderr, redirect_stdout
@@ -401,3 +402,41 @@ def test_subprocess_query_select1_no_warnings(
         )
     json.loads(result.stdout)
     assert "WARNING" not in result.stderr.upper()
+
+
+# ---------------------------------------------------------------------------
+# Import hygiene: the CLI module must not eagerly drag in lancedb (~2.6 s of
+# import time) for commands that never touch vectors (--version/--help/peek/
+# classify). embed_worker + cluster_worker defer their ``lance_store`` import
+# into the functions that use it; this pins that invariant so a future
+# module-top ``from claude_sql.core import lance_store`` re-regresses loudly.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_import_does_not_load_lancedb() -> None:
+    """Importing ``claude_sql.app.cli`` must not transitively import lancedb.
+
+    Run in a fresh interpreter so the assertion sees a clean ``sys.modules``
+    (the in-process test suite imports the embed/cluster paths elsewhere,
+    which legitimately load lancedb on demand). lancedb's import subtree is
+    ~2.6 s on this box, paid on every CLI invocation if it leaks back to a
+    module-top import.
+    """
+    probe = (
+        "import sys; import claude_sql.app.cli; "
+        "leaked = sorted(m for m in sys.modules if m == 'lancedb' or m.startswith('lancedb.')); "
+        "print('|'.join(leaked))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, f"import probe failed: {result.stderr[:500]}"
+    leaked = result.stdout.strip()
+    assert not leaked, (
+        "claude_sql.app.cli eagerly imported lancedb modules "
+        f"({leaked}); defer the lance_store import into the function that uses it"
+    )

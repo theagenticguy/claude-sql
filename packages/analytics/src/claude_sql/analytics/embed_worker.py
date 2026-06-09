@@ -38,7 +38,6 @@ from tenacity import (
     wait_exponential,
 )
 
-from claude_sql.core import lance_store
 from claude_sql.core.config import Settings
 from claude_sql.core.llm_shared import _build_bedrock_client
 from claude_sql.core.logging_setup import loguru_before_sleep
@@ -134,6 +133,11 @@ def discover_unembedded(
     list of (uuid, text) tuples
         Messages needing embedding, in DuckDB's scan order.
     """
+    # Deferred so importing this module (e.g. via the CLI for a non-embed
+    # command) doesn't drag in the ~2.6s lancedb import subtree. lance_store
+    # is only touched once an embed-path function actually runs.
+    from claude_sql.core import lance_store
+
     # Read the already-embedded uuids straight from Lance via its Python API.
     # We don't go through the DuckDB ``message_embeddings`` view here because
     # the embed command runs with ``register_vss`` skipped (cli.py:1205-1213),
@@ -435,6 +439,10 @@ async def run_backfill(
             "limit": limit,
             "dry_run": True,
         }
+
+    # Deferred (see discover_unembedded) — keeps the lancedb import off the
+    # dry-run / nothing-pending paths above, which return before this point.
+    from claude_sql.core import lance_store
 
     # Checkpoint every N messages so a throttling-induced timeout doesn't
     # discard work already embedded. chunk must be a multiple of batch_size.
