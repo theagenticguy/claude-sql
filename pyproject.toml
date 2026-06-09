@@ -1,13 +1,56 @@
 [project]
-name = "claude-sql-workspace"
-version = "1.1.0"
-description = "Workspace root for claude-sql packages (core, analytics, evals, provenance, app). The publishable binary is `claude-sql` from packages/app."
+name = "claude-sql"
+version = "1.1.1"
+description = "Zero-copy SQL + semantic search + LLM analytics over ~/.claude/ transcripts."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Laith Al-Saadoon", email = "lalsaado@amazon.com" }]
 requires-python = ">=3.13"
-# Virtual root: no runtime deps. The five workspace members own those.
-dependencies = []
+keywords = [
+    "claude", "claude-code", "anthropic", "duckdb", "sql",
+    "semantic-search", "embeddings", "bedrock", "transcripts",
+    "analytics", "observability",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anthropic>=0.40",
+    "anyio>=4.13.0",
+    "boto3>=1.42.91",
+    "cyclopts>=4.10.2",
+    "duckdb>=1.5.2,<2",
+    "hdbscan>=0.8.40",
+    "igraph>=1.0.0,<2.0",
+    "lancedb>=0.30,<0.31",
+    "leidenalg>=0.11.0,<0.12",
+    "loguru>=0.7.3",
+    "numpy>=2.4.4",
+    "packaging>=26.2",
+    "polars>=1.40.0",
+    "pyarrow>=23.0.1",
+    "pydantic>=2.13.2",
+    "pydantic-settings>=2.13.1",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.5",
+    "scipy>=1.13",
+    "tenacity>=9.1.4",
+    "tiktoken>=0.12.0",
+    "umap-learn>=0.5.12",
+]
+
+[project.scripts]
+claude-sql = "claude_sql.app.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/theagenticguy/claude-sql"
@@ -15,17 +58,22 @@ Repository = "https://github.com/theagenticguy/claude-sql"
 Issues = "https://github.com/theagenticguy/claude-sql/issues"
 Changelog = "https://github.com/theagenticguy/claude-sql/blob/main/CHANGELOG.md"
 
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12"]
+build-backend = "uv_build"
+
+# Single package, one namespace root with five layer sub-packages
+# (core / analytics / evals / provenance / app) under src/claude_sql/.
+# `namespace = true` lets uv_build pick up every sub-package under the
+# claude_sql.* namespace without enumerating each. `claude-sql` builds as
+# ONE self-contained wheel — `uv build` Just Works, no bundle step.
+[tool.uv.build-backend]
+module-name = "claude_sql"
+namespace = true
+
 # ---------------------------------------------------------------------------
-# uv — reproducibility + host-python independence + workspace topology.
+# uv — reproducibility + host-python independence.
 # ---------------------------------------------------------------------------
-#
-# `package = false` makes this a virtual project: uv does NOT try to build
-# or install the workspace root as a package. The five members under
-# packages/* are the publishable units; the root is the conductor.
-#
-# `[tool.uv.workspace]` + `[tool.uv.sources]` wire each member as an
-# editable workspace dependency. uv resolves a single uv.lock for every
-# member, and `uv sync` installs the whole graph editable.
 [tool.uv]
 required-version = ">=0.11.7"
 resolution = "highest"
@@ -33,17 +81,6 @@ python-preference = "only-managed"
 python-downloads = "automatic"
 compile-bytecode = true
 link-mode = "clone"
-package = false
-
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-claude-sql-core = { workspace = true }
-claude-sql-analytics = { workspace = true }
-claude-sql-evals = { workspace = true }
-claude-sql-provenance = { workspace = true }
-claude-sql = { workspace = true }
 
 # Named indexes for ``uv publish --index <name>``.  TestPyPI is the
 # dry-run target; production PyPI is the implicit default.
@@ -67,12 +104,12 @@ dev = [
 ]
 
 # ---------------------------------------------------------------------------
-# ruff — workspace-wide config; paths expanded for packages/*/src layout.
+# ruff — single src/ tree.
 # ---------------------------------------------------------------------------
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-src = ["packages/core/src", "packages/analytics/src", "packages/evals/src", "packages/provenance/src", "packages/app/src", "tests"]
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -102,14 +139,12 @@ ignore = [
     "SLF001", "PT011", "PT018", "D",
 ]
 "**/__init__.py" = ["F401", "E402"]
-# Glob-style keys so the ignores travel with the file regardless of which
-# package it lands in. ``cli.py`` and ``output.py`` legitimately call
+# Glob-style keys so the ignores travel with the file regardless of where
+# it lands in the tree. ``cli.py`` and ``output.py`` legitimately call
 # print() at the CLI boundary; T20 must not fire there.
 "**/cli.py" = ["T20"]
 "**/output.py" = ["T20"]
-# Build/release helper scripts print progress to stdout by design; they are
-# tooling, not package code, so the loguru-only T20 ban does not apply.
-"mise-tasks/**" = ["T20"]
+# Build/release helper scripts print progress to stdout by design.
 "scripts/**/*" = ["T20", "S101", "ANN"]
 
 [tool.ruff.lint.isort]
@@ -151,30 +186,16 @@ docstring-code-format = true
 docstring-code-line-length = "dynamic"
 
 # ---------------------------------------------------------------------------
-# ty — workspace-wide; root expands to every member's src + tests.
+# ty — single src/ tree.
 # ---------------------------------------------------------------------------
 [tool.ty.environment]
 python-version = "3.13"
 python-platform = "linux"
 python = ".venv"
-root = [
-    "./packages/core/src",
-    "./packages/analytics/src",
-    "./packages/evals/src",
-    "./packages/provenance/src",
-    "./packages/app/src",
-    "./tests",
-]
+root = ["./src", "./tests"]
 
 [tool.ty.src]
-include = [
-    "packages/core/src",
-    "packages/analytics/src",
-    "packages/evals/src",
-    "packages/provenance/src",
-    "packages/app/src",
-    "tests",
-]
+include = ["src", "tests"]
 respect-ignore-files = true
 
 [tool.ty.terminal]
@@ -198,23 +219,22 @@ possibly-missing-attribute = "warn"
 unused-ignore-comment = "warn"
 
 # ---------------------------------------------------------------------------
-# bandit — invoked via `bandit -r packages -c pyproject.toml`.
+# bandit — invoked via `bandit -r src -c pyproject.toml`.
 # ---------------------------------------------------------------------------
 [tool.bandit]
 exclude_dirs = ["tests", ".venv", ".erpaval", "docs"]
 skips = ["B101", "B404", "B603", "B607", "B608"]
 
 # ---------------------------------------------------------------------------
-# pytest — single tree at workspace root.
+# pytest — single tree at repo root.
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
 
 # ---------------------------------------------------------------------------
-# Commitizen — Strategy A: single workspace-root cz, lockstep release.
-# Per .erpaval/sessions/session-444fc0/research-uv-recipes.md §5d: defer
-# per-package CHANGELOG to a future repo split.
+# Commitizen — single package, single version. `version_provider = "uv"`
+# reads/writes [project].version here; one tag, one CHANGELOG.
 # ---------------------------------------------------------------------------
 [tool.commitizen]
 name = "cz_conventional_commits"
@@ -228,35 +248,18 @@ changelog_incremental = true
 changelog_merge_prerelease = true
 allow_abort = false
 allowed_prefixes = ["Merge", "Revert", "Pull request", "fixup!", "squash!"]
-# version_provider = "uv" bumps the workspace ROOT version only. The five
-# members under packages/* carry their own `version = "X.Y.Z"` and would
-# otherwise drift (left at the prior version forever), which is exactly what
-# broke the v1.1.0 release. version_files re-points each member's version line
-# to the new version on every `cz bump`. The `:version` marker scopes the
-# rewrite to the `version = "..."` line so nothing else in the file is touched.
-version_files = [
-    "packages/core/pyproject.toml:version",
-    "packages/analytics/pyproject.toml:version",
-    "packages/evals/pyproject.toml:version",
-    "packages/provenance/pyproject.toml:version",
-    "packages/app/pyproject.toml:version",
-]
 bump_message = "chore(release): $current_version → $new_version"
 pre_bump_hooks = ["uv lock"]
 post_bump_hooks = ["uv sync"]
 
 # ---------------------------------------------------------------------------
-# import-linter — layered DAG enforcement.
+# import-linter — layered DAG enforcement, now intra-package.
 # core (L0) < {analytics, evals, provenance} (L1 siblings) < app (L2).
+# The layers live under one distribution but the architectural boundary
+# is still enforced so the modules can't quietly entangle.
 # ---------------------------------------------------------------------------
 [tool.importlinter]
-root_packages = [
-    "claude_sql.core",
-    "claude_sql.analytics",
-    "claude_sql.evals",
-    "claude_sql.provenance",
-    "claude_sql.app",
-]
+root_packages = ["claude_sql"]
 
 [[tool.importlinter.contracts]]
 name = "claude-sql layered architecture"

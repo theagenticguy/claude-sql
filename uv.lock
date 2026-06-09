@@ -2,16 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.13"
 
-[manifest]
-members = [
-    "claude-sql",
-    "claude-sql-analytics",
-    "claude-sql-core",
-    "claude-sql-evals",
-    "claude-sql-provenance",
-    "claude-sql-workspace",
-]
-
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -296,117 +286,32 @@ wheels = [
 
 [[package]]
 name = "claude-sql"
-version = "1.1.0"
-source = { editable = "packages/app" }
-dependencies = [
-    { name = "claude-sql-analytics" },
-    { name = "claude-sql-core" },
-    { name = "claude-sql-evals" },
-    { name = "claude-sql-provenance" },
-    { name = "cyclopts" },
-    { name = "packaging" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "claude-sql-analytics", editable = "packages/analytics" },
-    { name = "claude-sql-core", editable = "packages/core" },
-    { name = "claude-sql-evals", editable = "packages/evals" },
-    { name = "claude-sql-provenance", editable = "packages/provenance" },
-    { name = "cyclopts", specifier = ">=4.10.2" },
-    { name = "packaging", specifier = ">=26.2" },
-]
-
-[[package]]
-name = "claude-sql-analytics"
-version = "1.1.0"
-source = { editable = "packages/analytics" }
-dependencies = [
-    { name = "anyio" },
-    { name = "claude-sql-core" },
-    { name = "hdbscan" },
-    { name = "igraph" },
-    { name = "leidenalg" },
-    { name = "numpy" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "umap-learn" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anyio", specifier = ">=4.13.0" },
-    { name = "claude-sql-core", editable = "packages/core" },
-    { name = "hdbscan", specifier = ">=0.8.40" },
-    { name = "igraph", specifier = ">=1.0.0,<2.0" },
-    { name = "leidenalg", specifier = ">=0.11.0,<0.12" },
-    { name = "numpy", specifier = ">=2.4.4" },
-    { name = "scikit-learn", specifier = ">=1.5" },
-    { name = "scipy", specifier = ">=1.13" },
-    { name = "umap-learn", specifier = ">=0.5.12" },
-]
-
-[[package]]
-name = "claude-sql-core"
-version = "1.1.0"
-source = { editable = "packages/core" }
+version = "1.1.1"
+source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "anyio" },
     { name = "boto3" },
+    { name = "cyclopts" },
     { name = "duckdb" },
+    { name = "hdbscan" },
+    { name = "igraph" },
     { name = "lancedb" },
+    { name = "leidenalg" },
     { name = "loguru" },
+    { name = "numpy" },
+    { name = "packaging" },
     { name = "polars" },
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "tenacity" },
     { name = "tiktoken" },
+    { name = "umap-learn" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", specifier = ">=0.40" },
-    { name = "boto3", specifier = ">=1.42.91" },
-    { name = "duckdb", specifier = ">=1.5.2,<2" },
-    { name = "lancedb", specifier = ">=0.30,<0.31" },
-    { name = "loguru", specifier = ">=0.7.3" },
-    { name = "polars", specifier = ">=1.40.0" },
-    { name = "pyarrow", specifier = ">=23.0.1" },
-    { name = "pydantic", specifier = ">=2.13.2" },
-    { name = "pydantic-settings", specifier = ">=2.13.1" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "tenacity", specifier = ">=9.1.4" },
-    { name = "tiktoken", specifier = ">=0.12.0" },
-]
-
-[[package]]
-name = "claude-sql-evals"
-version = "1.1.0"
-source = { editable = "packages/evals" }
-dependencies = [
-    { name = "claude-sql-core" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "claude-sql-core", editable = "packages/core" }]
-
-[[package]]
-name = "claude-sql-provenance"
-version = "1.1.0"
-source = { editable = "packages/provenance" }
-dependencies = [
-    { name = "claude-sql-core" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "claude-sql-core", editable = "packages/core" }]
-
-[[package]]
-name = "claude-sql-workspace"
-version = "1.1.0"
-source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
@@ -422,6 +327,30 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "anthropic", specifier = ">=0.40" },
+    { name = "anyio", specifier = ">=4.13.0" },
+    { name = "boto3", specifier = ">=1.42.91" },
+    { name = "cyclopts", specifier = ">=4.10.2" },
+    { name = "duckdb", specifier = ">=1.5.2,<2" },
+    { name = "hdbscan", specifier = ">=0.8.40" },
+    { name = "igraph", specifier = ">=1.0.0,<2.0" },
+    { name = "lancedb", specifier = ">=0.30,<0.31" },
+    { name = "leidenalg", specifier = ">=0.11.0,<0.12" },
+    { name = "loguru", specifier = ">=0.7.3" },
+    { name = "numpy", specifier = ">=2.4.4" },
+    { name = "packaging", specifier = ">=26.2" },
+    { name = "polars", specifier = ">=1.40.0" },
+    { name = "pyarrow", specifier = ">=23.0.1" },
+    { name = "pydantic", specifier = ">=2.13.2" },
+    { name = "pydantic-settings", specifier = ">=2.13.1" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "scikit-learn", specifier = ">=1.5" },
+    { name = "scipy", specifier = ">=1.13" },
+    { name = "tenacity", specifier = ">=9.1.4" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
+    { name = "umap-learn", specifier = ">=0.5.12" },
+]
 
 [package.metadata.requires-dev]
 dev = [
