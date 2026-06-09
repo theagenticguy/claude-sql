@@ -143,7 +143,7 @@ async def _conflicts_async(
     _purge_legacy_shards(settings.conflicts_parquet_path)
 
     already: set[str] = set()
-    done_df = read_all(settings.conflicts_parquet_path)
+    done_df = read_all(settings.conflicts_parquet_path, columns=["session_id"])
     if done_df is not None and done_df.height > 0:
         already = set(done_df["session_id"].to_list())
 
@@ -304,7 +304,7 @@ def detect_conflicts(
     thinking_mode = "disabled" if no_thinking else settings.classify_thinking
     if dry_run:
         already: set[str] = set()
-        done_df = read_all(settings.conflicts_parquet_path)
+        done_df = read_all(settings.conflicts_parquet_path, columns=["session_id"])
         if done_df is not None and done_df.height > 0:
             already = set(done_df["session_id"].to_list())
         pending_count = _count_pending_sessions(

@@ -428,7 +428,7 @@ async def _classify_async(
     """Async body behind :func:`detect_user_friction`."""
     out_path = settings.user_friction_parquet_path
     already: set[str] = set()
-    done_df = read_all(out_path)
+    done_df = read_all(out_path, columns=["uuid"])
     if done_df is not None and done_df.height > 0:
         already = set(done_df["uuid"].to_list())
 
