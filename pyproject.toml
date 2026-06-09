@@ -1,6 +1,6 @@
 [project]
 name = "claude-sql-workspace"
-version = "1.0.1"
+version = "1.1.0"
 description = "Workspace root for claude-sql packages (core, analytics, evals, provenance, app). The publishable binary is `claude-sql` from packages/app."
 readme = "README.md"
 license = { text = "Apache-2.0" }

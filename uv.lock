@@ -405,7 +405,7 @@ requires-dist = [{ name = "claude-sql-core", editable = "packages/core" }]
 
 [[package]]
 name = "claude-sql-workspace"
-version = "1.0.1"
+version = "1.1.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
