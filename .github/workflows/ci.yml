@@ -56,7 +56,7 @@ jobs:
         # --cov=packages walks every workspace member's src.
         run: uv run pytest --no-header -q --cov=packages --cov-report=xml --cov-report=term
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
           flags: unittests
