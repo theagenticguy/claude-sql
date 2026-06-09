@@ -1,8 +1,8 @@
 # claude-sql · Doc tree
 
-Comprehensive codebase documentation for `claude-sql`.
+Generated codebase docs for `claude-sql`.
 
-Prose is generated; structure is mechanical. Cross-references are deterministic. Generated against commit `982595b` (one package with five PEP 420 layer sub-packages under `src/claude_sql/`).
+Prose is generated; structure is mechanical; cross-references are deterministic. Built against commit `a5589ee`: one package, five PEP 420 layer sub-packages under `src/claude_sql/`.
 
 ## Architecture
 
