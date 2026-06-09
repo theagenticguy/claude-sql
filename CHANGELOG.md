@@ -1,3 +1,31 @@
+## v1.1.0 (2026-06-09)
+
+### Feat
+
+- **s3**: read transcripts from an S3 source (claude-agent-sdk SessionStore) (#66)
+- **cli**: add peek subcommand for session introspection (#51) (#59)
+
+### Fix
+
+- **types**: parameterize bare dict/list/tuple for ty 0.0.46 (#78)
+- **sql_views**: cast parent_uuid to VARCHAR so recursive CTEs work (#47) (#58)
+- **sql_views**: read-side dedup for message_trajectory (#46) (#57)
+
+### Refactor
+
+- **workspace**: split into 5 PEP 420 namespace packages under uv workspace (#60)
+
+### Perf
+
+- **cluster**: hand polars numpy arrays directly in the clusters output frame (#74)
+- **cli**: scope peek's UNNEST to one session, not the whole corpus (~5x) (#72)
+- **workers**: project read_all to key column in LLM-worker anti-joins (#70)
+- **lance**: column-project the uuid anti-join scan in get_embedded_uuids (#71)
+- **kappa**: hoist category support out of the Cohen's-kappa bootstrap loop (#73)
+- **cli**: defer lancedb import out of the CLI module-load path (~1.5s) (#77)
+- **community**: zero-copy embedding extraction in session centroids (#68)
+- **community**: segmented numpy mean for session centroids (#65)
+
 ## v1.0.1 (2026-05-14)
 
 ### Fix
