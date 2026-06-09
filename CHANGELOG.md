@@ -1,3 +1,13 @@
+## v1.1.1 (2026-06-09)
+
+### Fix
+
+- **release**: bundle 5 workspace members into one publishable claude-sql wheel (#80)
+
+### Refactor
+
+- **workspace**: collapse 5-package workspace into one claude-sql package (#81)
+
 ## v1.1.0 (2026-06-09)
 
 ### Feat
