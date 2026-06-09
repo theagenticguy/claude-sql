@@ -69,6 +69,30 @@ def test_has_table_returns_false_when_dataset_empty(tmp_path: Path) -> None:
     assert lance_store._has_table(db, lance_store.TABLE_NAME) is False
 
 
+def test_get_embedded_uuids_empty_when_no_table(tmp_path: Path) -> None:
+    """A fresh URI with no embeddings table yields an empty set, not an error."""
+    assert lance_store.get_embedded_uuids(tmp_path / "lance_absent") == set()
+
+
+def test_get_embedded_uuids_returns_full_set_above_default_limit(tmp_path: Path) -> None:
+    """The projected uuid scan must return EVERY row, not LanceDB's default 10.
+
+    ``get_embedded_uuids`` switched from ``to_arrow().select(["uuid"])`` (which
+    decodes the full N×dim float matrix) to a column-projected
+    ``search().select(["uuid"]).limit(count_rows())`` scan. The explicit limit
+    is load-bearing: a ``search()`` query without one caps at 10 rows, which
+    would silently truncate the anti-join set and re-embed everything past the
+    first 10 messages. Seed 25 rows (> 10) and assert all 25 come back.
+    """
+    lance_uri = tmp_path / "lance_many"
+    expected = {f"uuid-{i:03d}" for i in range(25)}
+    for u in sorted(expected):
+        _seed_one_row(lance_uri, u, dim=4)
+
+    got = lance_store.get_embedded_uuids(lance_uri)
+    assert got == expected, f"expected {len(expected)} uuids, got {len(got)}"
+
+
 def test_register_vss_empty_namespace_creates_fallback_table(tmp_path: Path) -> None:
     """Empty Lance dir: register_vss creates an empty ``message_embeddings`` and returns False.
 
