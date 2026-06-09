@@ -8,12 +8,12 @@ subset validator.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-def _bedrock_schema(model: type[BaseModel]) -> dict:
+def _bedrock_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Turn a pydantic v2 BaseModel into a Bedrock-compatible JSON Schema.
 
     Bedrock's structured output only accepts JSON Schema Draft 2020-12 SUBSET.
@@ -36,7 +36,7 @@ def _bedrock_schema(model: type[BaseModel]) -> dict:
     return _flatten(raw)
 
 
-def _flatten(schema: dict, defs: dict | None = None) -> dict:
+def _flatten(schema: dict[str, Any], defs: dict[str, Any] | None = None) -> dict[str, Any]:
     """Recursively inline $ref references and add additionalProperties: false.
 
     Uses ``$defs`` from the root schema as the lookup table for inlining.
@@ -58,7 +58,7 @@ def _flatten(schema: dict, defs: dict | None = None) -> dict:
     """
     if defs is None:
         defs = schema.get("$defs") or schema.get("definitions") or {}
-    out: dict = {}
+    out: dict[str, Any] = {}
     for k, v in schema.items():
         if k in ("$defs", "definitions"):
             continue
@@ -167,7 +167,7 @@ class SessionClassification(BaseModel):
     )
 
 
-SESSION_CLASSIFICATION_SCHEMA: dict = _bedrock_schema(SessionClassification)
+SESSION_CLASSIFICATION_SCHEMA: dict[str, Any] = _bedrock_schema(SessionClassification)
 
 
 class TrajectoryWindow(BaseModel):
@@ -286,7 +286,7 @@ class TrajectoryArrayResult(BaseModel):
     )
 
 
-TRAJECTORY_ARRAY_SCHEMA: dict = _bedrock_schema(TrajectoryArrayResult)
+TRAJECTORY_ARRAY_SCHEMA: dict[str, Any] = _bedrock_schema(TrajectoryArrayResult)
 
 
 class ConflictPair(BaseModel):
@@ -400,7 +400,7 @@ class ConflictsResult(BaseModel):
     )
 
 
-SESSION_CONFLICTS_SCHEMA: dict = _bedrock_schema(ConflictsResult)
+SESSION_CONFLICTS_SCHEMA: dict[str, Any] = _bedrock_schema(ConflictsResult)
 
 
 class UserFrictionSignal(BaseModel):
@@ -471,7 +471,7 @@ class UserFrictionSignal(BaseModel):
     )
 
 
-USER_FRICTION_SCHEMA: dict = _bedrock_schema(UserFrictionSignal)
+USER_FRICTION_SCHEMA: dict[str, Any] = _bedrock_schema(UserFrictionSignal)
 
 
 class Correction(BaseModel):
@@ -577,7 +577,7 @@ class PRReviewSheet(BaseModel):
     )
 
 
-PR_REVIEW_SHEET_SCHEMA: dict = _bedrock_schema(PRReviewSheet)
+PR_REVIEW_SHEET_SCHEMA: dict[str, Any] = _bedrock_schema(PRReviewSheet)
 
 
 __all__ = [

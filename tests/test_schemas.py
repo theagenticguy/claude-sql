@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from claude_sql.core.schemas import (
     PR_REVIEW_SHEET_SCHEMA,
@@ -19,9 +20,9 @@ from claude_sql.core.schemas import (
 )
 
 
-def _walk(schema: dict) -> list[dict]:
+def _walk(schema: dict[str, Any]) -> list[dict[str, Any]]:
     """Yield every dict in a nested schema (for assertions)."""
-    out: list[dict] = [schema]
+    out: list[dict[str, Any]] = [schema]
     for v in schema.values():
         if isinstance(v, dict):
             out.extend(_walk(v))

@@ -83,7 +83,7 @@ _RETRY_CODES: set[str] = {
 _BEDROCK_TRACE_PATH = os.environ.get("CLAUDE_SQL_BEDROCK_TRACE")
 
 
-def cacheable_text_block(text: str, ttl: str = "5m") -> dict:
+def cacheable_text_block(text: str, ttl: str = "5m") -> dict[str, Any]:
     """Return a content block with ephemeral ``cache_control`` attached.
 
     Helper for per-stage request-body builders that want to mark a stable
@@ -101,7 +101,7 @@ def cacheable_text_block(text: str, ttl: str = "5m") -> dict:
     return {"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": ttl}}
 
 
-def build_system_content_block(text: str, *, ttl: str = "1h") -> dict:
+def build_system_content_block(text: str, *, ttl: str = "1h") -> dict[str, Any]:
     """Return the system-block dict carried in the Bedrock ``system`` field.
 
     Same shape as :func:`cacheable_text_block` but defaults to ``ttl="1h"``
@@ -159,7 +159,7 @@ def _empty_cache_stats() -> dict[str, int]:
     }
 
 
-def extract_usage_metrics(payload: dict) -> dict[str, int]:
+def extract_usage_metrics(payload: dict[str, Any]) -> dict[str, int]:
     """Pull the six accumulator fields out of one Bedrock response.
 
     Handles both the legacy shape (``cache_creation_input_tokens`` only,
@@ -190,7 +190,7 @@ def extract_usage_metrics(payload: dict) -> dict[str, int]:
     }
 
 
-def _accumulate_cache_stats(pipeline: str, payload: dict) -> None:
+def _accumulate_cache_stats(pipeline: str, payload: dict[str, Any]) -> None:
     """Add this response's usage to the accumulator under ``pipeline``.
 
     No-op when no ``pipeline_cache_stats`` block is active for this
@@ -282,7 +282,9 @@ def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
         pipeline_finalize(pipeline)
 
 
-def maybe_log_bedrock_call(pipeline: str, model_id: str, payload: dict, elapsed_ms: float) -> None:
+def maybe_log_bedrock_call(
+    pipeline: str, model_id: str, payload: dict[str, Any], elapsed_ms: float
+) -> None:
     """Append a single trace row when ``CLAUDE_SQL_BEDROCK_TRACE`` is set
     and feed the per-pipeline cache-stat accumulator.
 
@@ -402,14 +404,14 @@ def _build_bedrock_client(settings: Settings) -> Any:
 def _invoke_classifier_sync(
     client: Any,
     model_id: str,
-    schema: dict,
+    schema: dict[str, Any],
     user_text: str,
     *,
     max_tokens: int,
     thinking_mode: str,
     system: str | None = None,
     pipeline: str = "classifier",
-) -> dict:
+) -> dict[str, Any]:
     """One Bedrock ``invoke_model`` call with ``output_config.format`` structured output.
 
     Parameters
@@ -497,7 +499,7 @@ class BedrockRefusalError(Exception):
     """
 
 
-def _parse_structured_payload(payload: dict) -> dict:
+def _parse_structured_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Pull the structured JSON object out of a Bedrock response.
 
     Four shapes observed in production (2026-04):
@@ -563,7 +565,7 @@ def _parse_structured_payload(payload: dict) -> dict:
 async def classify_one(
     client: Any,
     model_id: str,
-    schema: dict,
+    schema: dict[str, Any],
     text: str,
     *,
     max_tokens: int,
@@ -571,7 +573,7 @@ async def classify_one(
     sem: asyncio.Semaphore | anyio.CapacityLimiter,
     system: str | None = None,
     pipeline: str = "classifier",
-) -> dict:
+) -> dict[str, Any]:
     """Run one classification call under the concurrency limiter.
 
     ``sem`` accepts either an ``asyncio.Semaphore`` (legacy) or an

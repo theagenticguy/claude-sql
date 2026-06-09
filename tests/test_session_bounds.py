@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -17,7 +18,7 @@ def _write_session_jsonl(
     path: Path,
     *,
     session_id: str,
-    messages: list[dict],
+    messages: list[dict[str, Any]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
@@ -26,7 +27,7 @@ def _write_session_jsonl(
             fh.write("\n")
 
 
-def _user_text_record(uuid: str, session_id: str, ts: str, text: str) -> dict:
+def _user_text_record(uuid: str, session_id: str, ts: str, text: str) -> dict[str, Any]:
     return {
         "parentUuid": None,
         "isSidechain": False,

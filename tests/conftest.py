@@ -43,9 +43,9 @@ def _msg(
     role: str = "user",
     type_: str | None = None,
     model: str | None = None,
-    content: list[dict] | None = None,
+    content: list[dict[str, Any]] | None = None,
     parent: str | None = None,
-    usage: dict | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one Claude Code transcript record in the v1 JSONL shape."""
     return {
@@ -104,7 +104,7 @@ def make_assistant_msg(
     session_id: str,
     *,
     ts: str | None = None,
-    content: list[dict] | None = None,
+    content: list[dict[str, Any]] | None = None,
     model: str = "claude-sonnet-4-6",
 ) -> dict[str, Any]:
     """Assistant-role message; supply your own ``content`` blocks for tool_use."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -36,10 +37,10 @@ def _msg(
     *,
     role: str,
     model: str | None,
-    content: list[dict],
+    content: list[dict[str, Any]],
     type_: str = "assistant",
     parent: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     return {
         "parentUuid": parent,
         "isSidechain": False,

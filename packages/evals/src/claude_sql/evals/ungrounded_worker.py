@@ -27,6 +27,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
@@ -99,9 +100,9 @@ def count_in(haystack: str, needle: str) -> int:
     return haystack.count(needle)
 
 
-def check_claims(claims: Iterable[Claim], tool_output_text: str) -> list[dict]:
+def check_claims(claims: Iterable[Claim], tool_output_text: str) -> list[dict[str, Any]]:
     """For each claim, count hits in the tool-output text and decide grounded."""
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for claim in claims:
         hits = count_in(tool_output_text, claim.entity)
         rows.append(
@@ -132,7 +133,7 @@ class Turn:
 
 def detect(turns: list[Turn], freeze_sha: str) -> pl.DataFrame:
     """Run the detector over a batch of turns; return a parquet-shaped frame."""
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for t in turns:
         claims = extract_claims(t.assistant_text)
         checked = check_claims(claims, t.tool_output_text)

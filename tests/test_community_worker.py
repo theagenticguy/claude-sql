@@ -6,6 +6,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import numpy as np
@@ -26,11 +27,11 @@ from claude_sql.core.config import Settings
 from claude_sql.core.sql_views import register_raw, register_views, register_vss
 
 
-def _write_jsonl(path: Path, records: list[dict]) -> None:
+def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
 
 
-def _msg(uuid: str, session_id: str, ts: str, *, role: str, text: str) -> dict:
+def _msg(uuid: str, session_id: str, ts: str, *, role: str, text: str) -> dict[str, Any]:
     return {
         "parentUuid": None,
         "isSidechain": False,
