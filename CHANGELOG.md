@@ -1,3 +1,9 @@
+## v1.1.2 (2026-06-10)
+
+### Perf
+
+- **cli**: defer heavy worker imports out of the CLI module-load path (~0.9s) (#86)
+
 ## v1.1.1 (2026-06-09)
 
 ### Fix
