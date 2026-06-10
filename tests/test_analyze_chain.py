@@ -292,20 +292,26 @@ def test_analyze_chain_stage_order(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     def _fake_open_connection(*_a: object, **_kw: object) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(":memory:")
 
-    # Monkeypatch every worker entrypoint at the cli module's import site
-    # (where the analyze function reads them).
-    monkeypatch.setattr(cli_mod._skills_catalog, "sync", _fake_skills_sync)
-    monkeypatch.setattr(cli_mod, "_ingest_count_pending", _fake_ingest_count)
-    monkeypatch.setattr(cli_mod, "_ingest_stamp_messages", _fake_ingest_stamp)
-    monkeypatch.setattr(cli_mod, "_ingest_resolve_canonicals", _fake_ingest_resolve)
-    monkeypatch.setattr(cli_mod, "run_backfill", _fake_embed)
-    monkeypatch.setattr(cli_mod, "run_clustering", _fake_cluster)
-    monkeypatch.setattr(cli_mod, "run_terms", _fake_terms)
-    monkeypatch.setattr(cli_mod, "run_communities", _fake_community)
-    monkeypatch.setattr(cli_mod, "classify_sessions", _fake_classify)
-    monkeypatch.setattr(cli_mod, "trajectory_messages", _fake_trajectory)
-    monkeypatch.setattr(cli_mod, "detect_conflicts", _fake_conflicts)
-    monkeypatch.setattr(cli_mod, "detect_user_friction", _fake_friction)
+    # Monkeypatch every worker entrypoint at its SOURCE module. ``analyze``
+    # defers these imports into its body (``from claude_sql.analytics.X import
+    # name``), so the import statement re-reads ``X.name`` each call — patching
+    # the source attribute is picked up, whereas patching ``cli_mod.name`` would
+    # not (the name is no longer a cli module attribute). See the module-top
+    # NOTE in cli.py and test_pr3_perf.py::test_cli_import_is_lean.
+    monkeypatch.setattr("claude_sql.analytics.skills_catalog.sync", _fake_skills_sync)
+    monkeypatch.setattr("claude_sql.analytics.ingest.count_pending", _fake_ingest_count)
+    monkeypatch.setattr("claude_sql.analytics.ingest.stamp_messages", _fake_ingest_stamp)
+    monkeypatch.setattr("claude_sql.analytics.ingest.resolve_canonicals", _fake_ingest_resolve)
+    monkeypatch.setattr("claude_sql.analytics.embed_worker.run_backfill", _fake_embed)
+    monkeypatch.setattr("claude_sql.analytics.cluster_worker.run_clustering", _fake_cluster)
+    monkeypatch.setattr("claude_sql.analytics.terms_worker.run_terms", _fake_terms)
+    monkeypatch.setattr("claude_sql.analytics.community_worker.run_communities", _fake_community)
+    monkeypatch.setattr("claude_sql.analytics.classify_worker.classify_sessions", _fake_classify)
+    monkeypatch.setattr(
+        "claude_sql.analytics.trajectory_worker.trajectory_messages", _fake_trajectory
+    )
+    monkeypatch.setattr("claude_sql.analytics.conflicts_worker.detect_conflicts", _fake_conflicts)
+    monkeypatch.setattr("claude_sql.analytics.friction_worker.detect_user_friction", _fake_friction)
     monkeypatch.setattr(cli_mod, "_rebind_vss", _fake_rebind)
     monkeypatch.setattr(cli_mod, "_resolve_settings", _fake_resolve_settings)
     monkeypatch.setattr(cli_mod, "_open_connection_full", _fake_open_connection)

@@ -35,31 +35,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import duckdb
 import polars as pl
 from cyclopts import App, Parameter
 from loguru import logger
 
-from claude_sql.analytics import skills_catalog as _skills_catalog
-from claude_sql.analytics.classify_worker import classify_sessions
-from claude_sql.analytics.cluster_worker import run_clustering
-from claude_sql.analytics.community_worker import (
-    ResolutionLevel,
-    neighbors_of,
-    run_communities,
-)
-from claude_sql.analytics.conflicts_worker import detect_conflicts
-from claude_sql.analytics.embed_worker import embed_query, run_backfill
-from claude_sql.analytics.friction_worker import detect_user_friction
-from claude_sql.analytics.ingest import (
-    count_pending as _ingest_count_pending,
-    resolve_canonicals as _ingest_resolve_canonicals,
-    stamp_messages as _ingest_stamp_messages,
-)
-from claude_sql.analytics.terms_worker import run_terms
-from claude_sql.analytics.trajectory_worker import trajectory_messages
+# NOTE — heavy analytics/evals/provenance worker imports are DEFERRED into the
+# command bodies that use them (see the ``import`` statements inside ``embed``,
+# ``search``, ``classify``, ``cluster``, ``community``, ``analyze``, ``judge``,
+# ``kappa``, ``ungrounded-claim``, ``review-sheet``, …). Each worker drags a
+# ~0.5–1.4 s import subtree (boto3 via ``llm_shared``, ``schemas``, numpy/polars
+# re-exports); the fast read-only path (``schema``/``query``/``explain``/
+# ``peek``/``list-cache``/``shell``/``--version``/``--help``) touches none of
+# them. Importing them at module top paid ~0.94 s on EVERY invocation. This
+# extends the #77 lance_store deferral to the worker modules themselves; pinned
+# by ``test_cli_import_is_lean`` (fresh-interpreter sys.modules assertion). The
+# CHEAP eval/provenance modules (``freeze``, ``judges``, ``blind_handover``,
+# ``binding``, ``review_sheet_render`` — each <50 ms) stay at module top.
 from claude_sql.app.install_source import format_version
 from claude_sql.core import checkpointer
 from claude_sql.core.config import Settings
@@ -97,14 +91,15 @@ from claude_sql.core.sql_views import (
 from claude_sql.evals import (
     blind_handover as _blind_handover,
     freeze as _freeze,
-    judge_worker as _judge_worker,
     judges as _judge_catalog,
-    kappa_worker as _kappa_worker,
-    ungrounded_worker as _ungrounded_worker,
 )
 from claude_sql.provenance import binding as _binding
 from claude_sql.provenance.review_sheet_render import render_markdown, render_refusal_markdown
-from claude_sql.provenance.review_sheet_worker import generate_review_sheet
+
+# Heavy worker modules (each pulls boto3 via ``llm_shared``): deferred into the
+# command bodies — ``_judge_worker`` (judge), ``_kappa_worker`` (kappa),
+# ``_ungrounded_worker`` (ungrounded-claim), ``generate_review_sheet``
+# (review-sheet). See the module-top NOTE above.
 
 _APP_HELP = """\
 Zero-copy SQL + Cohere Embed v4 semantic search + Sonnet 4.6 analytics over
@@ -160,6 +155,14 @@ Narrow to one project with --glob to cut worker budget:
 At most one '**' segment is allowed per pattern (DuckDB limitation) -- the
 CLI rejects multi-star globs with a clear hint before DuckDB sees them.
 """
+
+
+# Defined locally (not imported from ``community_worker``) so the ``community``
+# command signature does not drag the igraph/leidenalg import subtree onto the
+# module-load path. This IS the public ``--resolution`` CLI contract; it must
+# stay byte-identical to ``community_worker.ResolutionLevel`` — pinned by
+# ``test_resolution_level_matches_worker`` in test_pr3_perf.py.
+ResolutionLevel = Literal["coarse", "medium", "fine"]
 
 
 app = App(
@@ -1534,6 +1537,8 @@ def skills_sync(
     --dry-run  Count rows without writing the parquet.  Useful for
                previewing how many skills will be catalogued.
     """
+    from claude_sql.analytics import skills_catalog as _skills_catalog
+
     _configure(common)
     settings = _resolve_settings(common)
     stats = _skills_catalog.sync(settings, dry_run=dry_run)
@@ -1644,6 +1649,8 @@ def embed(
     """
     import asyncio
 
+    from claude_sql.analytics.embed_worker import run_backfill
+
     _configure(common)
     settings = _resolve_settings(common)
     con = duckdb.connect(":memory:")
@@ -1728,6 +1735,8 @@ def search(
 
     Exit codes: 0 success, 2 no_embeddings, 70 runtime.
     """
+    from claude_sql.analytics.embed_worker import embed_query
+
     _configure(common)
     settings = _resolve_settings(common)
     fmt = _fmt(common)
@@ -1819,6 +1828,8 @@ def classify(
     reruns on unchanged sessions are free -- only sessions whose JSONL
     mtime changed are re-processed.
     """
+    from claude_sql.analytics.classify_worker import classify_sessions
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -1867,6 +1878,8 @@ def trajectory(
     Flags / exit codes identical to ``classify``.  See its help for the
     dry-run JSON schema.
     """
+    from claude_sql.analytics.trajectory_worker import trajectory_messages
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -1911,6 +1924,8 @@ def conflicts(
     Cost: defaults to ``--dry-run``. ~6K input / 400 output tokens / session.
     Flags / exit codes identical to ``classify``.
     """
+    from claude_sql.analytics.conflicts_worker import detect_conflicts
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -1961,6 +1976,8 @@ def friction(
     so even 10K candidates cost ≈ $3-4.
     Flags / exit codes identical to ``classify``.
     """
+    from claude_sql.analytics.friction_worker import detect_user_friction
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -2017,6 +2034,12 @@ def ingest(
     Real-run output: ``{"pipeline":"ingest","rows_processed":N,
     "dry_run":false}``.
     """
+    from claude_sql.analytics.ingest import (
+        count_pending as _ingest_count_pending,
+        resolve_canonicals as _ingest_resolve_canonicals,
+        stamp_messages as _ingest_stamp_messages,
+    )
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -2066,6 +2089,8 @@ def cluster(*, force: bool = False, common: Common | None = None) -> None:
     -----
     --force   Re-cluster even if clusters.parquet already exists.
     """
+    from claude_sql.analytics.cluster_worker import run_clustering
+
     _configure(common)
     settings = _resolve_settings(common)
     stats = run_clustering(settings, force=force)
@@ -2096,6 +2121,8 @@ def terms(*, force: bool = False, common: Common | None = None) -> None:
     -----
     --force   Recompute even if cluster_terms.parquet already exists.
     """
+    from claude_sql.analytics.terms_worker import run_terms
+
     _configure(common)
     settings = _resolve_settings(common)
     con = _open_connection_full(settings)
@@ -2169,6 +2196,8 @@ def community(
     0   success
     64  invalid input (e.g., --neighbors-of combined with partition flags)
     """
+    from claude_sql.analytics.community_worker import neighbors_of, run_communities
+
     _configure(common)
     settings = _resolve_settings(common)
     fmt = _fmt(common)
@@ -2315,6 +2344,21 @@ def analyze(
             --force-cluster --force-community
     """
     import asyncio
+
+    from claude_sql.analytics import skills_catalog as _skills_catalog
+    from claude_sql.analytics.classify_worker import classify_sessions
+    from claude_sql.analytics.cluster_worker import run_clustering
+    from claude_sql.analytics.community_worker import run_communities
+    from claude_sql.analytics.conflicts_worker import detect_conflicts
+    from claude_sql.analytics.embed_worker import run_backfill
+    from claude_sql.analytics.friction_worker import detect_user_friction
+    from claude_sql.analytics.ingest import (
+        count_pending as _ingest_count_pending,
+        resolve_canonicals as _ingest_resolve_canonicals,
+        stamp_messages as _ingest_stamp_messages,
+    )
+    from claude_sql.analytics.terms_worker import run_terms
+    from claude_sql.analytics.trajectory_worker import trajectory_messages
 
     _configure(common)
     settings = _resolve_settings(common)
@@ -2591,6 +2635,8 @@ def judge_cmd(
     ``sessions_parquet`` must have (session_id, text) columns.  Defaults to
     ``--dry-run`` per the project cost-guard convention.
     """
+    from claude_sql.evals import judge_worker as _judge_worker
+
     _configure(common)
     fmt = _fmt(common)
     study = _freeze.replay(manifest_sha)
@@ -2642,6 +2688,8 @@ def ungrounded_cmd(
     ``turns_parquet`` needs (session_id, turn_idx, assistant_text,
     tool_output_text) columns.  Writes per-claim grounded flags.
     """
+    from claude_sql.evals import ungrounded_worker as _ungrounded_worker
+
     _configure(common)
     fmt = _fmt(common)
     study = _freeze.replay(manifest_sha)
@@ -2681,6 +2729,8 @@ def kappa_cmd(
     if ``--delta-gate <prior.parquet>`` is set and the delta-kappa CI
     excludes zero on any axis (pre-registered stopping rule).
     """
+    from claude_sql.evals import kappa_worker as _kappa_worker
+
     _configure(common)
     fmt = _fmt(common)
     df = _kappa_worker.load_scores(scores_parquet)
@@ -3020,6 +3070,8 @@ def review_sheet_cmd(
     * 65  commit not found / git invocation failed.
     * 70  trailer and note disagree on digest.
     """
+    from claude_sql.provenance.review_sheet_worker import generate_review_sheet
+
     _configure(common)
     fmt = _review_sheet_format(common)
     # Error output follows the global rule (TABLE on TTY, JSON off-TTY) — the

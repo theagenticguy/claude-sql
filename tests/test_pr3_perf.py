@@ -440,3 +440,93 @@ def test_cli_import_does_not_load_lancedb() -> None:
         "claude_sql.app.cli eagerly imported lancedb modules "
         f"({leaked}); defer the lance_store import into the function that uses it"
     )
+
+
+# ---------------------------------------------------------------------------
+# Import hygiene (broadened): the CLI fast path (--version / --help / schema /
+# query / explain / peek / list-cache / shell) must not eagerly drag in ANY of
+# the heavy analytics/evals/provenance worker modules. Each pulls boto3 (via
+# ``llm_shared``), ``schemas``, or numpy/polars re-export subtrees — ~0.9 s of
+# import wall-clock measured on this box, paid on EVERY invocation when imported
+# at cli module top. The workers are deferred into the command bodies that use
+# them (extends the #77 lance_store deferral to the worker modules themselves).
+# A future module-top ``from claude_sql.analytics.X import ...`` re-regresses
+# this loudly. Runs in a fresh interpreter so the in-process suite (which
+# legitimately imports these workers elsewhere) doesn't pollute sys.modules.
+# ---------------------------------------------------------------------------
+
+# Modules that must NOT be present after a bare ``import claude_sql.app.cli``.
+# boto3/botocore gate the whole point (the LLM workers' import cost is dominated
+# by boto3); the worker modules are the direct deferral targets.
+_CLI_FORBIDDEN_EAGER_IMPORTS = (
+    "boto3",
+    "botocore",
+    "claude_sql.core.llm_shared",
+    "claude_sql.analytics.classify_worker",
+    "claude_sql.analytics.cluster_worker",
+    "claude_sql.analytics.community_worker",
+    "claude_sql.analytics.conflicts_worker",
+    "claude_sql.analytics.embed_worker",
+    "claude_sql.analytics.friction_worker",
+    "claude_sql.analytics.terms_worker",
+    "claude_sql.analytics.trajectory_worker",
+    "claude_sql.analytics.ingest",
+    "claude_sql.analytics.skills_catalog",
+    "claude_sql.evals.judge_worker",
+    "claude_sql.evals.kappa_worker",
+    "claude_sql.evals.ungrounded_worker",
+    "claude_sql.provenance.review_sheet_worker",
+)
+
+
+def test_cli_import_is_lean() -> None:
+    """A bare ``import claude_sql.app.cli`` must not pull the heavy workers.
+
+    Fresh-interpreter probe: import the CLI module, then report which of the
+    forbidden heavy modules leaked into ``sys.modules``. The fast read-only
+    path (schema/query/explain/peek/--version/--help) needs none of them; the
+    LLM/analytics/evals commands import their worker lazily inside the command
+    body. Keeping this list green holds CLI cold-start at the ~1.0 s fast-path
+    floor instead of the ~1.9 s it cost with eager worker imports.
+    """
+    forbidden = _CLI_FORBIDDEN_EAGER_IMPORTS
+    probe = (
+        "import sys; import claude_sql.app.cli; "
+        f"forbidden = {forbidden!r}; "
+        "leaked = sorted(m for m in sys.modules "
+        "if m in forbidden or any(m.startswith(f + '.') for f in forbidden)); "
+        "print('|'.join(leaked))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, f"import probe failed: {result.stderr[:500]}"
+    leaked = [m for m in result.stdout.strip().split("|") if m]
+    assert not leaked, (
+        "claude_sql.app.cli eagerly imported heavy worker modules "
+        f"({leaked}); defer the import into the command body that uses it "
+        "(see the module-top NOTE in cli.py)"
+    )
+
+
+def test_resolution_level_matches_worker() -> None:
+    """cli.ResolutionLevel must stay byte-identical to the worker's alias.
+
+    ``cli.ResolutionLevel`` is defined locally (rather than imported from
+    ``community_worker``) so the ``community`` command signature does not drag
+    the igraph/leidenalg import subtree onto the module-load path. It IS the
+    public ``--resolution`` CLI contract, so it must match the worker's
+    definition exactly — this guards against the two drifting apart.
+    """
+    import typing
+
+    from claude_sql.analytics import community_worker
+    from claude_sql.app import cli
+
+    assert typing.get_args(cli.ResolutionLevel) == typing.get_args(
+        community_worker.ResolutionLevel
+    ), "cli.ResolutionLevel drifted from community_worker.ResolutionLevel"

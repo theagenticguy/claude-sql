@@ -613,7 +613,12 @@ def test_search_with_mocked_embed(
     lance_store.add_chunk(tbl, df)
 
     fake_qv = [float(i % 3) for i in range(dim)]
-    monkeypatch.setattr(cli, "embed_query", lambda text, *, settings: fake_qv)
+    # ``search`` defers ``from claude_sql.analytics.embed_worker import
+    # embed_query`` into its body, so patch the source attribute (the deferred
+    # import re-reads it at call time). See cli.py module-top NOTE.
+    monkeypatch.setattr(
+        "claude_sql.analytics.embed_worker.embed_query", lambda text, *, settings: fake_qv
+    )
 
     cli.search("hello world", k=2, common=_common(tmp_corpus))
     out = capsys.readouterr().out
@@ -1132,7 +1137,12 @@ def test_review_sheet_cmd_renders_markdown_on_tty(
             "captured_at": "2026-01-01T00:00:00+00:00",
         },
     }
-    monkeypatch.setattr(cli, "generate_review_sheet", lambda *a, **kw: fake_result)
+    # ``review_sheet_cmd`` defers ``from claude_sql.provenance.review_sheet_worker
+    # import generate_review_sheet`` into its body; patch the source attribute.
+    monkeypatch.setattr(
+        "claude_sql.provenance.review_sheet_worker.generate_review_sheet",
+        lambda *a, **kw: fake_result,
+    )
     cli.review_sheet_cmd(
         "abcdef0",
         dry_run=False,
@@ -1179,7 +1189,12 @@ def test_review_sheet_cmd_renders_refusal_markdown(
             "captured_at": "2026-01-01T00:00:00+00:00",
         },
     }
-    monkeypatch.setattr(cli, "generate_review_sheet", lambda *a, **kw: fake_result)
+    # ``review_sheet_cmd`` defers ``from claude_sql.provenance.review_sheet_worker
+    # import generate_review_sheet`` into its body; patch the source attribute.
+    monkeypatch.setattr(
+        "claude_sql.provenance.review_sheet_worker.generate_review_sheet",
+        lambda *a, **kw: fake_result,
+    )
     cli.review_sheet_cmd(
         "abcdef0",
         dry_run=False,
