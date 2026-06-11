@@ -70,13 +70,12 @@ flowchart LR
     R --> V[business views]
     V --> Q[["claude-sql query<br/>claude-sql explain<br/>claude-sql schema"]]
     V --> E["claude-sql embed<br/>(Cohere Embed v4 on Bedrock)"]
-    E --> P["embeddings/<br/>part-*.parquet (sharded)"]
-    P --> H["HNSW index<br/>(persisted to<br/>~/.claude/hnsw.duckdb)"]
-    H --> S[["claude-sql search"]]
+    E --> P["LanceDB store<br/>(~/.claude/embeddings_lance/<br/>FLOAT[1024] + IVF_HNSW_SQ index)"]
+    P --> S[["claude-sql search"]]
     V --> L["claude-sql classify / trajectory /<br/>conflicts / friction (Sonnet 4.6 +<br/>output_config.format)"]
     L --> PA["session_classifications/, message_trajectory/,<br/>session_conflicts/, user_friction/<br/>(sharded part-*.parquet)"]
-    P --> C["claude-sql cluster<br/>(UMAP + HDBSCAN)"]
-    C --> PC["clusters + cluster_terms<br/>(c-TF-IDF)"]
+    P --> C["claude-sql cluster + terms<br/>(UMAP + HDBSCAN + c-TF-IDF)"]
+    C --> PC["clusters + cluster_terms"]
     P --> CM["claude-sql community<br/>(Leiden + CPM over mutual-kNN centroids)"]
     CM --> PM["session_communities<br/>parquet"]
     PA --> AV[analytics views + macros]
@@ -93,10 +92,28 @@ warn and no-op, never crash.
 
 ### As a uv tool (recommended)
 
-`claude-sql` is **not published to PyPI**. Install it from a local
-checkout. `mise run tool:install` wraps `uv tool install --from .
-claude-sql --force --reinstall` so the binary on your `PATH` lands in an
-isolated uv-managed venv.
+`claude-sql` is published to [PyPI](https://pypi.org/project/claude-sql/).
+Install the CLI into an isolated, uv-managed venv on your `PATH`:
+
+```bash
+uv tool install claude-sql
+claude-sql --version
+
+uv tool upgrade claude-sql      # pull the latest release
+uv tool uninstall claude-sql    # remove it
+```
+
+Or run it without installing anything persistent:
+
+```bash
+uvx claude-sql schema
+```
+
+### From a local checkout (latest unreleased commits)
+
+To run ahead of the last PyPI release, install from a clone.
+`mise run tool:install` wraps `uv tool install --from . claude-sql
+--force --reinstall`:
 
 ```bash
 git clone https://github.com/theagenticguy/claude-sql.git
@@ -110,16 +127,7 @@ Upgrade after pulling new commits by re-running the same task (the
 
 ```bash
 git pull
-mise run tool:upgrade
-```
-
-> **Note.** `uv tool upgrade claude-sql` does **not** work — it resolves
-> against PyPI, which has no `claude-sql` package. Always reinstall from
-> your checkout.
-
-Remove it with:
-
-```bash
+mise run tool:upgrade     # reinstall from the checkout, not from PyPI
 mise run tool:uninstall   # → uv tool uninstall claude-sql
 ```
 
@@ -224,6 +232,17 @@ claude-sql query "SELECT * FROM unused_skills(30) LIMIT 20"
 
 # Full analytics pipeline (includes a zero-cost `skills sync` at step 0).
 claude-sql analyze --since-days 30 --no-dry-run
+
+# Provenance: resolve a merged commit back to the transcript that wrote it.
+claude-sql resolve "$(git rev-parse HEAD)"
+claude-sql review-sheet "$(git rev-parse HEAD)" --no-dry-run
+
+# Eval gym: pre-register a study, run the judge panel, gate on agreement.
+claude-sql judges
+claude-sql freeze rubric.yaml --panel kimi-k2.5,deepseek-v3.2,glm-5
+claude-sql judge <manifest_sha> --sessions-parquet sessions.parquet \
+  --output-parquet scores.parquet --no-dry-run
+claude-sql kappa scores.parquet --floor 0.6
 ```
 
 More recipes in [`docs/cookbook.md`](docs/cookbook.md) (v1: sessions,
@@ -235,7 +254,14 @@ communities, classifications, trajectory, conflicts, friction).
 
 Every subcommand shares the top-level flags: `--verbose` / `--quiet`,
 `--glob`, `--subagent-glob`, and `--format {auto,table,json,ndjson,csv}`.
-Commands that spend real Bedrock money default to `--dry-run`.
+The LLM-classification commands (`classify`, `trajectory`, `conflicts`,
+`friction`, `analyze`, `judge`, `review-sheet`) and the cache-rewriting
+ones (`cache compact`, `cache migrate`, `ingest`) default to `--dry-run`.
+`embed` and `search` are the exceptions — they spend Bedrock the moment
+you call them (an `embed` backfill and a single query-vector call,
+respectively), so they have no dry-run gate.
+
+**Query + introspection (zero cost)**
 
 | Command | Purpose |
 |---|---|
@@ -244,27 +270,71 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `explain <sql>` | Static `EXPLAIN` by default; `--analyze` for `EXPLAIN ANALYZE` |
 | `shell` | Launch the `duckdb` REPL with everything pre-registered |
 | `list-cache` | Report freshness + row counts for every parquet cache |
-| `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock |
-| `search <text>` | HNSW cosine semantic search over embeddings |
-| `classify` | Sonnet 4.6 → session autonomy + work category + success + goal |
-| `trajectory` | Per-message sentiment + `is_transition` |
+| `peek <session_id>` | One-shot session summary — line count, role mix, top tools, samples |
+
+**Embeddings + structure**
+
+| Command | Purpose |
+|---|---|
+| `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock (spends by default) |
+| `search <text>` | IVF_HNSW_SQ cosine semantic search over the LanceDB store |
+| `ingest` | Stamp messages with `approx_tokens` / `simhash64` / canonical UUID (CPU only) |
+| `cluster` | UMAP → HDBSCAN over message embeddings (CPU only; `--force` to rebuild) |
+| `terms` | c-TF-IDF term labels per cluster (CPU only) |
+| `community` | Leiden + CPM over mutual-kNN session centroids; emits medoid + coherence + resolution profile + `--neighbors-of` |
+
+**LLM analytics (Sonnet 4.6 — default `--dry-run`)**
+
+| Command | Purpose |
+|---|---|
+| `classify` | Session autonomy + work category + success + goal |
+| `trajectory` | Per-window sentiment + transition kind |
 | `conflicts` | Per-session stance-conflict detection |
 | `friction` | Regex + Sonnet 4.6 → status pings, unmet expectations, confusion, etc. |
-| `cluster` | UMAP → HDBSCAN → c-TF-IDF over message embeddings |
-| `community` | Leiden + CPM over mutual-kNN session centroids; emits medoid + coherence + resolution profile + `--neighbors-of` |
+| `analyze` | Run the whole pipeline in dependency order (skills → ingest → embed → cluster → terms → community → classify → trajectory → conflicts → friction) |
+
+**Skills catalog + cache maintenance**
+
+| Command | Purpose |
+|---|---|
 | `skills sync` | Walk `~/.claude/skills/` + `~/.claude/plugins/cache/` → seedable skills catalog |
 | `skills ls` | List catalog entries, filterable by `--kind` and `--plugin` |
-| `analyze` | Run the whole pipeline in dependency order |
+| `cache compact` | Consolidate a sharded `<cache>/part-*.parquet` directory into one file |
+| `cache migrate` | Move a legacy single-file cache into the sharded directory layout |
+
+**Eval gym (cross-provider judge panels + agreement gates)**
+
+| Command | Purpose |
+|---|---|
+| `judges` | List the cross-provider Bedrock judge catalog |
+| `freeze <rubric>` | Pre-register a study — write an immutable manifest under `~/.claude/studies/<sha>/` |
+| `replay <manifest_sha>` | Load + echo a frozen study manifest by SHA |
+| `blind-handover <in> <out>` | Strip identity markers from a sessions parquet for grader-safe handover |
+| `judge <manifest_sha>` | Dispatch a frozen study's judge panel over a sessions parquet |
+| `ungrounded-claim <manifest_sha>` | Run the ungrounded-claim detector over a turns parquet |
+| `kappa <scores_parquet>` | Cohen's + Fleiss' kappa with bootstrapped 95% CI; exit 66 below the floor |
+
+**Transcript ↔ PR provenance (RFC 0001)**
+
+| Command | Purpose |
+|---|---|
+| `bind` | Attach a transcript↔commit binding (trailers + git-notes) to a commit |
+| `resolve <commit_sha>` | Resolve a commit's bound transcript (trailer → note precedence) |
+| `review-sheet <commit_sha>` | Render a compressed PR review sheet (Sonnet 4.6) |
 
 ### Agent-friendly defaults
 
 - **`--format auto`** emits a human table on a TTY and JSON when stdout
   is piped, so agents calling `claude-sql` via subprocess get JSON for
   free. `json`, `ndjson`, and `csv` are always available explicitly.
-- **Classified exit codes** for DuckDB errors — `64` for parse errors,
-  `65` for unknown view / column / macro, `70` for other runtime
-  errors, and `2` when `search` is called before `embed` has run. On
-  non-TTY stdout the error also comes back as
+- **Classified exit codes** for DuckDB errors — `64` for invalid input
+  (malformed flags **or** unparseable SQL), `65` for unknown view /
+  column / macro, `70` for other runtime errors, and `2` when `search`
+  is called before `embed` has run (also reused when `resolve` /
+  `review-sheet` find no binding). Two command-specific codes: `kappa`
+  exits `66` when an agreement floor or delta-gate is tripped, and
+  `shell` exits `127` when the system `duckdb` binary isn't on `PATH`.
+  On non-TTY stdout the error also comes back as
   `{"error": {"kind", "message", "hint"}}` on stderr, so agents don't
   have to scrape tracebacks.
 - **`list-cache`** reports every parquet (embeddings, classifications,
@@ -285,7 +355,8 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `sessions` | one per transcript file | `session_id`, `started_at`, `ended_at` |
 | `messages` | one per chat message | `uuid`, `session_id`, `role`, `model`, token usage |
 | `content_blocks` | flattened `message.content[]` | `block_type`, `tool_name` |
-| `messages_text` | text blocks aggregated per message | `uuid`, `text_content` |
+| `messages_text` | text blocks aggregated per message (≥32 chars) | `uuid`, `text_content` |
+| `turn_window` | adjacent-turn `LAG` window per session (compact-summary excluded) | `prev_uuid`, `curr_uuid`, `gap_ms`, `window_idx` |
 | `tool_calls` | `content_blocks` where `type='tool_use'` | `tool_name`, `tool_use_id` |
 | `tool_results` | `content_blocks` where `type='tool_result'` | `tool_use_id`, `content` |
 | `todo_events` | one row per todo per `TodoWrite` snapshot (legacy + `--print`/SDK) | `subject`, `status`, `snapshot_ix` |
@@ -294,14 +365,16 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `task_creations` | `TaskCreate` / `mcp__tasks__task_create` (interactive task tracker, v2.1.16+) | `subject`, `description`, `active_form`, `metadata` |
 | `task_updates` | `TaskUpdate` / `mcp__tasks__task_update` lifecycle events | `task_id`, `status`, `add_blocked_by`, `owner` |
 | `tasks_state_current` | latest status per `(session, task_id)` for the v2.1.16+ family | `task_id`, `subject`, `status`, `last_updated_at` |
-| `task_spawns` *(deprecated)* | `subagent_spawns` ∪ `task_creations` shim, removed next minor | `spawn_tool`, `subagent_type`, `description`, `prompt` |
 | `skill_invocations` | every `Skill` tool call + `<command-name>/foo</command-name>` user slash | `source` (`tool` / `slash_command`), `skill_id`, `args` |
 | `subagent_sessions` | rolled-up subagent runs | `parent_session_id`, `agent_hex`, `agent_type`, `description`, `started_at`, `ended_at`, `message_count`, `transcript_path` |
 | `subagent_messages` | user + assistant events from subagent transcripts | `uuid`, `parent_session_id` |
+| `message_embeddings` | one row per embedded message (LanceDB-backed; empty stub before first `embed`) | `uuid`, `model`, `dim`, `embedding` (`FLOAT[1024]`), `embedded_at` |
+| `ingest_stamps` | per-message ingest stamps (seeded by `claude-sql ingest`) | `uuid`, `simhash64`, `canonical_uuid` |
 | `session_classifications` | one row per classified session | `autonomy_tier`, `work_category`, `success`, `goal` |
 | `session_goals` | projection over classifications | `session_id`, `goal` |
-| `message_trajectory` | per-message sentiment + `is_transition` | `sentiment_delta` (`positive` / `neutral` / `negative`), `is_transition` |
-| `session_conflicts` | per-session stance conflicts | `stance_a`, `stance_b`, `resolution` |
+| `message_trajectory` | one row per adjacent-turn window (pair-keyed) | `prev_uuid`, `curr_uuid`, `curr_sentiment`, `delta`, `transition_kind`, `is_transition`, `confidence` |
+| `session_conflicts` | one row per conflicting turn pair (zero rows when none) | `turn_a_uuid`, `turn_b_uuid`, `conflict_kind`, `severity`, `agent_position`, `user_position`, `confidence` |
+| `conflicts_summary` | per-session conflict count over `session_conflicts` | `session_id`, `conflict_count` |
 | `message_clusters` | cluster id + 2d viz coords | `cluster_id`, `x`, `y`, `is_noise` |
 | `cluster_terms` | c-TF-IDF top terms per cluster | `cluster_id`, `term`, `weight`, `rank` |
 | `session_communities` | Leiden+CPM community per session | `community_id`, `size`, `is_medoid`, `coherence`, `gamma_used` |
@@ -326,17 +399,23 @@ Commands that spend real Bedrock money default to `--dry-run`.
 | `success_rate_by_work(since_days)` | table | Success / failure / partial rates per category |
 | `cluster_top_terms(cid, n)` | table | Top-N terms for a cluster |
 | `community_top_topics(cid, n)` | table | Dominant clusters within a community |
-| `sentiment_arc(sid)` | table | Per-message sentiment timeline for one session |
+| `sentiment_arc(sid)` | table | Per-window sentiment timeline for one session |
 | `friction_counts(since_days)` | table | Count + session breadth per friction label |
 | `friction_rate(since_days)` | table | Per-session friction pressure vs. user message count |
-| `friction_examples(label, n)` | table | Top-N example messages for a friction label |
+| `friction_examples(label_name, n)` | table | Top-N example messages for a friction label |
 | `skill_rank(last_n_days)` | table | Skill / slash leaderboard over a window (counts both `tool` and `slash_command` sources) |
 | `skill_source_mix(last_n_days)` | table | Per skill `n_tool` vs. `n_slash` — how is each skill invoked? |
 | `unused_skills(last_n_days)` | table | Catalog entries with zero invocations in the window (needs `skills sync`) |
+| `canonical_uuid_resolve()` | table | SimHash near-duplicate UUID resolution over `ingest_stamps` (needs `claude-sql ingest`) |
 
 ## Environment variables
 
-Every option is configurable via `CLAUDE_SQL_*`:
+Every setting in `config.py` is overridable via a `CLAUDE_SQL_*` env var
+(prefix + the upper-cased field name) or a `.env` in the working
+directory. The common knobs are below; the per-stage tuning fields
+(`CLAUDE_SQL_UMAP_*`, `CLAUDE_SQL_HDBSCAN_*`, `CLAUDE_SQL_TFIDF_*`, the
+`*_THINKING` modes, and each analytics parquet path) follow the same
+prefix convention — see `config.py` for the full set.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -349,14 +428,16 @@ Every option is configurable via `CLAUDE_SQL_*`:
 | `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region **and** the S3 secret region |
 | `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Embedding model |
 | `CLAUDE_SQL_SONNET_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Classification model |
-| `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension |
+| `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension (`256` / `512` / `1024` / `1536`) |
+| `CLAUDE_SQL_EMBEDDING_TYPE` | `int8` | Cohere output type (`int8` / `float` / `uint8` / `binary` / `ubinary`) |
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Parallel Cohere Embed v4 calls (global CRIS) |
-| `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Parallel Sonnet 4.6 calls (global CRIS) |
+| `CLAUDE_SQL_LLM_CONCURRENCY` | `16` | Parallel Sonnet 4.6 calls (global CRIS) |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Cohere batch size |
-| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings/` | Embeddings cache (sharded directory of `part-*.parquet`) |
+| `CLAUDE_SQL_LANCE_URI` | `~/.claude/embeddings_lance` | LanceDB embeddings store (`FLOAT[1024]` vectors + IVF_HNSW_SQ index) |
+| `CLAUDE_SQL_HNSW_METRIC` | `cosine` | Vector index distance metric (`cosine` / `l2` / `dot`) |
+| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings/` | **Legacy** parquet shards; kept only for one-time migration into LanceDB |
 | `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction/` | Friction cache (sharded) |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Short-message cutoff for the friction classifier |
-| `CLAUDE_SQL_HNSW_DB_PATH` | `~/.claude/hnsw.duckdb` | Persistent HNSW store (rebuilt automatically when stale) |
 | `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | DuckDB worker threads |
 | `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | DuckDB memory ceiling (percentage or absolute size) |
 | `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | DuckDB spill directory (avoids `/tmp` tmpfs thrash) |
@@ -480,9 +561,17 @@ See `docs/adr/0015-stack-modernization.md` and
 - **Global CRIS for Cohere.** The `global.cohere.embed-v4:0` profile
   sustains the highest throughput with no throttling in testing; direct
   and US CRIS both saturate at low TPM.
-- **HNSW rebuild at open.** The cosine-metric DuckDB VSS index is rebuilt
-  from the parquet on every connection open. No experimental
-  persistence.
+- **LanceDB embeddings store.** Vectors and the cosine-metric
+  `IVF_HNSW_SQ` (scalar-quantized HNSW) index live together in one
+  versioned LanceDB dataset at `~/.claude/embeddings_lance/`; DuckDB
+  reads it back via the `lance` core extension
+  (`INSTALL lance; LOAD lance; ATTACH … (TYPE LANCE)`). On a fresh
+  install with no Lance table yet, `register_vss` binds an empty
+  `message_embeddings` stub so `semantic_search` still resolves. This
+  replaces the old `embeddings/part-*.parquet` + `~/.claude/hnsw.duckdb`
+  rebuild-at-open combo; the legacy shards migrate over automatically on
+  first connect. Recovery: `rm -rf ~/.claude/embeddings_lance/` then
+  `claude-sql embed`.
 - **Structured output, GA path.** Sonnet 4.6 classification uses
   Bedrock's GA `output_config.format` (not `tool_use` / `tool_choice`)
   with adaptive thinking on. Pydantic v2 schemas are flattened (inline
@@ -514,9 +603,30 @@ See `docs/adr/0015-stack-modernization.md` and
   the agent missed a proactive step) — falls through to Sonnet 4.6
   structured output. Scoped to user-role messages under 300 characters
   by default; longer turns are almost always genuine task instructions.
+- **Pre-registered eval gym.** The `judges` / `freeze` / `judge` /
+  `kappa` family grades transcripts with a cross-provider Bedrock judge
+  panel (8 non-Anthropic/non-Amazon primaries + a within-family
+  Anthropic holdout to measure self-preference bias), then scores
+  inter-rater agreement with Cohen's + Fleiss' kappa and bootstrapped
+  95% CIs. `freeze` writes an immutable study manifest under
+  `~/.claude/studies/<sha>/` so a run is reproducible (`replay`);
+  `blind-handover` strips identity markers before grading; `kappa`
+  exits `66` below the agreement floor. No DuckDB views or `list-cache`
+  parquets — output goes to caller-named parquets stamped with the
+  freeze SHA.
+- **Transcript ↔ PR provenance.** `bind` writes a host-neutral binding
+  between a merged commit and the transcript that produced it, encoded
+  as three `git-interpret-trailers` trailers plus a JSON note under
+  `refs/notes/transcripts`. `resolve` reads it back (trailer-first,
+  note-fallback, loud on digest disagreement); `review-sheet` compresses
+  the bound transcript into a Markdown/JSON PR review sheet via Sonnet
+  4.6. Pure-stdlib, no new git infrastructure — see
+  [`docs/rfc/0001-transcript-pr-binding.md`](docs/rfc/0001-transcript-pr-binding.md).
 
 See [`docs/research_notes.md`](docs/research_notes.md) for deeper design
-rationale.
+rationale, and
+[`docs/rfc/0002-vision-and-roadmap.md`](docs/rfc/0002-vision-and-roadmap.md)
+for the data-model + roadmap direction.
 
 ## Links
 
@@ -528,6 +638,10 @@ rationale.
   tuning knobs.
 - [JSONL schema reference](docs/jsonl_schema_v1.sql) — column listings
   for every registered view.
+- [RFC 0001 — transcript ↔ PR binding](docs/rfc/0001-transcript-pr-binding.md)
+  — the `bind` / `resolve` / `review-sheet` convention.
+- [RFC 0002 — vision + roadmap](docs/rfc/0002-vision-and-roadmap.md) —
+  the v2 data model and production direction.
 
 ## License
 
