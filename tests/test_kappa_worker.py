@@ -93,6 +93,46 @@ def test_bootstrap_hoisted_categories_byte_identical() -> None:
     assert hi_h == hi_p
 
 
+def test_bootstrap_vectorized_matches_per_call_multicat() -> None:
+    # The bootstrap is vectorized over the resample axis (one 2-D index draw
+    # instead of n_bootstrap sequential 1-D draws). This must stay byte-
+    # identical to a sequential per-call reference even at multi-category
+    # scale (C=5), where np.sum over the category axis would reassociate and
+    # drift the last ULP — the implementation accumulates the C products
+    # sequentially to avoid exactly that.
+    rng = np.random.default_rng(99)
+    a = rng.integers(0, 5, size=250)
+    b = np.where(rng.random(250) < 0.6, a, rng.integers(0, 5, size=250))
+
+    def bootstrap_per_call(aa, bb, n_bootstrap, seed=kw.RNG_SEED):
+        r = np.random.default_rng(seed)
+        n = len(aa)
+        samples = np.empty(n_bootstrap, dtype=np.float64)
+        for i in range(n_bootstrap):
+            idx = r.integers(0, n, size=n)
+            cats = sorted(set(aa[idx].tolist()) | set(bb[idx].tolist()))
+            samples[i] = kw.cohens_kappa(aa[idx], bb[idx], cats)
+        return (
+            float(np.quantile(samples, 0.025)),
+            float(np.quantile(samples, 0.975)),
+        )
+
+    lo_v, hi_v = kw.bootstrap_kappa_ci(a, b, n_bootstrap=1000, seed=42)
+    lo_p, hi_p = bootstrap_per_call(a, b, n_bootstrap=1000, seed=42)
+    assert lo_v == lo_p
+    assert hi_v == hi_p
+
+
+def test_bootstrap_all_same_category_no_nan() -> None:
+    # Degenerate resamples (every draw is one category) give pe == 1.0; the
+    # vectorized element-wise guard must yield 0.0, never NaN/inf.
+    a = np.array([1, 1, 1, 1, 1, 1, 1, 1])
+    b = np.array([1, 1, 1, 1, 1, 1, 1, 1])
+    lo, hi = kw.bootstrap_kappa_ci(a, b, n_bootstrap=300, seed=42)
+    assert lo == 0.0
+    assert hi == 0.0
+
+
 def test_compute_pairwise_smoke() -> None:
     df = pl.DataFrame(
         {

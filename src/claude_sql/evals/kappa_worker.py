@@ -124,10 +124,34 @@ def bootstrap_kappa_ci(
     # replacement can only drop categories, never add), so derive it once
     # instead of rebuilding the set inside every one of n_bootstrap calls.
     categories = sorted(set(a.tolist()) | set(b.tolist()))
-    samples = np.empty(n_bootstrap, dtype=np.float64)
-    for i in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
-        samples[i] = cohens_kappa(a[idx], b[idx], categories)
+
+    # Vectorize the resample loop over the bootstrap axis. The pre-vectorized
+    # shape called ``cohens_kappa`` n_bootstrap times (≈180k calls per
+    # ``compute_pairwise`` run), each doing 2*C full-array ``np.mean`` scans
+    # plus per-call numpy dispatch — Python-call overhead dominated. Drawing
+    # all B index sets in one 2-D call is byte-identical to B sequential 1-D
+    # ``rng.integers(0, n, size=n)`` draws (verified: a 2-D ``integers`` draw
+    # consumes the bit-stream row-major, exactly matching the sequential
+    # loop), so the resampled kappas come out identical to the old path.
+    idx = rng.integers(0, n, size=(n_bootstrap, n))  # (B, n)
+    ra = a[idx]  # (B, n)
+    rb = b[idx]  # (B, n)
+    po = (ra == rb).mean(axis=1)  # (B,)  == old ``np.mean(a==b)`` per resample
+    # ``pe = sum_c pa_c * pb_c``. Count each category per resample with a
+    # broadcasted equality (B, n) -> (B,) per category. Accumulate the C
+    # products SEQUENTIALLY in sorted-category order with scalar-vector adds,
+    # matching the old ``pe += pa * pb`` loop float-summation order exactly
+    # (np.sum over the category axis would reassociate and drift the last ULP
+    # once C grows past ~11).
+    pe = np.zeros(n_bootstrap, dtype=np.float64)
+    for c in categories:
+        pa = (ra == c).mean(axis=1)  # (B,)
+        pb = (rb == c).mean(axis=1)  # (B,)
+        pe += pa * pb
+    # Element-wise mirror of the scalar guard: pe >= 1.0 -> kappa 0.0.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        kappas = (po - pe) / (1.0 - pe)
+    samples = np.where(pe >= 1.0, 0.0, kappas)
     low = float(np.quantile(samples, (1 - confidence) / 2))
     high = float(np.quantile(samples, 1 - (1 - confidence) / 2))
     return (low, high)
