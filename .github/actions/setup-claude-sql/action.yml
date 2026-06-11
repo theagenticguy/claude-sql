@@ -36,7 +36,7 @@ runs:
     # uniquely identifies the cache contents we want.
     - name: Restore uv package cache
       if: ${{ inputs.cache-uv == 'true' }}
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/uv
         key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
