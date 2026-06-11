@@ -1,3 +1,9 @@
+## v1.1.3 (2026-06-11)
+
+### Perf
+
+- **kappa**: vectorize bootstrap CI over the resample axis (~9.5x) (#91)
+
 ## v1.1.2 (2026-06-10)
 
 ### Perf
