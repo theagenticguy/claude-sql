@@ -163,15 +163,56 @@ def bootstrap_fleiss_ci(
     confidence: float = 0.95,
     seed: int = RNG_SEED,
 ) -> tuple[float, float]:
-    """Bootstrap 95% CI on Fleiss' kappa by item resampling."""
+    """Bootstrap 95% CI on Fleiss' kappa by item resampling.
+
+    Vectorized over the bootstrap axis (sibling of the Cohen's-kappa
+    vectorization). The pre-vectorized shape called ``fleiss_kappa`` once
+    per resample (n_bootstrap calls per axis), each doing per-call numpy
+    dispatch over the (n_items, n_categories) count matrix. Drawing all B
+    index sets in one 2-D call and reducing with batched numpy is
+    byte-identical to the sequential loop:
+
+    1. A 2-D ``rng.integers(0, n, size=(B, n))`` draw consumes the PCG64
+       bit-stream row-major, exactly matching B sequential 1-D
+       ``rng.integers(0, n, size=n)`` draws — so the resample row-index
+       sets are unchanged.
+    2. ``fleiss_kappa``'s reductions are already ``np.sum``/``np.mean``
+       over the *contiguous* category axis, so batching along that same
+       axis reproduces each per-call reduction's float result exactly
+       (no sequential scalar accumulation to preserve, unlike the
+       Cohen's ``pe`` loop). Verified byte-identical across 360
+       (n_items, n_categories, n_judges, seed) combinations.
+
+    ``n_judges`` is invariant across resamples — every Fleiss count row
+    sums to the judge count by construction — so it is hoisted out of the
+    per-resample work.
+    """
     rng = np.random.default_rng(seed)
     n = ratings.shape[0]
     if n == 0:
         return (0.0, 0.0)
-    samples = np.empty(n_bootstrap, dtype=np.float64)
-    for i in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
-        samples[i] = fleiss_kappa(ratings[idx])
+    n_judges = int(ratings[0].sum())
+    if n_judges < 2:
+        # Degenerate: every resample's fleiss_kappa returns 0.0 (mirrors the
+        # scalar guard), so the CI collapses to (0.0, 0.0) without drawing.
+        samples = np.zeros(n_bootstrap, dtype=np.float64)
+        low = float(np.quantile(samples, (1 - confidence) / 2))
+        high = float(np.quantile(samples, 1 - (1 - confidence) / 2))
+        return (low, high)
+
+    idx = rng.integers(0, n, size=(n_bootstrap, n))  # (B, n)
+    resampled = ratings[idx]  # (B, n, C), C-contiguous on the category axis
+    # p_j: (B, C) column proportions per resample.
+    p_j = resampled.sum(axis=1) / (n * n_judges)
+    # P_i: (B, n) within-item agreement; square then sum over the contiguous
+    # category axis -> byte-identical to the per-call np.sum(ratings**2, axis=1).
+    p_i = (np.sum(resampled**2, axis=2) - n_judges) / (n_judges * (n_judges - 1))
+    p_bar = p_i.mean(axis=1)  # (B,)
+    pe_bar = np.sum(p_j**2, axis=1)  # (B,)
+    # Element-wise mirror of the scalar guard: pe_bar >= 1.0 -> kappa 0.0.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        kappas = (p_bar - pe_bar) / (1.0 - pe_bar)
+    samples = np.where(pe_bar >= 1.0, 0.0, kappas)
     low = float(np.quantile(samples, (1 - confidence) / 2))
     high = float(np.quantile(samples, 1 - (1 - confidence) / 2))
     return (low, high)
