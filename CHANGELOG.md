@@ -1,3 +1,10 @@
+## v1.1.4 (2026-06-13)
+
+### Perf
+
+- **session-text**: JOIN the session-id window instead of binding a list param (#95)
+- **kappa**: vectorize Fleiss bootstrap CI over the resample axis (~4x) (#94)
+
 ## v1.1.3 (2026-06-11)
 
 ### Perf
