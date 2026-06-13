@@ -33,12 +33,36 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
+import pyarrow as pa
 from loguru import logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from claude_sql.core.config import Settings
+
+#: Name of the transient DuckDB relation holding the in-window session ids.
+#: The three timeline loaders JOIN against this instead of binding the id
+#: list as a ``?`` parameter — see :func:`session_text_corpus`.
+_SID_FILTER_RELATION = "_session_text_sid_filter"
+
+#: Chronological precedence for events sharing a timestamp. Append order plus a
+#: stable sort historically put text before tool_use before tool_result at a
+#: tie; we encode that explicitly so the sort key fully determines order.
+_KIND_RANK = {"text": 0, "tool_use": 1, "tool_result": 2}
+
+
+def _timeline_sort_key(row: _TimelineRow) -> tuple[str, int, str, str]:
+    """Total order for a session's timeline rows.
+
+    ``ts_iso`` is the primary key. The remaining components only break ties
+    *within* one timestamp: ``kind`` preserves the text→tool_use→tool_result
+    precedence, then ``body``/``aux`` canonicalize the order of multiple events
+    emitted in the same millisecond (e.g. several ``tool_use`` blocks in one
+    assistant turn). Without these, the row order at a tie was inherited from
+    the DuckDB scan plan and varied run-to-run.
+    """
+    return (row.ts_iso, _KIND_RANK.get(row.kind, 9), row.body or "", row.aux or "")
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +181,16 @@ def session_text_corpus(
     -----
     We issue three queries — one per source view (``messages_text``,
     ``tool_calls``, ``tool_results``) — filtered by the session-id window
-    resolved from ``messages_text``.  Each result set is ordered by
-    ``(session_id, ts)`` so we can stream it into a dict of lists without a
-    per-row Python sort.  IO errors from stale JSONLs are caught and logged
-    once with the session list that fell out.
+    resolved from ``messages_text``.  The window is handed to DuckDB as a
+    registered Arrow relation that each query JOINs against, rather than
+    binding the id list as a ``?`` parameter: DuckDB probes ``import pandas``
+    ~twice per element while binding a Python ``list`` parameter, and on an
+    install without pandas each probe is a full failed ``sys.path`` scan
+    (~35K failed imports / ~2.5s on a 6K-session corpus). Each result set is
+    ordered by ``(session_id, ts)`` so we can stream it into a dict of lists;
+    a final per-session sort stitches the three streams into one
+    deterministic chronological order. IO errors from stale JSONLs are caught
+    and logged once with the session list that fell out.
     """
     order = _load_session_order(con, since_days=since_days, limit=limit)
     if not order:
@@ -170,20 +200,28 @@ def session_text_corpus(
     session_set = set(order)
     texts_by_session: dict[str, list[_TimelineRow]] = {sid: [] for sid in order}
 
+    # Register the in-window session ids once as an Arrow relation; the three
+    # loaders JOIN against it (see the Notes above for why this beats a bound
+    # list parameter).
+    sid_filter = pa.table({"sid": pa.array(list(session_set), type=pa.string())})
+    con.register(_SID_FILTER_RELATION, sid_filter)
     try:
-        _load_messages_text(con, session_set, texts_by_session)
-        _load_tool_calls(con, session_set, texts_by_session)
-        _load_tool_results(con, session_set, texts_by_session)
+        _load_messages_text(con, texts_by_session)
+        _load_tool_calls(con, texts_by_session)
+        _load_tool_results(con, texts_by_session)
     except duckdb.IOException as exc:
         # A JSONL on the glob can be deleted between view registration and
         # the materializing query.  Log and return whatever landed.
         logger.warning("session_text_corpus: IO error while materializing ({})", exc)
+    finally:
+        con.unregister(_SID_FILTER_RELATION)
 
-    # DuckDB already ordered by (session_id, ts), but each list got fed across
-    # three separate queries so we sort once per session to stitch the three
-    # streams into true chronological order.
+    # DuckDB ordered each query by (session_id, ts), but the three streams are
+    # merged here, and the scan plan does not order rows that share a timestamp.
+    # _timeline_sort_key imposes a total order so the assembled transcript is
+    # byte-stable run-to-run.
     for rows in texts_by_session.values():
-        rows.sort(key=lambda r: r.ts_iso)
+        rows.sort(key=_timeline_sort_key)
 
     # Drop sessions that ended up with no rows at all -- keeps iteration
     # clean for downstream pipelines.
@@ -273,21 +311,23 @@ def session_bounds(
 
 def _load_messages_text(
     con: duckdb.DuckDBPyConnection,
-    session_set: set[str],
     out: dict[str, list[_TimelineRow]],
 ) -> None:
-    """Stream text blocks for every session in ``session_set`` into ``out``."""
-    sql = """
+    """Stream text blocks for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
         SELECT CAST(mt.session_id AS VARCHAR) AS sid,
                mt.ts,
                mt.role,
                mt.text_content
           FROM messages_text mt
-         WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT unnest(?))
+         WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
          ORDER BY sid, mt.ts
     """
-    sids = list(session_set)
-    for sid, ts, role, body in con.execute(sql, [sids]).fetchall():
+    for sid, ts, role, body in con.execute(sql).fetchall():
         out[sid].append(
             _TimelineRow(
                 ts_iso=ts.isoformat() if ts is not None else "",
@@ -301,21 +341,23 @@ def _load_messages_text(
 
 def _load_tool_calls(
     con: duckdb.DuckDBPyConnection,
-    session_set: set[str],
     out: dict[str, list[_TimelineRow]],
 ) -> None:
-    """Stream tool_use events for every session in ``session_set`` into ``out``."""
-    sql = """
+    """Stream tool_use events for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
         SELECT CAST(tc.session_id AS VARCHAR) AS sid,
                tc.ts,
                tc.tool_name,
                CAST(tc.tool_input AS VARCHAR) AS tool_input_json
           FROM tool_calls tc
-         WHERE CAST(tc.session_id AS VARCHAR) IN (SELECT unnest(?))
+         WHERE CAST(tc.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
          ORDER BY sid, tc.ts
     """
-    sids = list(session_set)
-    for sid, ts, tool_name, tool_input_json in con.execute(sql, [sids]).fetchall():
+    for sid, ts, tool_name, tool_input_json in con.execute(sql).fetchall():
         # Defensive: a session id can appear in tool_calls without being in
         # messages_text (tool-use-only probe sessions).  Skip those.
         rows = out.get(sid)
@@ -334,21 +376,23 @@ def _load_tool_calls(
 
 def _load_tool_results(
     con: duckdb.DuckDBPyConnection,
-    session_set: set[str],
     out: dict[str, list[_TimelineRow]],
 ) -> None:
-    """Stream tool_result events for every session in ``session_set`` into ``out``."""
-    sql = """
+    """Stream tool_result events for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
         SELECT CAST(tr.session_id AS VARCHAR) AS sid,
                tr.ts,
                tr.tool_use_id,
                CAST(tr.content AS VARCHAR) AS content_json
           FROM tool_results tr
-         WHERE CAST(tr.session_id AS VARCHAR) IN (SELECT unnest(?))
+         WHERE CAST(tr.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
          ORDER BY sid, tr.ts
     """
-    sids = list(session_set)
-    for sid, ts, tool_use_id, content_json in con.execute(sql, [sids]).fetchall():
+    for sid, ts, tool_use_id, content_json in con.execute(sql).fetchall():
         rows = out.get(sid)
         if rows is None:
             continue
