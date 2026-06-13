@@ -133,6 +133,48 @@ def test_bootstrap_all_same_category_no_nan() -> None:
     assert hi == 0.0
 
 
+def test_bootstrap_fleiss_vectorized_matches_per_call() -> None:
+    # bootstrap_fleiss_ci is vectorized over the resample axis (one 2-D index
+    # draw instead of n_bootstrap sequential 1-D draws + per-call fleiss_kappa).
+    # This must stay byte-identical to a sequential per-call reference across
+    # category counts where np.sum reassociation could otherwise drift a ULP.
+    rng = np.random.default_rng(123)
+    n_items, n_cats, n_judges = 200, 5, 9
+    counts = np.zeros((n_items, n_cats), dtype=np.int64)
+    for r in range(n_items):
+        for d in rng.integers(0, n_cats, size=n_judges):
+            counts[r, d] += 1
+
+    def bootstrap_per_call(ratings, n_bootstrap, confidence=0.95, seed=kw.RNG_SEED):
+        rg = np.random.default_rng(seed)
+        n = ratings.shape[0]
+        samples = np.empty(n_bootstrap, dtype=np.float64)
+        for i in range(n_bootstrap):
+            idx = rg.integers(0, n, size=n)
+            samples[i] = kw.fleiss_kappa(ratings[idx])
+        # Mirror the source's quantile-arg arithmetic exactly: (1-0.95)/2 is
+        # 0.025000000000000022, not the literal 0.025, and np.quantile
+        # interpolates differently at those two probabilities (1-ULP drift).
+        return (
+            float(np.quantile(samples, (1 - confidence) / 2)),
+            float(np.quantile(samples, 1 - (1 - confidence) / 2)),
+        )
+
+    lo_v, hi_v = kw.bootstrap_fleiss_ci(counts, n_bootstrap=1000, seed=42)
+    lo_p, hi_p = bootstrap_per_call(counts, n_bootstrap=1000, seed=42)
+    assert lo_v == lo_p
+    assert hi_v == hi_p
+
+
+def test_bootstrap_fleiss_degenerate_single_judge_no_nan() -> None:
+    # With n_judges < 2 every resample's fleiss_kappa returns 0.0 (the scalar
+    # guard); the vectorized fast-path must yield (0.0, 0.0), never NaN/inf.
+    counts = np.ones((6, 1), dtype=np.int64)  # 6 items, 1 category, 1 judge/row
+    lo, hi = kw.bootstrap_fleiss_ci(counts, n_bootstrap=300, seed=42)
+    assert lo == 0.0
+    assert hi == 0.0
+
+
 def test_compute_pairwise_smoke() -> None:
     df = pl.DataFrame(
         {
