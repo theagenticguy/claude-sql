@@ -492,3 +492,101 @@ def test_session_text_corpus_skips_tool_only_session(tmp_path: Path) -> None:
         assert all(r.kind == "text" for r in rows)
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. Deterministic timeline order at equal timestamps
+#
+# Regression guard for the arrow-join loader rewrite. The three timeline
+# queries are merged and sorted in Python; the DuckDB scan plan does not
+# order rows that share a timestamp, so without an explicit total order the
+# assembled transcript drifted run-to-run whenever one assistant turn emitted
+# several tool_use blocks at the same millisecond. _timeline_sort_key pins a
+# total order: (ts, kind_rank, body, aux).
+# ---------------------------------------------------------------------------
+
+
+def _tied_timestamp_con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
+    """A one-session corpus whose assistant turn fires three tool_use blocks
+    plus a text block, all stamped at the same instant."""
+    proj = tmp_path / "projects" / "proj-tie"
+    sid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    tied_ts = "2026-04-05T12:00:00.000Z"
+    write_session_jsonl(
+        proj / f"{sid}.jsonl",
+        messages=[
+            make_user_msg(
+                "t1",
+                sid,
+                "kick off a parallel batch of reads — long enough for the filter",
+                ts="2026-04-05T11:59:00.000Z",
+            ),
+            make_assistant_msg(
+                "t2",
+                sid,
+                ts=tied_ts,
+                content=[
+                    {"type": "text", "text": "running three reads at once"},
+                    {
+                        "type": "tool_use",
+                        "id": "tu-z",
+                        "name": "Read",
+                        "input": {"file_path": "/z.txt"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tu-a",
+                        "name": "Read",
+                        "input": {"file_path": "/a.txt"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tu-m",
+                        "name": "Read",
+                        "input": {"file_path": "/m.txt"},
+                    },
+                ],
+            ),
+        ],
+    )
+    glob = str(tmp_path / "projects" / "*" / "*.jsonl")
+    return _open_views(tmp_path, glob)
+
+
+def test_session_text_corpus_is_deterministic_across_rebuilds(tmp_path: Path) -> None:
+    """Repeated corpus builds yield byte-identical timelines even when several
+    events share one timestamp."""
+    con = _tied_timestamp_con(tmp_path)
+    try:
+        first = session_text_corpus(con)
+        for _ in range(4):
+            again = session_text_corpus(con)
+            assert again.order == first.order
+            for sid in first.order:
+                assert again.texts_by_session[sid] == first.texts_by_session[sid]
+    finally:
+        con.close()
+
+
+def test_session_text_corpus_tie_ordering_is_body_ranked(tmp_path: Path) -> None:
+    """Several tool_use blocks emitted at one timestamp fall in a fixed body
+    order — the sort key's third component — not the scan-plan order."""
+    con = _tied_timestamp_con(tmp_path)
+    try:
+        corpus = session_text_corpus(con)
+        sid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        rows = corpus.texts_by_session[sid]
+        # The three reads share the assistant turn's timestamp (the latest ts
+        # in the session); the earlier user-text row sits before them.
+        tied_ts = max(r.ts_iso for r in rows)
+        tied = [r for r in rows if r.ts_iso == tied_ts]
+        assert [r.kind for r in tied] == ["tool_use", "tool_use", "tool_use"]
+        # Ordered by tool_input body, ascending → /a.txt, /m.txt, /z.txt,
+        # regardless of the order DuckDB's scan returned them.
+        tool_bodies = [r.body or "" for r in tied]
+        assert tool_bodies == sorted(tool_bodies)
+        assert "/a.txt" in tool_bodies[0]
+        assert "/m.txt" in tool_bodies[1]
+        assert "/z.txt" in tool_bodies[2]
+    finally:
+        con.close()
