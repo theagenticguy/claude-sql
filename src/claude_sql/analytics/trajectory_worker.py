@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 import polars as pl
+import pyarrow as pa
 from loguru import logger
 
 from claude_sql.core import checkpointer, retry_queue
@@ -74,6 +75,15 @@ MAX_WINDOWS_PER_CHUNK: int = 16
 
 #: Numeric encoding of the three-label sentiment for the ``delta`` column.
 _SENTIMENT_VAL: dict[str, int] = {"negative": -1, "neutral": 0, "positive": 1}
+
+#: Name of the transient Arrow relation that holds the in-window session-id
+#: set for ``_load_windows``. Registered once per call and JOINed against
+#: instead of binding the id list as a ``?`` parameter — DuckDB's Python
+#: client probes ``import pandas`` ~twice per bound list element, and pandas
+#: is not a dependency, so each probe is a full failed ``sys.path`` scan
+#: (~3.4K failed imports on a cold-rebuild ~1.7K-session corpus). Mirrors the
+#: ``session_text`` fix (#95). See ``_load_windows`` for the JOIN site.
+_SID_FILTER_RELATION = "_trajectory_window_sid_filter"
 
 #: The six transition_kind labels — pinned in code so the count never drifts
 #: from the schema. Tested in ``test_transition_kind_enum_values_are_six``.
@@ -399,13 +409,19 @@ def _load_windows(
     ``messages_text`` for the prev/curr text bodies. Compact-summary rows
     are excluded inside the view itself.
     """
+    # Filter the session window via a JOIN onto an Arrow relation rather than
+    # binding ``active_sessions`` as a ``?`` list parameter. On a cold/forced
+    # rebuild ``active_sessions`` is the whole corpus (~1.7K+ ids), and a bound
+    # Python list makes DuckDB's client probe ``import pandas`` ~twice per
+    # element (a failed ``sys.path`` scan, since pandas is not a dependency) —
+    # ~3.4K wasted imports here. Registering the ids once as an Arrow relation
+    # and JOINing drops that to a single probe. Byte-identical output (ordered
+    # and multiset) verified on the live corpus. Mirrors #95 in ``session_text``.
     where = ["1=1"]
-    params: list[object] = []
     if since_days is not None:
         where.append(f"tw.curr_ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
     if active_sessions:
-        where.append("CAST(tw.session_id AS VARCHAR) IN (SELECT unnest(?))")
-        params.append(list(active_sessions))
+        where.append(f"CAST(tw.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})")
     sql = f"""
         SELECT CAST(tw.session_id AS VARCHAR) AS session_id,
                tw.prev_uuid,
@@ -423,7 +439,15 @@ def _load_windows(
     """
     if limit is not None:
         sql += f"\nLIMIT {int(limit)}"
-    rows = con.execute(sql, params).fetchall()
+    if active_sessions:
+        sid_filter = pa.table({"sid": pa.array(list(active_sessions), type=pa.string())})
+        con.register(_SID_FILTER_RELATION, sid_filter)
+        try:
+            rows = con.execute(sql).fetchall()
+        finally:
+            con.unregister(_SID_FILTER_RELATION)
+    else:
+        rows = con.execute(sql).fetchall()
     out: list[tuple[str, str | None, str, str | None, str, str | None, str]] = []
     for sid, prev_uuid, curr_uuid, prev_role, curr_role, prev_text, curr_text, _idx in rows:
         if curr_uuid is None or curr_text is None:
