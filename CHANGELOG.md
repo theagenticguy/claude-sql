@@ -1,3 +1,9 @@
+## v1.1.5 (2026-06-14)
+
+### Perf
+
+- **trajectory**: JOIN the session-id window instead of binding a list param (#98)
+
 ## v1.1.4 (2026-06-13)
 
 ### Perf
