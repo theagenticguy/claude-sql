@@ -223,6 +223,71 @@ def test_load_windows_with_since_days_and_limit(tmp_path: Path, tmp_settings: Se
     con.close()
 
 
+def test_load_windows_arrow_join_byte_identical_to_unnest_bind(
+    tmp_path: Path, tmp_settings: Settings
+) -> None:
+    """The Arrow-relation JOIN filter is byte-identical to the old ``unnest(?)`` bind.
+
+    PATTERN-H perf change: ``_load_windows`` filters ``active_sessions`` by
+    JOINing a registered Arrow relation instead of binding the id list as a
+    ``?`` parameter (kills DuckDB's ~2-probes-per-element pandas ``sys.path``
+    storm on a cold-rebuild full-corpus run). The filter SEMANTICS must not
+    move: run the production loader (Arrow JOIN) and the legacy bound-list SQL
+    against the SAME connection and assert the row lists are identical, ordered
+    and as a multiset.
+    """
+    sids = ["sess-a", "sess-b", "sess-c"]
+    con = _build_corpus(
+        tmp_path,
+        [
+            (
+                sid,
+                [
+                    _user(f"{sid}-u1", sid, "first opener long enough to clear the floor", off=0),
+                    _user(f"{sid}-u2", sid, "second turn long enough to clear the floor", off=1),
+                    _user(f"{sid}-u3", sid, "third turn long enough to clear the floor", off=2),
+                ],
+            )
+            for sid in sids
+        ],
+    )
+    # Filter to a strict SUBSET so the predicate actually has to discriminate.
+    active = {"sess-a", "sess-c"}
+
+    # NEW shape: the production loader (registers the Arrow relation + JOINs).
+    new_rows = trajectory_worker._load_windows(
+        con, active_sessions=active, since_days=3650, limit=None
+    )
+
+    # OLD shape: the legacy bound-list SQL, run inline against the same con.
+    old_sql = """
+        SELECT CAST(tw.session_id AS VARCHAR) AS session_id,
+               tw.prev_uuid, tw.curr_uuid, tw.prev_role, tw.curr_role,
+               mt_prev.text_content AS prev_text,
+               mt_curr.text_content AS curr_text,
+               tw.window_idx
+          FROM turn_window tw
+          LEFT JOIN messages_text mt_prev ON CAST(mt_prev.uuid AS VARCHAR) = tw.prev_uuid
+          LEFT JOIN messages_text mt_curr ON CAST(mt_curr.uuid AS VARCHAR) = tw.curr_uuid
+         WHERE 1=1 AND CAST(tw.session_id AS VARCHAR) IN (SELECT unnest(?))
+         ORDER BY tw.session_id, tw.window_idx
+    """
+    raw_old = con.execute(old_sql, [list(active)]).fetchall()
+    # Apply the same null-curr drop + tuple projection the loader does.
+    old_rows = [
+        (sid, pu, cu, pr, cr, pt, ct)
+        for sid, pu, cu, pr, cr, pt, ct, _idx in raw_old
+        if cu is not None and ct is not None
+    ]
+
+    assert new_rows  # the subset is non-empty
+    assert new_rows == old_rows  # ordered byte-identity
+    assert sorted(map(repr, new_rows)) == sorted(map(repr, old_rows))  # multiset
+    # Only the in-filter sessions appear; the excluded one is gone.
+    assert {r[0] for r in new_rows} == active
+    con.close()
+
+
 def test_load_windows_skips_rows_with_null_curr(tmp_path: Path) -> None:
     """A row whose ``curr_uuid`` or ``curr_text`` is None is dropped (covers line 430).
 
@@ -245,6 +310,13 @@ def test_load_windows_skips_rows_with_null_curr(tmp_path: Path) -> None:
     class FakeCon:
         def execute(self, sql: str, params: Any = None) -> Any:
             return FakeFetchResult()
+
+        def register(self, name: str, obj: Any) -> None:
+            """No-op: the real loader registers the session-id Arrow relation
+            before the turn_window query (perf: JOIN instead of a bound list)."""
+
+        def unregister(self, name: str) -> None:
+            """No-op twin of ``register`` — the loader unregisters in a finally."""
 
     rows = trajectory_worker._load_windows(
         FakeCon(),  # type: ignore[arg-type]
