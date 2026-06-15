@@ -1,3 +1,9 @@
+## v1.1.7 (2026-06-15)
+
+### Fix
+
+- **conflicts**: raise classify_max_tokens 2048 → 16000 to stop max_tokens truncation (#106)
+
 ## v1.1.6 (2026-06-15)
 
 ### Perf
