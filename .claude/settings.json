@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/augment.sh",
+            "timeout": 5,
+            "statusMessage": "Enriching with codehub graph context..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"${CLAUDE_TOOL_INPUT:-}\" | grep -qE 'git (commit|merge|rebase|pull)'; then codehub analyze || true; fi"
+          },
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/docs-staleness.sh",
+            "timeout": 4
+          }
+        ]
+      }
+    ]
+  }
+}
