@@ -242,8 +242,15 @@ class Settings(BaseSettings):
     #: from reasoning.  Bumps to ``adaptive`` only if quality regresses
     #: in real eval data.
     friction_thinking: Literal["adaptive", "disabled"] = "disabled"
-    #: Max output tokens for a single classification call.
-    classify_max_tokens: int = 2048
+    #: Max output tokens for a single classification call — covers BOTH the
+    #: adaptive-thinking budget AND the structured-output answer. The old
+    #: 2048 ceiling truncated large `conflicts` sessions: adaptive thinking
+    #: consumed the whole budget, the model emitted only a `thinking` block,
+    #: `stop_reason` came back `max_tokens`, and the parser raised on the
+    #: answer-less payload (see the conflicts retry-queue silent-drop bug,
+    #: 2026-06-15). 16000 leaves ample room for thinking + a full conflict
+    #: array on the largest sessions.
+    classify_max_tokens: int = 16000
     #: Per-text clip used when assembling session_text — tool_results can be
     #: arbitrarily large (Bash output, file reads).
     session_text_tool_result_max_chars: int = 50_000
