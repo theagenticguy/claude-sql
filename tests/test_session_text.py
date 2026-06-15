@@ -590,3 +590,91 @@ def test_session_text_corpus_tie_ordering_is_body_ranked(tmp_path: Path) -> None
         assert "/z.txt" in tool_bodies[2]
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. Engine-side ts.isoformat() (the timeline loaders format ts in SQL, not
+#    via a per-row Python ``ts.isoformat()`` call — see ``_iso_expr``).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "2026-04-01 10:00:00",  # whole second -> isoformat omits .%f
+        "2026-04-01 10:00:00.5",  # 500ms
+        "2026-04-01 10:00:00.123",  # ms precision
+        "2026-04-01 10:00:00.123456",  # full microsecond precision
+        "2026-04-01 10:00:00.000001",  # 1 microsecond
+        "2026-12-31 23:59:59",  # year/whole-second boundary
+        "2026-06-07 13:42:19",  # a real whole-second corpus stamp
+    ],
+)
+def test_iso_expr_matches_python_isoformat(literal: str) -> None:
+    """``_iso_expr`` reproduces ``datetime.isoformat()`` byte-for-byte.
+
+    The subtle case is the whole-second timestamp: ``strftime`` always emits
+    the fractional field, while Python drops it entirely, so the ``CASE`` must
+    pick the no-fraction format exactly when ``ts == date_trunc('second', ts)``.
+    """
+    from claude_sql.core.session_text import _iso_expr
+
+    con = duckdb.connect(":memory:")
+    try:
+        ts, iso = con.execute(
+            f"SELECT t, {_iso_expr('t')} FROM (SELECT TIMESTAMP '{literal}' AS t)"
+        ).fetchone()
+        assert iso == ts.isoformat()
+    finally:
+        con.close()
+
+
+def test_corpus_ts_iso_matches_python_isoformat_with_subsecond(tmp_path: Path) -> None:
+    """End-to-end: corpus ``ts_iso`` equals ``ts.isoformat()`` across a session
+    that mixes whole-second, millisecond, and microsecond timestamps.
+
+    Guards the engine-side formatting against any future ``strftime`` drift —
+    the loaders no longer touch ``ts`` in Python, so this is the only check
+    that the rendered timeline string still matches the canonical Python form.
+    """
+    proj = tmp_path / "projects" / "proj-iso"
+    sid = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    # Three user messages at distinct sub-second precisions. The Z suffix is
+    # parsed to a naive UTC ts (the corpus carries no tzinfo — see register_raw),
+    # so the Python reference uses naive datetimes too.
+    stamps = (
+        "2026-04-01T10:00:00.000Z",  # whole second
+        "2026-04-01T10:00:01.500Z",  # 500 ms
+        "2026-04-01T10:00:02.123456Z",  # microseconds
+    )
+    write_session_jsonl(
+        proj / f"{sid}.jsonl",
+        messages=[
+            make_user_msg(
+                f"iso{i}",
+                sid,
+                f"message {i} long enough to clear the 32-char user-text filter here",
+                ts=ts,
+            )
+            for i, ts in enumerate(stamps)
+        ],
+    )
+    glob = str(tmp_path / "projects" / "*" / "*.jsonl")
+    con = _open_views(tmp_path, glob)
+    try:
+        corpus = session_text_corpus(con)
+        rows = corpus.texts_by_session[sid]
+        got = [r.ts_iso for r in rows]
+        # Reference: read the same ts values raw and isoformat() them in Python.
+        raw = con.execute(
+            "SELECT ts FROM messages_text WHERE CAST(session_id AS VARCHAR) = ? ORDER BY ts",
+            [sid],
+        ).fetchall()
+        want = [r[0].isoformat() for r in raw]
+        assert got == want
+        # And the whole-second row carries no fractional component.
+        assert got[0] == "2026-04-01T10:00:00"
+        assert got[1] == "2026-04-01T10:00:01.500000"
+        assert got[2] == "2026-04-01T10:00:02.123456"
+    finally:
+        con.close()
