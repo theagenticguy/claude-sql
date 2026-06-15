@@ -35,7 +35,7 @@ def _plugin_manifest(version_dir: Path, name: str, version: str) -> None:
 def _build_fixture_layout(root: Path) -> None:
     """Lay out a realistic slice of ~/.claude/skills + plugins/cache."""
     user_skills = root / "skills"
-    _write_skill(user_skills / "gitnexus-cli", "gitnexus-cli", "Run gitnexus CLI.")
+    _write_skill(user_skills / "local-tool", "local-tool", "Run the local tool CLI.")
 
     cache = root / "plugins" / "cache"
     # Two versions of the same plugin; newest (1.29.0) should win.
@@ -113,10 +113,10 @@ def test_sync_writes_parquet(tmp_path: Path) -> None:
     assert clear["source_kind"].item() == "builtin"
 
     # User-skill takes precedence over plugin-skill for duplicate bare names
-    # (gitnexus-cli only exists in ~/.claude/skills here).
-    gn = df.filter(pl.col("skill_id") == "gitnexus-cli")
-    assert gn.height == 1
-    assert gn["source_kind"].item() == "user-skill"
+    # (local-tool only exists in ~/.claude/skills here).
+    user_only = df.filter(pl.col("skill_id") == "local-tool")
+    assert user_only.height == 1
+    assert user_only["source_kind"].item() == "user-skill"
 
 
 def test_sync_missing_roots_are_skipped(tmp_path: Path) -> None:
