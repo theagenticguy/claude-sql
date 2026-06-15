@@ -1,3 +1,9 @@
+## v1.1.6 (2026-06-15)
+
+### Perf
+
+- **session-text**: format ts.isoformat() engine-side in the timeline loaders (#100)
+
 ## v1.1.5 (2026-06-14)
 
 ### Perf
