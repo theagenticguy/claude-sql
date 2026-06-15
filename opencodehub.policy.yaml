@@ -1,0 +1,31 @@
+# OpenCodeHub policy (v1 — starter, all rules commented out)
+#
+# Consumed by 'codehub verdict' (ships in spec 002 P1). Uncomment the
+# rule types you want to enforce. Schema:
+#   packages/policy/schemas/policy-v1.json (once spec 002 lands)
+#
+# See ADR 0007 for scope rationale. Self-hosted OSS only — no calls
+# to any OpenCodeHub-operated service from this file or from the CI
+# actions that consume it.
+#
+# version: 1
+#
+# auto_approve:
+#   require:
+#     - blast_radius.tier: ">= 3"       # only tier-3-or-safer PRs auto-approve
+#     - findings.severity_error: 0
+#     - license_audit.violations: 0
+#
+# rules:
+#   - id: no-disallowed-licenses
+#     type: license_allowlist
+#     deny: ["GPL-3.0", "AGPL-3.0"]
+#
+#   - id: require-storage-owner
+#     type: ownership_required
+#     paths: ["packages/storage/**"]
+#     require_approval_from: ["@storage-team"]
+#
+#   - id: blast-radius-cap
+#     type: blast_radius_max
+#     max_tier: 2

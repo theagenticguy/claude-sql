@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "codehub": {
+      "command": "codehub",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

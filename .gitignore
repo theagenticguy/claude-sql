@@ -22,3 +22,5 @@ repomix-output.xml
 docs/.repomix/
 docs/.packets/
 .import_linter_cache/
+# OpenCodeHub local state
+.codehub/
