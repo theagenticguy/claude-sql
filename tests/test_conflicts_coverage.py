@@ -410,7 +410,26 @@ def test_mixed_valid_and_degenerate_only_keeps_valid(
 ) -> None:
     """One degenerate pair beside a valid one → only the valid pair lands."""
     sid = "sess-mixed-pairs"
-    con = _one_session_con(tmp_path, sid=sid)
+    # The valid pair names turns real-a / real-b; seed them as real messages
+    # so the uuid-validity guard (#109) keeps that pair. ``dupe`` is degenerate
+    # (turn_a == turn_b) and is dropped by the pre-existing degenerate check.
+    con = _build_con(
+        tmp_path,
+        [
+            (
+                sid,
+                [
+                    make_user_msg(
+                        uuid,
+                        sid,
+                        "substantive user message that easily clears the messages_text filter",
+                        ts=f"2026-04-10T10:0{i}:00.000Z",
+                    )
+                    for i, uuid in enumerate(["u-cov-1", "real-a", "real-b"])
+                ],
+            )
+        ],
+    )
 
     payload = {
         "conflicts": [

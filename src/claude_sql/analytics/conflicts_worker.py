@@ -128,6 +128,42 @@ def _purge_legacy_shards(target: Path) -> None:
         target.unlink(missing_ok=True)
 
 
+_UUID_FILTER_RELATION = "_conflicts_sid_filter"
+
+
+def _valid_turn_uuids(
+    con: duckdb.DuckDBPyConnection,
+    session_ids: list[str],
+) -> dict[str, set[str]]:
+    """Map each pending session id -> the set of its real ``messages`` uuids.
+
+    Used to validate the model's returned ``turn_*_uuid`` values before they
+    land in the parquet (issue #109). Only ``messages`` uuids are valid turn
+    keys; tool-use ids and approximated strings are not. The session-id window
+    is registered once as an Arrow relation and JOINed (the PATTERN-H idiom)
+    rather than bound as a list parameter, so a large pending set does not
+    trigger DuckDB's per-element ``import pandas`` probe storm.
+    """
+    if not session_ids:
+        return {}
+    sid_filter = pa.table({"sid": pa.array(session_ids, type=pa.string())})
+    con.register(_UUID_FILTER_RELATION, sid_filter)
+    try:
+        sql = f"""
+            SELECT CAST(m.session_id AS VARCHAR) AS sid,
+                   CAST(m.uuid AS VARCHAR)       AS uuid
+              FROM messages m
+             WHERE CAST(m.session_id AS VARCHAR) IN (SELECT sid FROM {_UUID_FILTER_RELATION})
+               AND m.uuid IS NOT NULL
+        """
+        out: dict[str, set[str]] = {}
+        for sid, uuid in con.execute(sql).fetchall():
+            out.setdefault(sid, set()).add(uuid)
+    finally:
+        con.unregister(_UUID_FILTER_RELATION)
+    return out
+
+
 async def _conflicts_async(
     con: duckdb.DuckDBPyConnection,
     settings: Settings,
@@ -161,7 +197,16 @@ async def _conflicts_async(
         keep |= retry_ids
 
     pending: list[tuple[str, str]] = []
-    for sid, text in iter_session_texts(con, settings=settings, since_days=since_days, limit=limit):
+    # ``include_uuids=True`` puts each turn's message uuid in the transcript
+    # header (``[uuid=... role ts]``) so the model can copy ``turn_a_uuid`` /
+    # ``turn_b_uuid`` verbatim instead of approximating them. Without it the
+    # model invents ids (tool-use ids, integers) that match no message, which
+    # is why ``detected_at``-free temporal recovery (issue #109) could only
+    # reach ~32% of rows. The host-side guard below is the belt to this
+    # suspenders: it drops any returned pair whose uuids are not real.
+    for sid, text in iter_session_texts(
+        con, settings=settings, since_days=since_days, limit=limit, include_uuids=True
+    ):
         if sid in already and sid not in retry_ids:
             continue
         if sid not in keep:
@@ -173,6 +218,13 @@ async def _conflicts_async(
         return 0
     if skipped:
         logger.info("conflicts: skipped {} sessions via checkpoint", skipped)
+
+    # Per-session set of real message uuids, used to validate the model's
+    # returned ``turn_*_uuid`` values before they land in the parquet. Built
+    # once from ``messages_text`` over just the pending sessions so the guard
+    # is O(turns), not a per-pair query. A pair naming a uuid not in its
+    # session's set is dropped (see the emit loop).
+    valid_uuids = _valid_turn_uuids(con, [sid for sid, _ in pending])
 
     client = _build_bedrock_client(settings)
     sem = anyio.CapacityLimiter(settings.llm_concurrency)
@@ -234,6 +286,26 @@ async def _conflicts_async(
                         sid,
                         turn_a,
                         turn_b,
+                    )
+                    continue
+                # uuid-validity guard (issue #109): the model is now shown
+                # ``[uuid=...]`` headers and told to copy them verbatim, but a
+                # tool-use id or an approximated string can still slip through.
+                # A pair whose turn uuids are not BOTH real message uuids for
+                # this session can never be recovered on a conversation-time
+                # axis, so drop it at the source rather than write an
+                # unrecoverable row. Empty set (e.g. uuid map unavailable) ->
+                # skip the guard rather than drop every row.
+                session_uuids = valid_uuids.get(sid)
+                if session_uuids and (turn_a not in session_uuids or turn_b not in session_uuids):
+                    logger.warning(
+                        "conflicts: {} returned a pair with non-message uuids "
+                        "(turn_a={!r} valid={}, turn_b={!r} valid={}) — skipping",
+                        sid,
+                        turn_a,
+                        turn_a in session_uuids,
+                        turn_b,
+                        turn_b in session_uuids,
                     )
                     continue
                 rows.append(

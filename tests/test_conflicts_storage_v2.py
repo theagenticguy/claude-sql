@@ -141,6 +141,9 @@ def test_session_with_two_conflicts_writes_two_rows_keyed_on_pair(
 ) -> None:
     """Two pairs returned → two parquet rows, keyed on ``(turn_a_uuid, turn_b_uuid)``."""
     sid = "sess-two-pairs"
+    # The conflict pairs name turn uuids turn-001/002/007/009; the host-side
+    # uuid-validity guard (issue #109) drops any pair whose turn uuids are not
+    # real ``messages`` uuids, so the corpus must actually contain those turns.
     con = _build_con(
         tmp_path,
         [
@@ -148,10 +151,13 @@ def test_session_with_two_conflicts_writes_two_rows_keyed_on_pair(
                 sid,
                 [
                     make_user_msg(
-                        "u-rich",
+                        uuid,
                         sid,
                         "this is a substantive technical discussion that easily clears the filter",
-                        ts="2026-04-02T10:00:00.000Z",
+                        ts=f"2026-04-02T10:0{i}:00.000Z",
+                    )
+                    for i, uuid in enumerate(
+                        ["u-rich", "turn-001", "turn-002", "turn-007", "turn-009"]
                     )
                 ],
             )
@@ -215,6 +221,73 @@ def test_session_with_two_conflicts_writes_two_rows_keyed_on_pair(
 
     # Confidence round-trips as a float.
     assert df["confidence"].to_list() == pytest.approx([0.82, 0.95])
+    con.close()
+
+
+def test_pair_with_non_message_uuids_is_dropped(
+    tmp_path: Path,
+    tmp_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uuid-validity guard (issue #109): a pair whose turn uuids are not real
+    ``messages`` uuids is dropped before it reaches the parquet, so every
+    written row is recoverable on a conversation-time axis via
+    ``conflicts_over_time``. The model approximating a tool-use id or an
+    integer (the live-corpus failure mode) must not poison the cache."""
+    sid = "sess-ghost-uuids"
+    con = _build_con(
+        tmp_path,
+        [
+            (
+                sid,
+                [
+                    make_user_msg(
+                        uuid,
+                        sid,
+                        "substantive technical discussion that easily clears the messages filter",
+                        ts=f"2026-04-03T10:0{i}:00.000Z",
+                    )
+                    for i, uuid in enumerate(["u-real", "real-turn-a", "real-turn-b"])
+                ],
+            )
+        ],
+    )
+
+    payload = {
+        "conflicts": [
+            {
+                # Both uuids are real -> kept.
+                "turn_a_uuid": "real-turn-a",
+                "turn_b_uuid": "real-turn-b",
+                "conflict_kind": "disagreement",
+                "severity": "medium",
+                "agent_position": "A",
+                "user_position": "B",
+                "confidence": 0.8,
+            },
+            {
+                # turn_b is a tool-use id the model approximated -> dropped.
+                "turn_a_uuid": "real-turn-a",
+                "turn_b_uuid": "toolu_bdrk_0nothing_real",
+                "conflict_kind": "correction",
+                "severity": "low",
+                "agent_position": "C",
+                "user_position": "D",
+                "confidence": 0.6,
+            },
+        ]
+    }
+    monkeypatch.setattr(conflicts_worker, "classify_one", AsyncMock(return_value=payload))
+    monkeypatch.setattr(conflicts_worker, "_build_bedrock_client", lambda _s: object())
+
+    processed = conflicts_worker.detect_conflicts(con, tmp_settings, dry_run=False)
+    assert processed == 1
+
+    df = read_all(tmp_settings.conflicts_parquet_path)
+    assert df is not None
+    assert df.height == 1, "only the pair with two real message uuids survives the guard"
+    pair = (df["turn_a_uuid"].to_list()[0], df["turn_b_uuid"].to_list()[0])
+    assert pair == ("real-turn-a", "real-turn-b")
     con.close()
 
 
@@ -330,7 +403,21 @@ def test_conflicts_summary_view_excludes_zero_conflict_sessions(
                         sid_loud,
                         f"MARKER_LOUD {sid_loud} substantive message about a real conflict",
                         ts="2026-04-05T10:00:00.000Z",
-                    )
+                    ),
+                    # The loud session's conflict names turns loud-a / loud-b;
+                    # seed them so the uuid-validity guard (#109) keeps the row.
+                    make_user_msg(
+                        "loud-a",
+                        sid_loud,
+                        f"MARKER_LOUD {sid_loud} stance A on the real conflict at hand",
+                        ts="2026-04-05T10:01:00.000Z",
+                    ),
+                    make_user_msg(
+                        "loud-b",
+                        sid_loud,
+                        f"MARKER_LOUD {sid_loud} opposing stance B on the same conflict",
+                        ts="2026-04-05T10:02:00.000Z",
+                    ),
                 ],
             ),
         ],
