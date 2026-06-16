@@ -125,6 +125,11 @@ class _TimelineRow:
     kind: str  # "text" | "tool_use" | "tool_result"
     body: str | None
     aux: str | None  # tool_name for tool_use, tool_use_id for tool_result
+    # The message uuid, populated only on ``kind == "text"`` rows (the turn
+    # uuids the conflicts pipeline needs to copy verbatim). ``None`` on
+    # tool_use / tool_result rows, which are not addressable turns. Surfaced
+    # in the transcript only when ``assemble(include_uuids=True)``.
+    uuid: str | None = None
 
 
 @dataclass(slots=True)
@@ -142,11 +147,18 @@ class SessionTextCorpus:
     def __len__(self) -> int:
         return len(self.order)
 
-    def assemble(self, session_id: str, *, settings: Settings) -> str:
+    def assemble(self, session_id: str, *, settings: Settings, include_uuids: bool = False) -> str:
         """Render one session as a single newline-separated transcript.
 
         Applies :attr:`Settings.session_text_tool_result_max_chars` and the
         total-length cap :attr:`Settings.session_text_total_max_chars`.
+
+        When ``include_uuids`` is True, each text turn's header carries its
+        message uuid as ``[uuid=<id> role ts]`` so a classifier can copy the
+        turn's natural key verbatim (the conflicts pipeline needs this — see
+        issue #109). The default (False) keeps the historic ``[role ts]``
+        header so the classify / trajectory / friction prompts stay
+        byte-identical run-to-run.
         """
         rows = self.texts_by_session.get(session_id)
         if not rows:
@@ -161,7 +173,10 @@ class SessionTextCorpus:
             if row.body is None:
                 continue
             if row.kind == "text":
-                line = f"[{row.role} {row.ts_iso}] {row.body}"
+                if include_uuids and row.uuid:
+                    line = f"[uuid={row.uuid} {row.role} {row.ts_iso}] {row.body}"
+                else:
+                    line = f"[{row.role} {row.ts_iso}] {row.body}"
             elif row.kind == "tool_use":
                 name = row.aux or "tool"
                 line = f"[tool_use:{name} {row.ts_iso}] {_tool_input_preview(row.body)}"
@@ -344,12 +359,13 @@ def _load_messages_text(
         SELECT CAST(mt.session_id AS VARCHAR) AS sid,
                CASE WHEN mt.ts IS NULL THEN '' ELSE {_iso_expr("mt.ts")} END AS ts_iso,
                mt.role,
-               mt.text_content
+               mt.text_content,
+               CAST(mt.uuid AS VARCHAR) AS uuid
           FROM messages_text mt
          WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
          ORDER BY sid, mt.ts
     """
-    for sid, ts_iso, role, body in con.execute(sql).fetchall():
+    for sid, ts_iso, role, body, uuid in con.execute(sql).fetchall():
         out[sid].append(
             _TimelineRow(
                 ts_iso=ts_iso,
@@ -357,6 +373,7 @@ def _load_messages_text(
                 kind="text",
                 body=body,
                 aux=None,
+                uuid=uuid,
             )
         )
 
@@ -440,14 +457,20 @@ def iter_session_texts(
     settings: Settings,
     since_days: int | None = None,
     limit: int | None = None,
+    include_uuids: bool = False,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(session_id, text)`` for every session with at least one text block.
 
     Newest-first.  Internally materializes a :class:`SessionTextCorpus` — one
     glob scan regardless of how many sessions match the window.
+
+    ``include_uuids`` is forwarded to :meth:`SessionTextCorpus.assemble`; pass
+    True only for the conflicts pipeline, which needs per-turn uuids in the
+    transcript headers (issue #109). All other callers keep the default so
+    their prompts stay byte-identical.
     """
     corpus = session_text_corpus(con, since_days=since_days, limit=limit)
     for sid in corpus.order:
-        text = corpus.assemble(sid, settings=settings)
+        text = corpus.assemble(sid, settings=settings, include_uuids=include_uuids)
         if text:
             yield sid, text

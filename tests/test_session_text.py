@@ -287,6 +287,33 @@ def test_assemble_renders_user_tool_use_and_result_lines(
     assert rendered.count("\n") == len(rendered.split("\n")) - 1
 
 
+def test_assemble_include_uuids_adds_header_only_on_text_turns(
+    session_text_corpus_con: duckdb.DuckDBPyConnection,
+    tmp_settings: Settings,
+) -> None:
+    """``include_uuids=True`` prefixes text-turn headers with ``[uuid=<id> ...]``
+    (the conflicts pipeline needs verbatim turn uuids — issue #109), while the
+    default keeps the historic ``[role ts]`` header byte-identical so the
+    classify / trajectory / friction prompts never shift."""
+    corpus = session_text_corpus(session_text_corpus_con)
+    sid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    default = corpus.assemble(sid_a, settings=tmp_settings)
+    with_uuids = corpus.assemble(sid_a, settings=tmp_settings, include_uuids=True)
+
+    # Default path: no uuid headers anywhere (byte-identical to pre-#109).
+    assert "[uuid=" not in default
+    assert default.startswith("[user ")
+
+    # uuid path: the fixture's user text turns carry uuids u1 and u3.
+    assert "[uuid=u1 user " in with_uuids
+    assert "[uuid=u3 user " in with_uuids
+    # tool_use / tool_result lines are NOT addressable turns -> no uuid header.
+    assert "[tool_use:Read " in with_uuids
+    assert "[tool_result tu-a1 " in with_uuids
+    assert "[uuid=tu-a1" not in with_uuids
+
+
 def test_assemble_truncates_when_total_exceeds_cap(
     session_text_corpus_con: duckdb.DuckDBPyConnection,
     tmp_path: Path,

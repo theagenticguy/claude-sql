@@ -332,6 +332,7 @@ MACRO_NAMES: tuple[str, ...] = (
     "friction_counts",
     "friction_rate",
     "friction_examples",
+    "conflicts_over_time",
     "unused_skills",
     "canonical_uuid_resolve",
 )
@@ -372,6 +373,7 @@ MACRO_SIGNATURES: dict[str, tuple[str, ...]] = {
     "friction_counts": ("since_days",),
     "friction_rate": ("since_days",),
     "friction_examples": ("label_name", "n"),
+    "conflicts_over_time": ("since_days",),
     "unused_skills": ("last_n_days",),
     "canonical_uuid_resolve": (),
 }
@@ -1155,6 +1157,7 @@ _ANALYTICS_MACRO_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "friction_counts": ("user_friction_parquet_path",),
     "friction_rate": ("user_friction_parquet_path",),
     "friction_examples": ("user_friction_parquet_path",),
+    "conflicts_over_time": ("conflicts_parquet_path",),
     "unused_skills": ("skills_catalog_parquet_path",),
     "canonical_uuid_resolve": ("ingest_stamps_parquet_path",),
 }
@@ -1610,6 +1613,70 @@ def register_macros(
             );
             """,
         ),
+        # Conflicts on a REAL conversation-time axis (issue #109).
+        #
+        # ``session_conflicts.detected_at`` is the *worker run-time* clock,
+        # not when the user and agent actually disagreed -- a whole backfill
+        # run collapses onto one timestamp, so any ``GROUP BY
+        # date_trunc(detected_at)`` describes when the nightly job ran, not
+        # the conversation.  This macro recovers the real moment by joining
+        # the later turn of the pair (``turn_b_uuid``) back to
+        # ``messages.uuid`` and surfacing ``m.ts`` -- the same recover-the-
+        # timestamp-via-join shape as ``sentiment_arc`` (which joins
+        # ``message_trajectory.curr_uuid``), and the same ``ts``-based
+        # ``since_days`` window as ``friction_counts`` (pass NULL for the
+        # full corpus).
+        #
+        # INNER JOIN on purpose: a conflict row only appears here when its
+        # ``turn_b_uuid`` resolves to a real message, so the time axis is
+        # never a fabricated stamp.  On the live corpus a large fraction of
+        # stored ``turn_*_uuid`` values are tool-use ids or model-approximated
+        # strings that are NOT verbatim message uuids (the whole-session
+        # prompt shows ``[role ts]`` headers, not ``[uuid=...]`` ones), so the
+        # recoverable subset is the trustworthy subset -- see the v1.1
+        # pair-scanner note below for the source-side fix.
+        #
+        # ``conversation_ts`` is the real axis; ``detected_at`` is carried
+        # through ONLY so a caller can see the run-time stamp it replaces.
+        # ``root_session_id`` collapses an orchestrator + its subagent
+        # sessions to one conversation: a single back-and-forth that fans
+        # out across N ``session_id`` values dedupes to one root, so
+        # ``count(DISTINCT root_session_id)`` counts distinct *conversations*
+        # that disagreed, not raw rows.
+        (
+            "conflicts_over_time",
+            """
+            CREATE OR REPLACE MACRO conflicts_over_time(since_days) AS TABLE (
+                SELECT m.ts                                          AS conversation_ts,
+                       sc.session_id,
+                       COALESCE(sm.root_sid, sc.session_id)          AS root_session_id,
+                       sc.turn_a_uuid,
+                       sc.turn_b_uuid,
+                       sc.conflict_kind,
+                       sc.severity,
+                       sc.agent_position,
+                       sc.user_position,
+                       sc.confidence,
+                       sc.detected_at
+                  FROM session_conflicts sc
+                  JOIN messages m
+                    ON CAST(m.uuid AS VARCHAR) = sc.turn_b_uuid
+                  LEFT JOIN (
+                      -- child subagent session -> its orchestrator (parent)
+                      -- session; aggregated to one row per child so the join
+                      -- can never fan a conflict row out.
+                      SELECT CAST(session_id AS VARCHAR)                  AS child_sid,
+                             any_value(CAST(parent_session_id AS VARCHAR)) AS root_sid
+                        FROM subagent_messages
+                       GROUP BY CAST(session_id AS VARCHAR)
+                  ) sm
+                    ON sm.child_sid = sc.session_id
+                 WHERE since_days IS NULL
+                    OR m.ts >= current_timestamp - (since_days * INTERVAL 1 DAY)
+                 ORDER BY m.ts DESC
+            );
+            """,
+        ),
         # Catalog entries the user has NOT invoked in the last N days.
         # Pure catalog lookup; ``skills_catalog`` may be missing pre-sync.
         # ``source_kind`` filter keeps out the 'builtin' rows (users
@@ -1918,6 +1985,16 @@ def register_analytics(
         # zero rows -- the legacy ``empty=True`` sentinel is gone, and
         # the legacy ``resolution AS conflict_resolution`` alias with it
         # (RFC 0002 §3.4).
+        #
+        # ⚠️ ``detected_at`` is the WORKER RUN-TIME clock, NOT when the
+        # conflict happened in the conversation (issue #109).  A whole
+        # backfill run stamps every row with one timestamp, so
+        # ``GROUP BY date_trunc(detected_at)`` / ``WHERE detected_at >= ...``
+        # describe *when the nightly job ran*, not when the user and agent
+        # disagreed.  For a real conversation-time axis use the
+        # ``conflicts_over_time(since_days)`` macro, which recovers ``ts`` by
+        # joining ``turn_b_uuid`` back to ``messages.uuid`` (same caveat the
+        # ``friction_counts`` macro already carries for ``user_friction``).
         "session_conflicts": None,
     }
 
