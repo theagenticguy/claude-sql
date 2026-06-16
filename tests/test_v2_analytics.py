@@ -605,3 +605,192 @@ def test_analytics_macros_register_safely(analytics_settings: Settings, tmp_path
     rows = con.execute("SELECT term FROM cluster_top_terms(0, 5) ORDER BY rank").fetchall()
     assert len(rows) == 3  # our fixture has 3 terms per cluster
     assert [r[0] for r in rows] == ["alpha", "beta", "gamma"]
+
+
+# ---------------------------------------------------------------------------
+# conflicts_over_time -- conversation-time recovery (issue #109)
+#
+# ``session_conflicts.detected_at`` is the worker run-time clock, so temporal
+# queries against it describe when the nightly job ran, not when the conflict
+# happened. ``conflicts_over_time(since_days)`` recovers the real moment by
+# joining ``turn_b_uuid`` -> ``messages.uuid`` and surfacing ``m.ts``.
+# ---------------------------------------------------------------------------
+
+
+_CONFLICTS_PARQUET_SCHEMA: dict[str, Any] = {
+    "session_id": pl.Utf8,
+    "turn_a_uuid": pl.Utf8,
+    "turn_b_uuid": pl.Utf8,
+    "conflict_kind": pl.Utf8,
+    "severity": pl.Utf8,
+    "agent_position": pl.Utf8,
+    "user_position": pl.Utf8,
+    "confidence": pl.Float64,
+    "detected_at": pl.Datetime("us", "UTC"),
+}
+
+
+def _make_conflicts_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write a v1.0 conflicts shard. Schema mirrors conflicts_worker._CONFLICTS_PARQUET_SCHEMA."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(rows, schema=_CONFLICTS_PARQUET_SCHEMA).write_parquet(path)
+
+
+def _conflicts_corpus(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, Settings]:
+    """Stand up a tiny transcript corpus + conflicts parquet.
+
+    The corpus has two assistant turns at known, well-separated timestamps so
+    a conversation-time axis is distinguishable from the single run-time
+    ``detected_at`` stamp. ``u-late`` is the recoverable ``turn_b_uuid``;
+    ``ghost-uuid`` is a model-approximated id that matches no message (the
+    common live-corpus case) and must be dropped by the inner join.
+    """
+    proj = tmp_path / "projects" / "-x"
+    proj.mkdir(parents=True)
+    sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    def _rec(uuid: str, ts: str, text: str) -> dict[str, Any]:
+        return {
+            "parentUuid": None,
+            "isSidechain": False,
+            "type": "assistant",
+            "uuid": uuid,
+            "timestamp": ts,
+            "sessionId": sid,
+            "version": "2.0.0",
+            "gitBranch": "main",
+            "cwd": "/x",
+            "userType": "external",
+            "entrypoint": "cli",
+            "permissionMode": "acceptEdits",
+            "promptId": f"p-{uuid}",
+            "message": {
+                "id": f"m-{uuid}",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "content": [{"type": "text", "text": text}],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        }
+
+    lines = [
+        _rec("u-early", "2026-05-01T10:00:00.000Z", "early turn"),
+        _rec("u-late", "2026-05-20T15:30:00.000Z", "late turn where they disagreed"),
+    ]
+    (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(r) for r in lines) + "\n")
+
+    # register_raw's subagent globs must match >=1 file or it raises
+    # IOException on the empty glob -- seed a minimal subagent stub.
+    parent_uuid = "99999999-9999-9999-9999-999999999999"
+    sub_dir = proj / parent_uuid / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-deadbeef.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "description": "placeholder"})
+    )
+    (sub_dir / "agent-deadbeef.jsonl").write_text(
+        json.dumps(dict(lines[0], sessionId=f"sub-{parent_uuid}", uuid="sub-u-1")) + "\n"
+    )
+
+    conf_dir = tmp_path / "conflicts"
+    # Every row stamped with ONE run-time detected_at -- the bug under test.
+    run_time = datetime(2026, 6, 12, 5, 23, tzinfo=UTC)
+    _make_conflicts_parquet(
+        conf_dir / "part-1000000000000000000.parquet",
+        rows=[
+            {
+                "session_id": sid,
+                "turn_a_uuid": "u-early",
+                "turn_b_uuid": "u-late",  # recoverable -> ts 2026-05-20
+                "conflict_kind": "disagreement",
+                "severity": "high",
+                "agent_position": "use approach A",
+                "user_position": "approach B is better",
+                "confidence": 0.9,
+                "detected_at": run_time,
+            },
+            {
+                "session_id": sid,
+                "turn_a_uuid": "u-early",
+                "turn_b_uuid": "ghost-uuid",  # no matching message -> dropped
+                "conflict_kind": "correction",
+                "severity": "low",
+                "agent_position": "x",
+                "user_position": "y",
+                "confidence": 0.5,
+                "detected_at": run_time,
+            },
+        ],
+    )
+
+    settings = Settings(
+        conflicts_parquet_path=conf_dir,
+        classifications_parquet_path=tmp_path / "missing_cls",
+        trajectory_parquet_path=tmp_path / "missing_traj",
+        clusters_parquet_path=tmp_path / "missing_clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "missing_ter.parquet",
+        communities_parquet_path=tmp_path / "missing_comm.parquet",
+        user_friction_parquet_path=tmp_path / "missing_friction",
+    )
+    con = duckdb.connect(":memory:")
+    register_raw(
+        con,
+        glob=str(proj / "*.jsonl"),
+        subagent_glob=str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.jsonl"),
+        subagent_meta_glob=str(
+            tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.meta.json"
+        ),
+    )
+    register_views(con)
+    register_vss(con, embeddings_parquet=tmp_path / "__no_embeddings__.parquet")
+    register_analytics(con, settings=settings)
+    register_macros(con, settings=settings)
+    return con, settings
+
+
+def test_conflicts_over_time_recovers_conversation_ts(tmp_path: Path) -> None:
+    """The macro surfaces the real ``messages.ts`` of the later turn, not the
+    run-time ``detected_at``, and drops rows whose ``turn_b_uuid`` is not a
+    real message uuid (the inner join keeps the time axis honest)."""
+    con, _ = _conflicts_corpus(tmp_path)
+    # ``detected_at`` is TIMESTAMP WITH TIME ZONE; fetching a tz value to
+    # Python requires the optional ``pytz`` module, which the test env does
+    # not ship. Cast both timestamps to VARCHAR so the assertion never
+    # depends on it -- we only need the date axes, not tz-aware datetimes.
+    rows = con.execute(
+        "SELECT CAST(conversation_ts AS VARCHAR), session_id, root_session_id, "
+        "       conflict_kind, severity, "
+        "       CAST(detected_at AS VARCHAR) "
+        "FROM conflicts_over_time(NULL)"
+    ).fetchall()
+    # Only the recoverable row survives -- 'ghost-uuid' is dropped.
+    assert len(rows) == 1
+    conversation_ts, session_id, root_session_id, kind, severity, detected_at = rows[0]
+    # Recovered conversation time is the late turn (2026-05-20), NOT the
+    # 2026-06-12 run-time detected_at.
+    assert conversation_ts.startswith("2026-05-20 15:30:00")
+    assert detected_at.startswith("2026-06-12 05:23:00")
+    assert conversation_ts[:10] != detected_at[:10]
+    assert kind == "disagreement"
+    assert severity == "high"
+    # Top-level session: root_session_id falls back to session_id.
+    assert root_session_id == session_id
+
+
+def test_conflicts_over_time_since_days_uses_conversation_ts(tmp_path: Path) -> None:
+    """``since_days`` filters on the recovered conversation ts. The fixture's
+    only recoverable conflict is in May 2026, far older than any positive
+    window relative to ``current_timestamp``, so a 7-day window is empty while
+    NULL (full corpus) returns it."""
+    con, _ = _conflicts_corpus(tmp_path)
+    full = con.execute("SELECT count(*) FROM conflicts_over_time(NULL)").fetchone()[0]
+    windowed = con.execute("SELECT count(*) FROM conflicts_over_time(7)").fetchone()[0]
+    assert full == 1
+    assert windowed == 0
