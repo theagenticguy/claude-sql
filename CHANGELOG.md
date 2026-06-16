@@ -1,3 +1,9 @@
+## v1.1.8 (2026-06-16)
+
+### Fix
+
+- **conflicts**: add conflicts_over_time macro for a real conversation-time axis (#110)
+
 ## v1.1.7 (2026-06-15)
 
 ### Fix
