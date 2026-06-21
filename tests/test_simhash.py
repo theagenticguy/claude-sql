@@ -99,6 +99,60 @@ def test_simhash_signed_bigint_range() -> None:
     assert -(1 << 63) <= sig < (1 << 63)
 
 
+def _simhash64_scalar_reference(text: str) -> int:
+    """Independent per-bit scalar SimHash, byte-identical to the original loop.
+
+    Pins :func:`simhash64`'s vectorized numpy voting against the historical
+    ``±1`` Python tally.  Lives in the test, not the module, so any future
+    drift in the production path fails here instead of silently changing
+    every ingest signature (which would orphan the canonical-resolution
+    cache).
+    """
+    import hashlib
+    import re
+
+    word = re.compile(r"\w+")
+    toks = word.findall(text.lower())
+    if not toks:
+        return 0
+    grams = (
+        {" ".join(toks)}
+        if len(toks) < 3
+        else {" ".join(toks[i : i + 3]) for i in range(len(toks) - 2)}
+    )
+    votes = [0] * 64
+    for g in grams:
+        h = int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+        for b in range(64):
+            votes[b] += 1 if (h >> b) & 1 else -1
+    sig = 0
+    for b in range(64):
+        if votes[b] > 0:
+            sig |= 1 << b
+    return sig - (1 << 64) if sig >= (1 << 63) else sig
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",  # empty → 0
+        "   \t\n  ",  # whitespace-only → 0
+        "hello",  # 1-token degenerate path
+        "hello world",  # 2-token degenerate path
+        "the quick brown fox jumps over the lazy dog repeatedly today",
+        "fix it",  # short, punctuation-stripped
+        "a a a a a a a a",  # repeated token → single gram, tie-free
+        # A long doc whose grams can drive individual bit tallies to an even
+        # split (exercises the strict ``> 0`` / ``2*count > n`` majority gate).
+        " ".join(f"word{i % 7}" for i in range(120)),
+        "abcdef ghijkl mnopqr stuvwx yzabcd efghij klmnop qrstuv wxyzab cdefgh",
+    ],
+)
+def test_simhash_vectorized_matches_scalar_reference(text: str) -> None:
+    """The numpy-vectorized voting must be byte-identical to the scalar tally."""
+    assert simhash64(text) == _simhash64_scalar_reference(text)
+
+
 # ---------------------------------------------------------------------------
 # hamming_distance_64
 # ---------------------------------------------------------------------------
