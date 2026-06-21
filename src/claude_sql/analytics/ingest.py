@@ -45,6 +45,7 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import numpy as np
 import polars as pl
 import tiktoken
 from loguru import logger
@@ -75,6 +76,15 @@ _ANTHROPIC_RATIO = 0.78
 #: Mask of the low 64 bits — used to coerce a hashed integer into the
 #: unsigned 64-bit range before splitting into per-bit votes.
 _U64_MASK = (1 << 64) - 1
+
+#: Per-bit position vector ``[0, 1, …, 63]`` and the matching powers of two,
+#: precomputed once so :func:`simhash64` can vote across all 64 bits with two
+#: vectorized numpy reductions instead of two Python ``for b in range(64)``
+#: loops.  ``uint64`` throughout: the OR of distinct powers tops out at
+#: ``2**64 - 1`` which is exactly representable, so the reduction is exact
+#: (no float rounding, byte-identical to the scalar tally).
+_BIT_POSITIONS = np.arange(64, dtype=np.uint64)
+_BIT_POWERS = np.uint64(1) << _BIT_POSITIONS
 
 #: Sentinel signed-BIGINT value for empty / hash-degenerate input.  Stored
 #: alongside the real signatures so DuckDB doesn't need to special-case
@@ -150,15 +160,23 @@ def simhash64(text: str) -> int:
         grams = {" ".join(toks)}
     else:
         grams = {" ".join(toks[i : i + 3]) for i in range(len(toks) - 2)}
-    votes = [0] * 64
-    for g in grams:
-        h = int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
-        for b in range(64):
-            votes[b] += 1 if (h >> b) & 1 else -1
-    sig_unsigned = 0
-    for b in range(64):
-        if votes[b] > 0:
-            sig_unsigned |= 1 << b
+    # Vectorized SimHash voting.  blake2b each gram into a uint64, then vote
+    # over all 64 bit positions at once: bit ``b`` of the signature is set iff
+    # a majority of grams have bit ``b`` set, i.e. ``2 * set_count > n_grams``
+    # (equivalent to the scalar ``±1`` tally being ``> 0``).  ``set_count`` is
+    # exact in uint64 and the final signature is the OR of distinct powers of
+    # two, so the result is byte-identical to the per-bit Python loop.
+    digests = np.fromiter(
+        (
+            int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+            for g in grams
+        ),
+        dtype=np.uint64,
+        count=len(grams),
+    )
+    set_counts = ((digests[:, None] >> _BIT_POSITIONS) & np.uint64(1)).sum(axis=0, dtype=np.uint64)
+    majority = (set_counts.astype(np.int64) * 2) > len(grams)
+    sig_unsigned = int(_BIT_POWERS[majority].sum(dtype=np.uint64))
     # DuckDB BIGINT is signed; coerce so the Python int round-trips through
     # parquet → DuckDB without losing high-bit values.
     return sig_unsigned - (1 << 64) if sig_unsigned >= (1 << 63) else sig_unsigned
