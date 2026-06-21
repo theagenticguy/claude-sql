@@ -1,3 +1,9 @@
+## v1.1.9 (2026-06-21)
+
+### Perf
+
+- **ingest**: vectorize simhash64 bit-voting with numpy (#117)
+
 ## v1.1.8 (2026-06-16)
 
 ### Fix
