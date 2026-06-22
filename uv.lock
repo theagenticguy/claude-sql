@@ -338,7 +338,7 @@ requires-dist = [
     { name = "lancedb", specifier = ">=0.30,<0.34" },
     { name = "leidenalg", specifier = ">=0.11.0,<0.13" },
     { name = "loguru", specifier = ">=0.7.3" },
-    { name = "numpy", specifier = ">=2.4.4" },
+    { name = "numpy", specifier = ">=2.4.4,<2.5" },
     { name = "packaging", specifier = ">=26.2" },
     { name = "polars", specifier = ">=1.40.0" },
     { name = "pyarrow", specifier = ">=23.0.1" },
