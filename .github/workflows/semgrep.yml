@@ -22,7 +22,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: semgrep scan (p/auto + p/owasp-top-ten)
         # `|| true` so the SARIF upload step still runs on findings;
         # gating happens through GitHub code scanning, not the scan's

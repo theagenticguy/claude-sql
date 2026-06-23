@@ -17,21 +17,21 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-claude-sql
       - run: uv run ruff check .
 
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-claude-sql
       - run: uv run ruff format --check .
 
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-claude-sql
       # ty config drives paths via [tool.ty.environment].root + [tool.ty.src].include
       - run: uv run ty check
@@ -39,7 +39,7 @@ jobs:
   lock-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       - run: uv lock --check
 
@@ -49,7 +49,7 @@ jobs:
       contents: read
       id-token: write   # tokenless Codecov OIDC upload
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-claude-sql
       - name: pytest (+coverage)
         # pytest config drives paths via [tool.pytest.ini_options].testpaths;

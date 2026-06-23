@@ -22,7 +22,7 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # `betterleaks git .` scans full commit history; without a deep
           # checkout the scanner only sees the merge-commit shadow.
