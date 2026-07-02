@@ -130,6 +130,11 @@ SELECT * FROM work_mix(30);
 SELECT * FROM success_rate_by_work(30);
 ```
 
+Rates divide by `known_sessions` (excludes the `unknown` outcome, which
+correlates with work category and otherwise understates real rates).
+Columns: `work_category, sessions, known_sessions, unknown_fraction,
+success_rate, failure_rate, partial_rate`.
+
 ### 10. Todos I open and never close
 
 ```sql

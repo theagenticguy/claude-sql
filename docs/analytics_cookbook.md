@@ -197,8 +197,26 @@ window).
 SELECT * FROM success_rate_by_work(30);
 ```
 
-Returns `work_category, sessions, success_rate, failure_rate,
-partial_rate`.
+Returns `work_category, sessions, known_sessions, unknown_fraction,
+success_rate, failure_rate, partial_rate`.
+
+The three rates divide by `known_sessions` (sessions whose `success`
+label is *not* `unknown`), **not** by `sessions`. The classifier emits
+`unknown` ("insufficient signal to judge") a lot, and it correlates with
+work category — dev sessions rarely end with a crisp done-state in the
+transcript, so a large share land `unknown`. Dividing by the full count
+let that `unknown` mass silently understate the real rates (it made
+`admin` look ~6× better than `sde` when the true gap against judged
+outcomes is ~1.3×). `unknown_fraction` is surfaced as its own column so
+you can see how much of the window was actually judged; `sessions` is
+still the full window count.
+
+> **Migration (v1.1.9 → v1.2.0).** This macro previously returned
+> `(work_category, sessions, success_rate, failure_rate, partial_rate)`
+> with the rates over `sessions`. It now returns `known_sessions` and
+> `unknown_fraction` too, and the rates are over `known_sessions`. To
+> recover the old all-sessions denominator, multiply a rate by
+> `known_sessions / sessions`.
 
 ### 4.4 Autonomy trend per week (last 90 days)
 

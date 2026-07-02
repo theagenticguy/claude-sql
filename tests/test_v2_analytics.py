@@ -608,6 +608,186 @@ def test_analytics_macros_register_safely(analytics_settings: Settings, tmp_path
 
 
 # ---------------------------------------------------------------------------
+# success_rate_by_work -- known-outcome denominator (issue #48)
+#
+# The macro divides its success/failure/partial rates by ``known_sessions``
+# (``success != 'unknown'``), NOT by the full session count.  ``unknown``
+# ("insufficient signal to judge") correlates with work category and would
+# otherwise silently understate every rate.  ``sessions`` stays the full
+# window count and ``unknown_fraction`` is surfaced as its own column.
+# ---------------------------------------------------------------------------
+
+
+def _make_outcome_mix_parquet(path: Path, outcomes: list[str], work_category: str) -> None:
+    """Write a classifications parquet with one row per element of ``outcomes``.
+
+    Every row shares ``work_category`` so the macro collapses to a single
+    group whose denominator behaviour is easy to assert.
+    """
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "session_id": f"sess-{i:04d}",
+            "autonomy_tier": "assisted",
+            "work_category": work_category,
+            "success": outcome,
+            "goal": f"goal {i}",
+            "confidence": 0.8,
+            "classified_at": now,
+        }
+        for i, outcome in enumerate(outcomes)
+    ]
+    pl.DataFrame(
+        rows,
+        schema={
+            "session_id": pl.Utf8,
+            "autonomy_tier": pl.Utf8,
+            "work_category": pl.Utf8,
+            "success": pl.Utf8,
+            "goal": pl.Utf8,
+            "confidence": pl.Float32,
+            "classified_at": pl.Datetime("us", "UTC"),
+        },
+    ).write_parquet(path)
+
+
+def _success_rate_corpus(tmp_path: Path, cls_path: Path) -> duckdb.DuckDBPyConnection:
+    """Stand up the minimal environment ``success_rate_by_work`` needs.
+
+    The macro reads only from ``session_classifications``, but
+    :func:`register_macros` also binds the always-on v1 macros against the
+    transcript-derived views (``messages``/``tool_calls``/...), so a minimal
+    one-message transcript corpus must exist first.  All non-classification
+    analytics caches are pointed at missing paths so their views/macros are
+    cleanly skipped.
+    """
+    proj = tmp_path / "projects" / "-x"
+    proj.mkdir(parents=True)
+    parent_uuid = "99999999-9999-9999-9999-999999999999"
+    sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    session_record = {
+        "parentUuid": None,
+        "isSidechain": False,
+        "type": "user",
+        "uuid": "u-m1",
+        "timestamp": "2026-04-01T10:00:00.000Z",
+        "sessionId": sid,
+        "version": "2.0.0",
+        "gitBranch": "main",
+        "cwd": "/x",
+        "userType": "external",
+        "entrypoint": "cli",
+        "permissionMode": "acceptEdits",
+        "promptId": "p-u-m1",
+        "message": {
+            "id": "m-u-m1",
+            "type": "message",
+            "role": "user",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "content": [{"type": "text", "text": "seed text for macros"}],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+    }
+    (proj / f"{sid}.jsonl").write_text(json.dumps(session_record) + "\n")
+    sub_dir = proj / parent_uuid / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-deadbeef.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "description": "placeholder"})
+    )
+    sub_record = dict(session_record, sessionId=f"sub-{parent_uuid}", uuid="sub-u-1")
+    (sub_dir / "agent-deadbeef.jsonl").write_text(json.dumps(sub_record) + "\n")
+
+    settings = Settings(
+        classifications_parquet_path=cls_path,
+        clusters_parquet_path=tmp_path / "nope_clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "nope_ter.parquet",
+        trajectory_parquet_path=tmp_path / "nope_traj.parquet",
+        conflicts_parquet_path=tmp_path / "nope_conf.parquet",
+        communities_parquet_path=tmp_path / "nope_comm.parquet",
+        skills_catalog_parquet_path=tmp_path / "nope_skills.parquet",
+    )
+    con = duckdb.connect(":memory:")
+    register_raw(
+        con,
+        glob=str(proj / "*.jsonl"),
+        subagent_glob=str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.jsonl"),
+        subagent_meta_glob=str(
+            tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.meta.json"
+        ),
+    )
+    register_views(con)
+    register_vss(con, embeddings_parquet=tmp_path / "__no_embeddings__.parquet")
+    register_analytics(con, settings=settings)
+    register_macros(con, settings=settings)
+    return con
+
+
+def test_success_rate_by_work_divides_by_known_not_total(tmp_path: Path) -> None:
+    """Rates use ``known_sessions`` as the denominator, not the full count.
+
+    Fixture: one ``sde`` category with 3 success + 1 failure + 1 partial +
+    5 unknown = 10 sessions, 5 of them judged.  The old macro reported
+    success_rate = 3/10 = 0.30; the fixed macro reports 3/5 = 0.60 and
+    exposes unknown_fraction = 0.50 (issue #48).
+    """
+    cls_path = tmp_path / "cls.parquet"
+    _make_outcome_mix_parquet(
+        cls_path,
+        outcomes=(["success"] * 3 + ["failure"] * 1 + ["partial"] * 1 + ["unknown"] * 5),
+        work_category="sde",
+    )
+    con = _success_rate_corpus(tmp_path, cls_path)
+
+    row = con.execute(
+        "SELECT work_category, sessions, known_sessions, unknown_fraction, "
+        "success_rate, failure_rate, partial_rate FROM success_rate_by_work(3650)"
+    ).fetchone()
+    assert row is not None
+    work_category, sessions, known_sessions, unknown_fraction = row[0], row[1], row[2], row[3]
+    success_rate, failure_rate, partial_rate = row[4], row[5], row[6]
+
+    assert work_category == "sde"
+    assert sessions == 10  # full window count, unchanged
+    assert known_sessions == 5  # success != 'unknown'
+    assert unknown_fraction == pytest.approx(0.5)
+    # Rates over the KNOWN denominator (5), not the total (10).
+    assert success_rate == pytest.approx(3 / 5)
+    assert failure_rate == pytest.approx(1 / 5)
+    assert partial_rate == pytest.approx(1 / 5)
+    # Known rates form a proper distribution.
+    assert success_rate + failure_rate + partial_rate == pytest.approx(1.0)
+
+
+def test_success_rate_by_work_all_unknown_yields_null_rates(tmp_path: Path) -> None:
+    """A category with only ``unknown`` outcomes has zero known sessions, so
+    the rates are NULL (NULLIF guards the divide-by-zero) rather than 0 or a
+    crash, and unknown_fraction is 1.0."""
+    cls_path = tmp_path / "cls.parquet"
+    _make_outcome_mix_parquet(cls_path, outcomes=["unknown"] * 4, work_category="sde")
+    con = _success_rate_corpus(tmp_path, cls_path)
+
+    row = con.execute(
+        "SELECT sessions, known_sessions, unknown_fraction, "
+        "success_rate, failure_rate, partial_rate FROM success_rate_by_work(3650)"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == 4  # sessions
+    assert row[1] == 0  # known_sessions
+    assert row[2] == pytest.approx(1.0)  # unknown_fraction
+    # NULLIF(0, 0) -> NULL denominator -> NULL rate, not a ZeroDivisionError.
+    assert row[3] is None
+    assert row[4] is None
+    assert row[5] is None
+
+
+# ---------------------------------------------------------------------------
 # conflicts_over_time -- conversation-time recovery (issue #109)
 #
 # ``session_conflicts.detected_at`` is the worker run-time clock, so temporal
