@@ -1,3 +1,11 @@
+## v1.2.0 (2026-07-02)
+
+### Fix
+
+- **skills**: skill_usage tool-source rows join to prior user intent (#50) (#131)
+- **analytics**: success_rate_by_work computes rates over known outcomes (#48) (#130)
+- **analytics**: autonomy_trend buckets by session start not classifier time (#49) (#129)
+
 ## v1.1.9 (2026-06-21)
 
 ### Perf
