@@ -505,17 +505,27 @@ pack — lets you spot the skills that never caught on.
 ### 6.5 Join through to see what a skill is *for*
 
 Chain `skill_usage` back to `messages_text` to read the actual user
-intent behind each invocation:
+intent behind each invocation. Join on `context_uuid`, **not**
+`message_uuid`:
 
 ```sql
 SELECT su.ts, su.source, su.skill_name, su.plugin,
        substr(mt.text_content, 1, 160) AS context
 FROM skill_usage su
-JOIN messages_text mt ON mt.uuid = su.message_uuid
+JOIN messages_text mt ON mt.uuid = su.context_uuid
 WHERE su.skill_id = 'erpaval'
 ORDER BY su.ts DESC
 LIMIT 10;
 ```
+
+`message_uuid` points at the raw invocation. For `source = 'slash_command'`
+that is the user text block, so it joins to `messages_text` directly. But
+for `source = 'tool'` it points at the assistant *tool-use* block, which
+carries no text — joining on `message_uuid` silently drops every
+tool-driven hit. `context_uuid` fixes this: it resolves to the nearest
+prior user-role text message in the session (the intent that triggered the
+skill) for `tool` rows, and equals `message_uuid` for `slash_command`
+rows, so the recipe surfaces a row regardless of how the skill was invoked.
 
 ## 7. v1.0 ingest stamps
 
