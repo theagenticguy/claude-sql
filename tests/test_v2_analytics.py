@@ -794,3 +794,214 @@ def test_conflicts_over_time_since_days_uses_conversation_ts(tmp_path: Path) -> 
     windowed = con.execute("SELECT count(*) FROM conflicts_over_time(7)").fetchone()[0]
     assert full == 1
     assert windowed == 0
+
+
+# ---------------------------------------------------------------------------
+# autonomy_trend -- conversation-time bucketing (issue #49)
+#
+# A one-shot backfill stamps every classification row with the same
+# ``classified_at = NOW()``, which collapsed the "trend" to a single week.
+# ``autonomy_trend(N)`` now buckets by ``sessions.started_at`` (recovered via
+# an inner join on ``session_id``), so the trend spans every week a session
+# actually happened, regardless of when the classifier ran.
+# ---------------------------------------------------------------------------
+
+
+def _autonomy_trend_corpus(
+    tmp_path: Path,
+    *,
+    sessions: list[tuple[str, str, str]],
+    classified_at: datetime,
+    extra_classification_sids: list[tuple[str, str]] | None = None,
+) -> duckdb.DuckDBPyConnection:
+    """Stand up a transcript corpus + classifications parquet for the trend.
+
+    ``sessions`` is a list of ``(session_id, iso_timestamp, autonomy_tier)``.
+    Each becomes a one-line transcript (so ``sessions.started_at`` == its
+    timestamp) *and* a classification row stamped with the shared
+    ``classified_at`` -- the backfill scenario from issue #49.
+
+    ``extra_classification_sids`` adds classification rows whose ``session_id``
+    has no matching transcript, exercising the inner join's drop behavior.
+    """
+    proj = tmp_path / "projects" / "-x"
+    proj.mkdir(parents=True)
+
+    def _rec(sid: str, ts: str) -> dict[str, Any]:
+        return {
+            "parentUuid": None,
+            "isSidechain": False,
+            "type": "assistant",
+            "uuid": f"u-{sid}",
+            "timestamp": ts,
+            "sessionId": sid,
+            "version": "2.0.0",
+            "gitBranch": "main",
+            "cwd": "/x",
+            "userType": "external",
+            "entrypoint": "cli",
+            "permissionMode": "acceptEdits",
+            "promptId": f"p-{sid}",
+            "message": {
+                "id": f"m-{sid}",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "content": [{"type": "text", "text": f"turn for {sid}"}],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        }
+
+    for sid, ts, _tier in sessions:
+        (proj / f"{sid}.jsonl").write_text(json.dumps(_rec(sid, ts)) + "\n")
+
+    # register_raw's subagent globs must match >=1 file or it raises on the
+    # empty glob -- seed a minimal subagent stub.
+    parent_uuid = "99999999-9999-9999-9999-999999999999"
+    sub_dir = proj / parent_uuid / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-deadbeef.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "description": "placeholder"})
+    )
+    (sub_dir / "agent-deadbeef.jsonl").write_text(
+        json.dumps(dict(_rec("stub", "2026-01-01T00:00:00.000Z"), sessionId=f"sub-{parent_uuid}"))
+        + "\n"
+    )
+
+    cls_rows = [
+        {
+            "session_id": sid,
+            "autonomy_tier": tier,
+            "work_category": "sde",
+            "success": "success",
+            "goal": f"goal {sid}",
+            "confidence": 0.8,
+            "classified_at": classified_at,
+        }
+        for sid, _ts, tier in sessions
+    ]
+    for sid, tier in extra_classification_sids or []:
+        cls_rows.append(
+            {
+                "session_id": sid,
+                "autonomy_tier": tier,
+                "work_category": "sde",
+                "success": "success",
+                "goal": f"goal {sid}",
+                "confidence": 0.8,
+                "classified_at": classified_at,
+            }
+        )
+    cls_dir = tmp_path / "session_classifications"
+    cls_dir.mkdir()
+    pl.DataFrame(
+        cls_rows,
+        schema={
+            "session_id": pl.Utf8,
+            "autonomy_tier": pl.Utf8,
+            "work_category": pl.Utf8,
+            "success": pl.Utf8,
+            "goal": pl.Utf8,
+            "confidence": pl.Float32,
+            "classified_at": pl.Datetime("us", "UTC"),
+        },
+    ).write_parquet(cls_dir / "part-1000000000000000000.parquet")
+
+    settings = Settings(
+        classifications_parquet_path=cls_dir,
+        trajectory_parquet_path=tmp_path / "missing_traj",
+        conflicts_parquet_path=tmp_path / "missing_conf",
+        clusters_parquet_path=tmp_path / "missing_clu.parquet",
+        cluster_terms_parquet_path=tmp_path / "missing_ter.parquet",
+        communities_parquet_path=tmp_path / "missing_comm.parquet",
+        user_friction_parquet_path=tmp_path / "missing_friction",
+    )
+    con = duckdb.connect(":memory:")
+    register_raw(
+        con,
+        glob=str(proj / "*.jsonl"),
+        subagent_glob=str(tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.jsonl"),
+        subagent_meta_glob=str(
+            tmp_path / "projects" / "*" / "*" / "subagents" / "agent-*.meta.json"
+        ),
+    )
+    register_views(con)
+    register_vss(con, embeddings_parquet=tmp_path / "__no_embeddings__.parquet")
+    register_analytics(con, settings=settings)
+    register_macros(con, settings=settings)
+    return con
+
+
+def test_autonomy_trend_buckets_by_session_time_not_classified_at(tmp_path: Path) -> None:
+    """Backfilled classifications (one shared ``classified_at``) must still
+    fan out across the weeks their sessions actually happened -- the trend
+    must NOT collapse to a single bucket (issue #49)."""
+    # Three sessions in three distinct ISO weeks; all classified in one run.
+    con = _autonomy_trend_corpus(
+        tmp_path,
+        sessions=[
+            ("sess-w1", "2026-05-04T10:00:00.000Z", "manual"),  # week of 2026-05-04
+            ("sess-w2", "2026-05-11T10:00:00.000Z", "assisted"),  # week of 2026-05-11
+            ("sess-w3", "2026-05-18T10:00:00.000Z", "autonomous"),  # week of 2026-05-18
+        ],
+        classified_at=datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
+    )
+    rows = con.execute(
+        "SELECT CAST(week AS VARCHAR), autonomy_tier, n "
+        "FROM autonomy_trend(365) ORDER BY week, autonomy_tier"
+    ).fetchall()
+    # One row per (week, tier) -- three distinct weeks, NOT one collapsed
+    # bucket at the 2026-06-30 classifier run time.
+    weeks = {r[0][:10] for r in rows}
+    assert weeks == {"2026-05-04", "2026-05-11", "2026-05-18"}
+    assert len(rows) == 3
+    assert [(r[0][:10], r[1], r[2]) for r in rows] == [
+        ("2026-05-04", "manual", 1),
+        ("2026-05-11", "assisted", 1),
+        ("2026-05-18", "autonomous", 1),
+    ]
+
+
+def test_autonomy_trend_window_filters_on_session_time(tmp_path: Path) -> None:
+    """``window_days`` filters on ``started_at`` (conversation time), so an
+    old session drops out of a short window even though it was classified
+    today. Proves the WHERE clause moved off ``classified_at``."""
+    con = _autonomy_trend_corpus(
+        tmp_path,
+        sessions=[
+            ("sess-old", "2026-01-05T10:00:00.000Z", "manual"),  # far outside 30d
+            ("sess-old2", "2026-02-09T10:00:00.000Z", "assisted"),  # also outside
+        ],
+        classified_at=datetime(2026, 7, 1, 12, 0, tzinfo=UTC),
+    )
+    # Both sessions are months old relative to current_timestamp; a 30-day
+    # window on started_at excludes them, while a 3-year window includes them.
+    windowed = con.execute("SELECT count(*) FROM autonomy_trend(30)").fetchone()[0]
+    full = con.execute("SELECT count(*) FROM autonomy_trend(1095)").fetchone()[0]
+    assert windowed == 0
+    assert full == 2
+
+
+def test_autonomy_trend_drops_classifications_without_session(tmp_path: Path) -> None:
+    """A classification whose ``session_id`` has no transcript-derived session
+    has no conversation time to place on the trend, so the inner join drops
+    it -- the time axis stays honest (mirrors ``conflicts_over_time``)."""
+    con = _autonomy_trend_corpus(
+        tmp_path,
+        sessions=[("sess-real", "2026-05-11T10:00:00.000Z", "autonomous")],
+        classified_at=datetime(2026, 6, 30, 12, 0, tzinfo=UTC),
+        extra_classification_sids=[("ghost-session", "manual")],
+    )
+    rows = con.execute(
+        "SELECT autonomy_tier, n FROM autonomy_trend(365) ORDER BY autonomy_tier"
+    ).fetchall()
+    # Only the row backed by a real session survives; 'ghost-session' is
+    # dropped by the inner join.
+    assert rows == [("autonomous", 1)]
