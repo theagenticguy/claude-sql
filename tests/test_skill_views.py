@@ -263,6 +263,111 @@ def test_skill_invocations_combined_count(skills_fixture: Path) -> None:
     assert n == 3
 
 
+def test_skill_invocations_context_uuid(skills_fixture: Path) -> None:
+    """Every invocation carries a ``context_uuid`` for the messages_text join.
+
+    * ``slash_command`` rows are a direct passthrough — ``context_uuid`` ==
+      ``message_uuid`` — because the user text block *is* the intent.
+    * ``tool`` rows resolve against ``messages_text`` for the nearest prior
+      user-role text message, never the text-less assistant tool-use block.
+      Session A's only prior user turn (``u-a-1``, "Do the thing.") is below
+      the 32-char ``messages_text`` gate, so the resolved context is NULL —
+      the lookup correctly declines to invent a joinable row.
+    """
+    con = _connect(skills_fixture)
+    rows = con.execute(
+        "SELECT source, message_uuid, context_uuid FROM skill_invocations ORDER BY source, ts"
+    ).fetchall()
+    by_source = {(src, muid): cuid for src, muid, cuid in rows}
+    # slash rows: context_uuid is a direct message_uuid passthrough.
+    assert by_source[("slash_command", "u-b-1")] == "u-b-1"
+    assert by_source[("slash_command", "u-b-2")] == "u-b-2"
+    # tool row (a-a-1 is the assistant tool-use message): the only prior user
+    # turn is too short for messages_text, so context resolves to NULL rather
+    # than pointing back at the text-less tool-use block.
+    assert by_source[("tool", "a-a-1")] is None
+
+
+def test_skill_usage_context_join_surfaces_tool_intent(tmp_path: Path) -> None:
+    """GH #50: a ``tool``-source row joins messages_text via ``context_uuid``.
+
+    Joining on ``message_uuid`` returns nothing for tool rows (it points at a
+    text-less assistant tool-use block); joining on ``context_uuid`` surfaces
+    the user prompt that triggered the skill. The prior user turn must clear
+    the 32-char ``messages_text`` gate.
+    """
+    proj = tmp_path / "projects" / "-home-alice-workplace-proj"
+    proj.mkdir(parents=True)
+    session = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    intent = "Please land the erpaval loop on PR forty-two and validate the gates."
+    records = [
+        _msg(
+            "u-c-1",
+            session,
+            "2026-04-03T08:00:00.000Z",
+            role="user",
+            model=None,
+            type_="user",
+            content=[{"type": "text", "text": intent}],
+        ),
+        _msg(
+            "a-c-1",
+            session,
+            "2026-04-03T08:00:05.000Z",
+            role="assistant",
+            model="claude-opus-4-7",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "tu-c-1",
+                    "name": "Skill",
+                    "input": {"skill": "erpaval", "args": "Land PR #42"},
+                }
+            ],
+        ),
+    ]
+    (proj / f"{session}.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    # Seed a subagent pair so the subagent globs resolve (read_json needs a match).
+    sub_dir = proj / session / "subagents"
+    sub_dir.mkdir(parents=True)
+    hex_id = "cccc1111cccc1111"
+    (sub_dir / f"agent-{hex_id}.meta.json").write_text(
+        json.dumps({"agentType": "general-purpose", "description": "seed"})
+    )
+    (sub_dir / f"agent-{hex_id}.jsonl").write_text(
+        json.dumps(
+            _msg(
+                f"sub-u-{hex_id}",
+                f"sub-{hex_id}",
+                "2026-04-03T08:00:30.000Z",
+                role="user",
+                type_="user",
+                model=None,
+                content=[{"type": "text", "text": "go"}],
+            )
+        )
+        + "\n"
+    )
+
+    con = _connect(proj)
+
+    # Baseline: the pre-#50 recipe (join on message_uuid) drops the tool row.
+    on_message_uuid = con.execute(
+        "SELECT count(*) FROM skill_usage su "
+        "JOIN messages_text mt ON mt.uuid = su.message_uuid "
+        "WHERE su.skill_id = 'erpaval'"
+    ).fetchone()[0]
+    assert on_message_uuid == 0
+
+    # Fixed recipe: join on context_uuid surfaces the triggering user intent.
+    rows = con.execute(
+        "SELECT su.source, mt.text_content FROM skill_usage su "
+        "JOIN messages_text mt ON mt.uuid = su.context_uuid "
+        "WHERE su.skill_id = 'erpaval'"
+    ).fetchall()
+    assert rows == [("tool", intent)]
+
+
 def test_skill_usage_without_catalog(skills_fixture: Path) -> None:
     """Missing catalog → skill_usage still serves with is_builtin=false everywhere."""
     con = _connect(skills_fixture)

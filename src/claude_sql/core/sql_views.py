@@ -259,6 +259,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
         ("skill_id", "VARCHAR"),
         ("args", "VARCHAR"),
         ("tool_use_id", "VARCHAR"),
+        ("context_uuid", "VARCHAR"),
     ),
     "subagent_sessions": (
         ("parent_session_id", "VARCHAR"),
@@ -1003,6 +1004,19 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
         # so the slash-command surface isn't biased toward one era.
         cmd_name_re = "<command-name>/([A-Za-z0-9_:.-]+)</command-name>"
         args_re = "<command-args>([^<]*)</command-args>"
+        # ``context_uuid`` is the joinable-to-``messages_text`` handle on each
+        # invocation (GH #50).  ``message_uuid`` stays raw — for ``tool`` rows
+        # it points at the assistant *tool-use* block, which carries no text,
+        # so ``JOIN messages_text ON uuid = message_uuid`` silently returns
+        # nothing.  ``context_uuid`` resolves that to the nearest *prior*
+        # user-role text message in the same session (the intent that
+        # triggered the skill), so the cookbook's "what is this skill for"
+        # recipe surfaces a row regardless of source:
+        #
+        #   * ``tool``          → nearest prior ``messages_text.uuid`` at or
+        #                         before the invocation ``ts`` in that session.
+        #   * ``slash_command`` → the invocation ``message_uuid`` itself; the
+        #                         user text block *is* the intent.
         con.execute(
             f"""
             CREATE OR REPLACE VIEW skill_invocations AS
@@ -1013,7 +1027,16 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 'tool'                                        AS source,
                 json_extract_string(tc.tool_input, '$.skill') AS skill_id,
                 json_extract_string(tc.tool_input, '$.args')  AS args,
-                tc.tool_use_id
+                tc.tool_use_id,
+                (
+                    SELECT mt.uuid
+                    FROM messages_text mt
+                    WHERE mt.session_id = tc.session_id
+                      AND mt.role = 'user'
+                      AND mt.ts <= tc.ts
+                    ORDER BY mt.ts DESC, mt.uuid DESC
+                    LIMIT 1
+                )                                             AS context_uuid
             FROM tool_calls tc
             WHERE tc.tool_name = 'Skill'
               AND json_extract_string(tc.tool_input, '$.skill') IS NOT NULL
@@ -1025,7 +1048,8 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 'slash_command'                                    AS source,
                 regexp_extract(cb.text, '{cmd_name_re}', 1)        AS skill_id,
                 NULLIF(regexp_extract(cb.text, '{args_re}', 1), '') AS args,
-                NULL                                                AS tool_use_id
+                NULL                                                AS tool_use_id,
+                cb.message_uuid                                     AS context_uuid
             FROM content_blocks cb
             WHERE cb.role = 'user'
               AND cb.block_type = 'text'
@@ -1039,7 +1063,8 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
                 'slash_command'                                        AS source,
                 regexp_extract(raw.txt, '{cmd_name_re}', 1)            AS skill_id,
                 NULLIF(regexp_extract(raw.txt, '{args_re}', 1), '')    AS args,
-                NULL                                                   AS tool_use_id
+                NULL                                                   AS tool_use_id,
+                m.uuid                                                 AS context_uuid
             FROM messages m,
                  LATERAL (SELECT json_extract_string(m.content_json, '$') AS txt) raw
             WHERE m.role = 'user'
@@ -2155,6 +2180,10 @@ def register_analytics(
     # catalog for human-readable labels + ``is_builtin`` tagging.  When the
     # catalog parquet is absent the view still works, but every row gets a
     # ``skill_name = skill_id`` pass-through and ``is_builtin = false``.
+    # ``context_uuid`` rides through from ``skill_invocations`` — join it to
+    # ``messages_text`` to read the user intent behind any invocation,
+    # including ``tool``-source rows whose ``message_uuid`` is text-less
+    # (GH #50).
     try:
         if "skills_catalog" in registered:
             con.execute(
@@ -2164,6 +2193,7 @@ def register_analytics(
                     si.session_id,
                     si.ts,
                     si.message_uuid,
+                    si.context_uuid,
                     si.source,
                     si.skill_id,
                     si.args,
@@ -2186,6 +2216,7 @@ def register_analytics(
                     si.session_id,
                     si.ts,
                     si.message_uuid,
+                    si.context_uuid,
                     si.source,
                     si.skill_id,
                     si.args,
