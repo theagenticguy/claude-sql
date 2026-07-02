@@ -244,6 +244,15 @@ SELECT * FROM autonomy_trend(90);
 Returns one row per `(week, autonomy_tier)` with a count. Plot `week` on
 the x-axis, count on y, colored by tier.
 
+The `week` bucket comes from `sessions.started_at` (when the session
+actually happened), not `classified_at` (when the classifier ran). This
+matters for backfills: if you classified the whole corpus in one pass,
+every row shares one `classified_at`, so bucketing on it would collapse
+the trend into a single week. Bucketing on session start keeps the trend
+meaningful however you ran classification — incrementally or as a one-shot
+backfill. A classification whose session has no transcript-derived start
+time is dropped from the trend (it has no point on the time axis).
+
 ## 5. Trajectory + sentiment
 
 > **Requires `claude-sql trajectory --no-dry-run` first.** v1.0 uses a
