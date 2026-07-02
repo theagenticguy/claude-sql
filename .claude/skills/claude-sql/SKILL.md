@@ -153,7 +153,7 @@ The macro layer (call these like SQL functions):
 - `semantic_search(query_vec, k)` → HNSW top-k
 - `autonomy_trend(window_days)` → weekly autonomy mix
 - `work_mix(since_days)` → work-category distribution
-- `success_rate_by_work(since_days)` → success/fail/partial per category
+- `success_rate_by_work(since_days)` → success/fail/partial per category, over *known* outcomes (rates exclude `unknown`; also returns `known_sessions` + `unknown_fraction`)
 - `cluster_top_terms(cid, n)` / `community_top_topics(cid, n)` /
   `sentiment_arc(sid)` — the rest of the analytics pivots
 

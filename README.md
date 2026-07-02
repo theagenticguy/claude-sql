@@ -396,7 +396,7 @@ respectively), so they have no dry-run gate.
 | `semantic_search(query_vec, k)` | table | HNSW top-k over embeddings |
 | `autonomy_trend(window_days)` | table | Weekly autonomy-tier mix |
 | `work_mix(since_days)` | table | Work-category distribution |
-| `success_rate_by_work(since_days)` | table | Success / failure / partial rates per category |
+| `success_rate_by_work(since_days)` | table | Success / failure / partial rates per category, over *known* outcomes (excludes `unknown`); also returns `known_sessions` + `unknown_fraction` |
 | `cluster_top_terms(cid, n)` | table | Top-N terms for a cluster |
 | `community_top_topics(cid, n)` | table | Dominant clusters within a community |
 | `sentiment_arc(sid)` | table | Per-window sentiment timeline for one session |

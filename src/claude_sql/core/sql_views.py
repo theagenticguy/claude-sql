@@ -1449,6 +1449,28 @@ def register_macros(
             """,
         ),
         # Success / failure / partial rate broken down by work category.
+        #
+        # ⚠️ Denominator = KNOWN outcomes, not all sessions (issue #48).
+        # ``success`` is one of {success, partial, failure, unknown}; the
+        # ``unknown`` label ("insufficient signal to judge") correlates
+        # heavily with work category — dev work rarely ends with a crisp
+        # done-state in the transcript, so up to ~85% of ``sde`` sessions
+        # land ``unknown``.  Dividing the rates by ``count(*)`` (all
+        # sessions) let that ``unknown`` mass silently understate real
+        # rates and made admin look ~6× better than sde when the true gap
+        # against known outcomes is ~1.3×.  The rates below therefore
+        # divide by ``known_sessions`` (``success != 'unknown'``), and
+        # ``unknown_fraction`` is surfaced as its own column so the
+        # judged-vs-total coverage stays visible instead of contaminating
+        # the numerator.  ``sessions`` remains the full window count.
+        #
+        # Migration (v1.1.9 → v1.2.0): output columns changed from
+        # ``(work_category, sessions, success_rate, failure_rate,
+        # partial_rate)`` to ``(work_category, sessions, known_sessions,
+        # unknown_fraction, success_rate, failure_rate, partial_rate)`` and
+        # the three rates are now over ``known_sessions`` rather than
+        # ``sessions``.  To recover the old all-sessions denominator,
+        # multiply a rate by ``known_sessions / sessions``.
         (
             "success_rate_by_work",
             """
@@ -1456,12 +1478,18 @@ def register_macros(
                 SELECT
                     work_category,
                     count(*) AS sessions,
+                    count(*) FILTER (WHERE success != 'unknown') AS known_sessions,
+                    count(*) FILTER (WHERE success = 'unknown')::DOUBLE
+                        / NULLIF(count(*), 0) AS unknown_fraction,
                     count(*) FILTER (WHERE success = 'success')::DOUBLE
-                        / NULLIF(count(*), 0) AS success_rate,
+                        / NULLIF(count(*) FILTER (WHERE success != 'unknown'), 0)
+                        AS success_rate,
                     count(*) FILTER (WHERE success = 'failure')::DOUBLE
-                        / NULLIF(count(*), 0) AS failure_rate,
+                        / NULLIF(count(*) FILTER (WHERE success != 'unknown'), 0)
+                        AS failure_rate,
                     count(*) FILTER (WHERE success = 'partial')::DOUBLE
-                        / NULLIF(count(*), 0) AS partial_rate
+                        / NULLIF(count(*) FILTER (WHERE success != 'unknown'), 0)
+                        AS partial_rate
                 FROM session_classifications
                 WHERE classified_at >= current_timestamp - (since_days * INTERVAL 1 DAY)
                 GROUP BY 1
