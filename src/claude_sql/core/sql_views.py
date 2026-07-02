@@ -1407,16 +1407,29 @@ def register_macros(
     settings_for_gate = settings if settings is not None else Settings()
     analytics_macros: list[tuple[str, str]] = [
         # Time series: autonomy tier mix over rolling windows.
+        #
+        # Buckets by ``sessions.started_at`` (conversation time), NOT
+        # ``classified_at`` (classifier run time). A one-shot backfill stamps
+        # every row with the same ``classified_at = NOW()``, which collapsed
+        # the "trend" to a single week (issue #49). The trend question is "how
+        # has my autonomy mix evolved over time," which depends on when the
+        # session happened. The inner join to ``sessions`` on ``session_id``
+        # recovers that timestamp and — like ``conflicts_over_time`` (issue
+        # #109) — keeps the time axis honest: a classification whose session
+        # is not in the transcript-derived corpus has no conversation time to
+        # place on the trend, so it is dropped rather than mis-bucketed.
         (
             "autonomy_trend",
             """
             CREATE OR REPLACE MACRO autonomy_trend(window_days) AS TABLE (
                 SELECT
-                    date_trunc('week', classified_at) AS week,
-                    autonomy_tier,
+                    date_trunc('week', s.started_at) AS week,
+                    sc.autonomy_tier,
                     count(*) AS n
-                FROM session_classifications
-                WHERE classified_at >= current_timestamp - (window_days * INTERVAL 1 DAY)
+                FROM session_classifications sc
+                JOIN sessions s
+                  ON s.session_id = sc.session_id
+                WHERE s.started_at >= current_timestamp - (window_days * INTERVAL 1 DAY)
                 GROUP BY 1, 2
                 ORDER BY 1, 2
             );
