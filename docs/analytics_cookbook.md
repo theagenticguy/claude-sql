@@ -148,6 +148,23 @@ ORDER BY n DESC
 LIMIT 10;
 ```
 
+Two results surprise people on the first run:
+
+- **`community_id = -1` is often the largest bucket** (commonly 10–20% of
+  the corpus). It is the noise / unassigned sentinel (`NOISE_COMMUNITY_ID`),
+  not a real community. Leiden collapses any group below
+  `leiden_min_community_size` (default 3) into it, along with sessions whose
+  mutual-kNN neighborhood is too sparse to earn an edge above the
+  `leiden_edge_floor` (default 0.3). Filter it out for topic work:
+  `WHERE community_id <> -1`.
+- **The top real communities sit at nearly equal size** (e.g. communities
+  0–N all within a session or two of each other). That flat top is the
+  mutual-kNN plateau, not a bug: with `k=15` and a symmetric `max(w_ij,
+  w_ji)` graph, each dense node reaches a similar number of mutual
+  neighbors, so the densest knot of the graph partitions into
+  same-order-of-magnitude communities before the size distribution drops off
+  into the long tail.
+
 To label a community, roll up the HDBSCAN clusters its sessions' messages
 fall into and show the top c-TF-IDF terms per cluster. That's what
 `community_top_topics(cid, n)` does:
