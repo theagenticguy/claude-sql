@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39   # v8.2.0
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3   # v8.3.0
       - name: Install Python 3.13
         run: uv python install 3.13
       # claude-sql is a single package (src/claude_sql/ with five layer
@@ -99,7 +99,7 @@ jobs:
       id-token: write   # Trusted Publishing OIDC
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39   # v8.2.0
+      - uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3   # v8.3.0
       - uses: actions/download-artifact@v8
         with:
           name: dist
@@ -125,7 +125,7 @@ jobs:
       id-token: write   # Trusted Publishing OIDC
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39   # v8.2.0
+      - uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3   # v8.3.0
       - uses: actions/download-artifact@v8
         with:
           name: dist
