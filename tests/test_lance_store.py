@@ -20,8 +20,10 @@ Both behaviors were verified live against lancedb 0.30.2 and DuckDB
 
 from __future__ import annotations
 
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -169,3 +171,65 @@ def test_register_vss_attaches_real_dataset(tmp_path: Path) -> None:
         "SELECT * FROM semantic_search([0.1, 0.1, 0.1, 0.1]::FLOAT[4], 2)"
     ).fetchall()
     assert len(rows) == 2
+
+
+def _seed_batch(lance_uri: Path, n: int, *, dim: int = 8) -> Any:
+    """Seed ``n`` distinct rows in one chunk and return the opened table.
+
+    IVF index training runs k-means, so ``ensure_index`` needs more than a
+    handful of rows to build a real index rather than no-op on a tiny table.
+    """
+    db = lance_store.connect_db(lance_uri)
+    tbl = lance_store.open_or_create_table(db, dim=dim)
+    now = datetime.now(UTC)
+    df = pl.DataFrame(
+        {
+            "uuid": [f"u-{i:04d}" for i in range(n)],
+            "model": ["test"] * n,
+            "dim": [dim] * n,
+            # Vary each vector so k-means has a non-degenerate spread.
+            "embedding": [[float((i + j) % 7) for j in range(dim)] for i in range(n)],
+            "embedded_at": [now] * n,
+        },
+        schema={
+            "uuid": pl.Utf8,
+            "model": pl.Utf8,
+            "dim": pl.Int32,
+            "embedding": pl.Array(pl.Float32, dim),
+            "embedded_at": pl.Datetime("us", "UTC"),
+        },
+    )
+    lance_store.add_chunk(tbl, df)
+    return tbl
+
+
+def test_ensure_index_uses_config_api_without_deprecation(tmp_path: Path) -> None:
+    """``ensure_index`` builds the IvfHnswSq index via the unified config API.
+
+    lancedb >=0.30 deprecated the ``metric=/vector_column_name=/index_type=``
+    kwargs on ``create_index`` in favor of a positional column + ``config=``
+    object; 0.34 makes the legacy form emit a ``DeprecationWarning``. This pins
+    that ``ensure_index`` (1) creates a real ``IvfHnswSq`` index on the
+    ``embedding`` column and (2) emits NO ``DeprecationWarning`` — so a future
+    lancedb bump that tightens the deprecation into an error can't regress us.
+    """
+    lance_uri = tmp_path / "lance_index"
+    tbl = _seed_batch(lance_uri, 512, dim=8)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        lance_store.ensure_index(tbl, metric="cosine")
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+
+    assert not deprecations, "ensure_index emitted DeprecationWarning(s): " + "; ".join(
+        str(w.message).splitlines()[0] for w in deprecations
+    )
+
+    indices = tbl.list_indices()
+    assert len(indices) == 1
+    idx = indices[0]
+    assert "embedding" in getattr(idx, "columns", [])
+    assert getattr(idx, "index_type", None) == "IvfHnswSq"
+
+    # Idempotent: a second call sees the existing index and no-ops (no error).
+    lance_store.ensure_index(tbl, metric="cosine")
