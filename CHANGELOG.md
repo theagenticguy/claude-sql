@@ -1,3 +1,9 @@
+## v1.2.1 (2026-07-08)
+
+### Refactor
+
+- **lance_store**: migrate create_index to unified config API (#145)
+
 ## v1.2.0 (2026-07-02)
 
 ### Fix
