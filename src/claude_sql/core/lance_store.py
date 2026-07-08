@@ -27,15 +27,20 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import lancedb
 import polars as pl
 import pyarrow as pa
+from lancedb.index import IvfHnswSq
 from loguru import logger
 
 #: Lance table name inside the namespace.
 TABLE_NAME = "embeddings"
+
+#: Distance metrics accepted by the LanceDB vector index (``IvfHnswSq``'s
+#: ``distance_type``). Mirrors ``Settings.hnsw_metric``'s domain.
+DistanceMetric = Literal["cosine", "l2", "dot"]
 
 #: Glob pattern matching legacy parquet shards (for one-time migration).
 _LEGACY_PART_GLOB = "part-*.parquet"
@@ -111,7 +116,7 @@ def add_chunk(tbl: Any, df: pl.DataFrame) -> None:
     tbl.add(arrow_table)
 
 
-def ensure_index(tbl: Any, *, metric: str = "cosine") -> None:
+def ensure_index(tbl: Any, *, metric: DistanceMetric = "cosine") -> None:
     """Create the IVF_HNSW_SQ vector index on the ``embedding`` column.
 
     No-op if an index already exists. Index name is exactly ``IVF_HNSW_SQ``
@@ -128,11 +133,15 @@ def ensure_index(tbl: Any, *, metric: str = "cosine") -> None:
         if "embedding" in getattr(idx, "columns", []):
             return
     try:
-        tbl.create_index(
-            metric=metric,
-            vector_column_name="embedding",
-            index_type="IVF_HNSW_SQ",
-        )
+        # lancedb >=0.30 unified index API: pass the vector column as the first
+        # positional arg and an index-config object via ``config=``. The legacy
+        # ``metric=/vector_column_name=/index_type=`` kwargs are deprecated (they
+        # emit a DeprecationWarning as of 0.34). ``IvfHnswSq`` is the config class
+        # for the scalar-quantized HNSW index this store uses; ``distance_type``
+        # carries the former ``metric``. When ``config=`` is passed, the first
+        # positional is the column name (the param is legacy-named ``metric``),
+        # and ``vector_column_name=`` is ignored — do NOT pass it here.
+        tbl.create_index("embedding", config=IvfHnswSq(distance_type=metric))
     except (RuntimeError, ValueError) as exc:
         # Index creation can fail on tiny tables (no vectors yet, or
         # k-means seeding hits a degenerate split). Log and continue —
