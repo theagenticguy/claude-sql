@@ -271,6 +271,7 @@ respectively), so they have no dry-run gate.
 | `shell` | Launch the `duckdb` REPL with everything pre-registered |
 | `list-cache` | Report freshness + row counts for every parquet cache |
 | `peek <session_id>` | One-shot session summary — line count, role mix, top tools, samples |
+| `manifest` | Machine-readable JSON manifest of every command, flag, and exit code |
 
 **Embeddings + structure**
 

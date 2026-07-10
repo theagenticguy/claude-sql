@@ -1,6 +1,6 @@
 """Cyclopts CLI entry point for ``claude-sql``.
 
-Wires the ``claude-sql`` console script to its thirteen subcommands.  Shared
+Wires the ``claude-sql`` console script to its subcommands.  Shared
 flags -- ``--verbose`` / ``--quiet``, ``--glob``, ``--subagent-glob``,
 ``--format`` -- live on a flattened :class:`Common` dataclass so callers write
 ``claude-sql query ... --format json`` instead of ``--common.format json``.
@@ -2536,6 +2536,22 @@ def judges_cmd(*, common: Common | None = None) -> None:
     emit_dataframe(df, fmt=fmt)
 
 
+@app.command(name="manifest")
+def manifest_cmd(*, common: Common | None = None) -> None:
+    """Emit a machine-readable manifest of every command, flag, and exit code.
+
+    One call returns the whole command surface as JSON -- command names,
+    per-parameter types / choices / defaults, the shared ``--format`` flags,
+    the stable exit-code contract, and the output conventions -- so an agent
+    learns the CLI without scraping ``--help`` per subcommand.  Always JSON,
+    regardless of ``--format`` (the manifest is inherently machine-readable).
+    """
+    _configure(common)
+    from claude_sql.core.manifest import build_manifest
+
+    emit_json(build_manifest(app), fmt=OutputFormat.JSON)
+
+
 @app.command(name="freeze")
 def freeze_cmd(
     rubric: Path,
@@ -3153,8 +3169,8 @@ def review_sheet_cmd(
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
     del common
-    print("claude-sql - pass a subcommand or --help")
-    print("  schema | query | explain | shell | list-cache | peek")
+    print("claude-sql - pass a subcommand, --help, or `manifest` for the full JSON surface")
+    print("  schema | query | explain | shell | list-cache | peek | manifest")
     print("  ingest | embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
     print("  judges | freeze | replay | judge | ungrounded-claim | kappa | blind-handover")
