@@ -712,6 +712,21 @@ def test_judges_cmd_lists_catalog(
     assert "kimi-k2.5" in shortnames
 
 
+def test_manifest_cmd_emits_full_command_surface(
+    tmp_corpus: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli.manifest_cmd(common=_common(tmp_corpus, fmt=OutputFormat.TABLE))
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    # Always JSON regardless of --format (the manifest is machine-only).
+    assert payload["apiVersion"] == "1"
+    assert payload["cli"] == "claude-sql"
+    names = {c["name"] for c in payload["commands"]}
+    assert {"query", "manifest", "kappa", "cache compact", "skills ls"} <= names
+    assert payload["exit_codes"]["parse_error"] == 64
+    assert "auto" in payload["output_formats"]
+
+
 def test_freeze_then_replay_roundtrip(
     tmp_corpus: dict[str, Any],
     tmp_path: Path,

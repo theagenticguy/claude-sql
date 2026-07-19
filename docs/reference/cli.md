@@ -2,7 +2,9 @@
 
 The `claude-sql` CLI is a [cyclopts](https://cyclopts.readthedocs.io) `App` wired in `src/claude_sql/app/cli.py:164` and registered as the `claude-sql` console script in `pyproject.toml:53`.
 
-Every subcommand inherits a flattened `Common` flag block (`src/claude_sql/app/cli.py:171`): `--verbose` / `--quiet` (`src/claude_sql/app/cli.py:184-185`), `--glob` / `--subagent-glob` (`src/claude_sql/app/cli.py:186-187`), and `--format {auto,table,json,ndjson,csv}` (`src/claude_sql/app/cli.py:188`). These shared flags are documented once here and elided from each subcommand's flag list below. The router exposes 31 subcommands, ordered as they appear in the source.
+Every subcommand inherits a flattened `Common` flag block (`src/claude_sql/app/cli.py:171`): `--verbose` / `--quiet` (`src/claude_sql/app/cli.py:184-185`), `--glob` / `--subagent-glob` (`src/claude_sql/app/cli.py:186-187`), and `--format {auto,table,json,ndjson,csv}` (`src/claude_sql/app/cli.py:188`). These shared flags are documented once here and elided from each subcommand's flag list below. The router exposes 32 subcommands, ordered as they appear in the source.
+
+For a machine-readable equivalent of this whole page (command names, parameter types/choices/defaults, exit codes, output conventions), run `claude-sql manifest` (see below) or read the generated [`cli-manifest.md`](cli-manifest.md), which is derived from the same command tree by introspection and cannot drift from the code.
 
 ## shell
 
@@ -312,6 +314,14 @@ claude-sql judges
 
 List the cross-provider Bedrock judge catalog (shortname, model ID, family, notes).
 `src/claude_sql/app/cli.py:2431`.
+
+## manifest
+
+```
+claude-sql manifest
+```
+
+Emit a machine-readable manifest of every command, flag, and exit code as JSON (always JSON, regardless of `--format`). Derived from the cyclopts command tree by introspection (`src/claude_sql/core/manifest.py`), so it cannot describe a flag that doesn't exist. `src/claude_sql/app/cli.py:2540`.
 
 ## freeze
 

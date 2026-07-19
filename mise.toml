@@ -188,6 +188,20 @@ description = "Build the publishable claude-sql wheel + sdist into dist/"
 # root, so `uv build` produces the one self-contained wheel directly.
 run = "uv build"
 
+[tasks."docs:cli-manifest"]
+description = "Regenerate docs/reference/cli-manifest.md from the CLI's manifest introspection"
+sources = ["src/claude_sql/app/cli.py", "src/claude_sql/core/manifest.py", "scripts/gen_cli_manifest_doc.py"]
+outputs = ["docs/reference/cli-manifest.md"]
+run = "uv run python scripts/gen_cli_manifest_doc.py"
+
+[tasks."docs:cli-manifest:check"]
+description = "Fail if docs/reference/cli-manifest.md is stale (CI drift gate)"
+run = """
+uv run python scripts/gen_cli_manifest_doc.py
+git diff --exit-code -- docs/reference/cli-manifest.md || \
+  (echo 'docs/reference/cli-manifest.md is stale -- run `mise run docs:cli-manifest` and commit it.' && exit 1)
+"""
+
 [tasks."tool:install"]
 description = "Install claude-sql as a uv tool (global, isolated venv)"
 run = "uv tool install --from . claude-sql --force --reinstall"
