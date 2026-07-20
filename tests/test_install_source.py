@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql.app.install_source import _tool_dir, format_version, read_install_source
+from claude_sql.interfaces.cli.install_source import _tool_dir, format_version, read_install_source
 
 
 def _write_receipt(root: Path, text: str, tool: str = "claude-sql") -> Path:

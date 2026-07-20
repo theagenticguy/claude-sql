@@ -26,11 +26,11 @@ from typing import Any
 import duckdb
 import pytest
 
-from claude_sql.app import cli
-from claude_sql.app.cli import Common
-from claude_sql.core import sql_views
-from claude_sql.core.config import Settings
-from claude_sql.core.output import OutputFormat
+from claude_sql.infrastructure import duckdb_views as sql_views
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.interfaces.cli import app as cli
+from claude_sql.interfaces.cli.app import Common
+from claude_sql.interfaces.cli.output import OutputFormat
 
 # ---------------------------------------------------------------------------
 # Cache redirection — mirrors ``test_cli.py`` so each test gets a clean
@@ -409,12 +409,12 @@ def test_subprocess_query_select1_no_warnings(
 # import time) for commands that never touch vectors (--version/--help/peek/
 # classify). embed_worker + cluster_worker defer their ``lance_store`` import
 # into the functions that use it; this pins that invariant so a future
-# module-top ``from claude_sql.core import lance_store`` re-regresses loudly.
+# module-top ``from claude_sql.infrastructure import lance_store`` re-regresses loudly.
 # ---------------------------------------------------------------------------
 
 
 def test_cli_import_does_not_load_lancedb() -> None:
-    """Importing ``claude_sql.app.cli`` must not transitively import lancedb.
+    """Importing ``claude_sql.interfaces.cli.app`` must not transitively import lancedb.
 
     Run in a fresh interpreter so the assertion sees a clean ``sys.modules``
     (the in-process test suite imports the embed/cluster paths elsewhere,
@@ -423,7 +423,7 @@ def test_cli_import_does_not_load_lancedb() -> None:
     module-top import.
     """
     probe = (
-        "import sys; import claude_sql.app.cli; "
+        "import sys; import claude_sql.interfaces.cli.app; "
         "leaked = sorted(m for m in sys.modules if m == 'lancedb' or m.startswith('lancedb.')); "
         "print('|'.join(leaked))"
     )
@@ -437,7 +437,7 @@ def test_cli_import_does_not_load_lancedb() -> None:
     assert result.returncode == 0, f"import probe failed: {result.stderr[:500]}"
     leaked = result.stdout.strip()
     assert not leaked, (
-        "claude_sql.app.cli eagerly imported lancedb modules "
+        "claude_sql.interfaces.cli.app eagerly imported lancedb modules "
         f"({leaked}); defer the lance_store import into the function that uses it"
     )
 
@@ -445,53 +445,52 @@ def test_cli_import_does_not_load_lancedb() -> None:
 # ---------------------------------------------------------------------------
 # Import hygiene (broadened): the CLI fast path (--version / --help / schema /
 # query / explain / peek / list-cache / shell) must not eagerly drag in ANY of
-# the heavy analytics/evals/provenance worker modules. Each pulls boto3 (via
+# the heavy analytics worker modules. Each pulls boto3 (via
 # ``llm_shared``), ``schemas``, or numpy/polars re-export subtrees — ~0.9 s of
 # import wall-clock measured on this box, paid on EVERY invocation when imported
 # at cli module top. The workers are deferred into the command bodies that use
 # them (extends the #77 lance_store deferral to the worker modules themselves).
-# A future module-top ``from claude_sql.analytics.X import ...`` re-regresses
+# A future module-top ``from claude_sql.application.use_cases.X import ...`` re-regresses
 # this loudly. Runs in a fresh interpreter so the in-process suite (which
 # legitimately imports these workers elsewhere) doesn't pollute sys.modules.
 # ---------------------------------------------------------------------------
 
-# Modules that must NOT be present after a bare ``import claude_sql.app.cli``.
+# Modules that must NOT be present after a bare ``import claude_sql.interfaces.cli.app``.
 # boto3/botocore gate the whole point (the LLM workers' import cost is dominated
 # by boto3); the worker modules are the direct deferral targets.
 _CLI_FORBIDDEN_EAGER_IMPORTS = (
     "boto3",
     "botocore",
-    "claude_sql.core.llm_shared",
-    "claude_sql.analytics.classify_worker",
-    "claude_sql.analytics.cluster_worker",
-    "claude_sql.analytics.community_worker",
-    "claude_sql.analytics.conflicts_worker",
-    "claude_sql.analytics.embed_worker",
-    "claude_sql.analytics.friction_worker",
-    "claude_sql.analytics.terms_worker",
-    "claude_sql.analytics.trajectory_worker",
-    "claude_sql.analytics.ingest",
-    "claude_sql.analytics.skills_catalog",
-    "claude_sql.evals.judge_worker",
-    "claude_sql.evals.kappa_worker",
-    "claude_sql.evals.ungrounded_worker",
-    "claude_sql.provenance.review_sheet_worker",
+    "strands",
+    "openai",
+    "claude_sql.infrastructure.llm_analytics.strands_luna",
+    "claude_sql.infrastructure.bedrock.client",
+    "claude_sql.application.use_cases.classify",
+    "claude_sql.application.use_cases.cluster",
+    "claude_sql.application.use_cases.community",
+    "claude_sql.application.use_cases.conflicts",
+    "claude_sql.application.use_cases.embed",
+    "claude_sql.application.use_cases.friction",
+    "claude_sql.application.use_cases.terms",
+    "claude_sql.application.use_cases.trajectory",
+    "claude_sql.application.use_cases.ingest",
+    "claude_sql.application.use_cases.skills",
 )
 
 
 def test_cli_import_is_lean() -> None:
-    """A bare ``import claude_sql.app.cli`` must not pull the heavy workers.
+    """A bare ``import claude_sql.interfaces.cli.app`` must not pull the heavy workers.
 
     Fresh-interpreter probe: import the CLI module, then report which of the
     forbidden heavy modules leaked into ``sys.modules``. The fast read-only
     path (schema/query/explain/peek/--version/--help) needs none of them; the
-    LLM/analytics/evals commands import their worker lazily inside the command
+    LLM/analytics commands import their worker lazily inside the command
     body. Keeping this list green holds CLI cold-start at the ~1.0 s fast-path
     floor instead of the ~1.9 s it cost with eager worker imports.
     """
     forbidden = _CLI_FORBIDDEN_EAGER_IMPORTS
     probe = (
-        "import sys; import claude_sql.app.cli; "
+        "import sys; import claude_sql.interfaces.cli.app; "
         f"forbidden = {forbidden!r}; "
         "leaked = sorted(m for m in sys.modules "
         "if m in forbidden or any(m.startswith(f + '.') for f in forbidden)); "
@@ -507,7 +506,7 @@ def test_cli_import_is_lean() -> None:
     assert result.returncode == 0, f"import probe failed: {result.stderr[:500]}"
     leaked = [m for m in result.stdout.strip().split("|") if m]
     assert not leaked, (
-        "claude_sql.app.cli eagerly imported heavy worker modules "
+        "claude_sql.interfaces.cli.app eagerly imported heavy worker modules "
         f"({leaked}); defer the import into the command body that uses it "
         "(see the module-top NOTE in cli.py)"
     )
@@ -524,8 +523,8 @@ def test_resolution_level_matches_worker() -> None:
     """
     import typing
 
-    from claude_sql.analytics import community_worker
-    from claude_sql.app import cli
+    from claude_sql.application.use_cases import community as community_worker
+    from claude_sql.interfaces.cli import app as cli
 
     assert typing.get_args(cli.ResolutionLevel) == typing.get_args(
         community_worker.ResolutionLevel

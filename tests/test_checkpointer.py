@@ -6,7 +6,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from claude_sql.core.checkpointer import (
+from claude_sql.infrastructure.sqlite_state.checkpointer import (
     PIPELINE_NAMES,
     count_rows,
     filter_unchanged,

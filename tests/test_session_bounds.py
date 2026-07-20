@@ -10,8 +10,8 @@ from typing import Any
 import duckdb
 import pytest
 
-from claude_sql.core.session_text import session_bounds
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.session_text_loader import session_bounds
 
 
 def _write_session_jsonl(

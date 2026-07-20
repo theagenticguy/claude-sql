@@ -9,11 +9,10 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.core.output import (
-    EXIT_CODES,
-    ClassifiedError,
+from claude_sql.domain.errors import EXIT_CODES, ClassifiedError
+from claude_sql.infrastructure.duckdb_errors import classify_duckdb_error
+from claude_sql.interfaces.cli.output import (
     OutputFormat,
-    classify_duckdb_error,
     emit_dataframe,
     emit_error,
     resolve_format,

@@ -24,10 +24,12 @@ import sys
 
 import pytest
 
-from claude_sql.core.output import (
+from claude_sql.domain.errors import (
     EXIT_CODES,
     ClassifiedError as _ClassifiedError,
     InputValidationError,
+)
+from claude_sql.interfaces.cli.output import (
     OutputFormat,
     emit_error,
     run_or_die,

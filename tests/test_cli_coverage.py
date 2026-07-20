@@ -29,9 +29,9 @@ from typing import Any
 
 import pytest
 
-from claude_sql.app import cli
-from claude_sql.app.cli import Common
-from claude_sql.core.output import OutputFormat
+from claude_sql.interfaces.cli import app as cli
+from claude_sql.interfaces.cli.app import Common
+from claude_sql.interfaces.cli.output import OutputFormat
 
 # ---------------------------------------------------------------------------
 # Cache redirection — same shape as test_cli.py so settings paths are sane.
@@ -310,7 +310,10 @@ def test_migrate_legacy_caches_oserror_does_not_crash(
     def _raise(*_a: object, **_kw: object) -> None:
         raise OSError("simulated read-only mount")
 
-    monkeypatch.setattr(cli.shutil, "move", _raise)
+    # ``_maybe_migrate_legacy_caches`` moved to
+    # ``infrastructure.duckdb_connection`` in the Wave-4 rebind cut; patch
+    # ``shutil.move`` where that module references it.
+    monkeypatch.setattr("claude_sql.infrastructure.duckdb_connection.shutil.move", _raise)
 
     # Must not raise — the loop swallows OSError and warns.
     cli._maybe_migrate_legacy_caches()

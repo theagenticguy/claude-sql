@@ -1,6 +1,16 @@
 # RFC 0002 — Vision, data model, and production roadmap
 
-**Status**: draft
+> **Status: SUPERSEDED by the v2 design (2026-07-19).** This RFC shaped
+> claude-sql v1.x. The v2 direction reverses two of its binding constraints:
+> constraint #3 "No model substitution" and non-goal "Not changing the
+> embedding model" no longer hold — v2 makes the embedding model **pluggable**
+> behind an `EmbeddingProvider` port (Cohere-on-Bedrock, Ollama, and a local
+> ONNX BGE model). v2 also **drops** the `evals/` and `provenance/` planes.
+> The retrieval + clustering plane this RFC built is kept. See
+> `docs/v2/DESIGN.md` for the current architecture. Read the rest of this file
+> as historical context for v1.
+
+**Status**: draft (superseded — see banner above)
 **Filed**: 2026-05-12
 **Owner**: Laith
 **Hard constraints (binding for every change in this RFC)**

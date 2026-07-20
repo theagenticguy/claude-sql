@@ -17,14 +17,14 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.core.config import Settings
-from claude_sql.core.sql_views import (
+from claude_sql.infrastructure.duckdb_views import (
     register_analytics,
     register_macros,
     register_raw,
     register_views,
     register_vss,
 )
+from claude_sql.infrastructure.settings import Settings
 
 SESSION_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 SESSION_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"

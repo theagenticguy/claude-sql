@@ -1,101 +1,105 @@
 # claude-sql · Business logic
 
-This file indexes the domain rules baked into claude-sql: the validations, invariants, derivations, and gate logic that govern how Claude Code transcripts are ingested, classified, scored, and bound to commits.
+This file indexes the domain rules baked into `claude-sql` — the validations, invariants, calculations, and policy gates that shape behavior beyond what interface shapes alone reveal.
 
-**Scope.** "Business logic" here means application-layer rules: pydantic schema constraints on LLM outputs, the deterministic guard clauses that protect parquet caches from poisoned data, the numeric derivations (sentiment delta, kappa, cosine community detection), and the policy gates (parquet-existence gating, refusal handling, the kappa stopping rule, blind-handover stripping). Out of scope: the DuckDB view DDL itself (covered in `architecture/data-flow.md`), Bedrock prompt *content* beyond the rules it encodes, and the JSONL-on-disk format. There is no relational database with UNIQUE/FK constraints in this system — the durable store is parquet shards plus a sqlite checkpoint DB — so the Invariants section captures parquet-shape and idempotence invariants rather than DB constraints.
+**Scope.** After the v2 hexagonal reshape (`feat/v2-hexagonal`), the rules concentrate in the innermost hexagon: `src/claude_sql/domain/`. This document covers those pure domain rules plus the application-layer enforcement sites that invoke them (`src/claude_sql/application/`) and the thin adapter/interface guards that translate them to wire contracts (`src/claude_sql/infrastructure/`, `src/claude_sql/interfaces/`). Four invariants are additionally **machine-checked by Lean 4 proofs** under `proofs/` (core Lean, no mathlib, wired into `mise run check`); those are cited as proven rules, not just asserted ones.
 
-Domains used below mirror the worker decomposition: **Classification** (session-level), **Trajectory** (sentiment arc), **Conflicts** (stance clashes), **Friction** (short-message signals), **Community** (session clustering), **Evals** (judge agreement / blind handover), **Provenance** (commit-to-transcript binding), **Output** (CLI error/exit contract), **Config**.
+In scope: pydantic v2 classification schemas (the LLM-analytics contract), the dedup/dim/friction/cost domain math, the transcript-collapse ordering rules, the retry-queue backoff, the CLI error taxonomy, and the two SQL sites that enforce a domain rule (near-dup self-join, embedding-store guard). Out of scope: the DuckDB view / macro definitions in `infrastructure/duckdb_views.py` (that surface belongs to the contract/reference docs), and database-level DDL except the one `retry_queue` primary key that shapes application dedup behavior. There is no relational database with migrations — persistence is parquet shards, a LanceDB dataset, and a SQLite state file. The old `core/`, `analytics/`, `evals/`, and `provenance/` packages are gone; they are not documented here.
 
 ## Validations
 
-The classifier outputs are validated structurally twice: pydantic v2 models (`model_config = ConfigDict(extra="forbid")`) reject unknown fields, and a flattened JSON Schema is enforced server-side by Bedrock's `output_config.format`. `_bedrock_schema` strips constraints Bedrock's Draft 2020-12 subset rejects (numeric `ge`/`le`, string `minLength`/`pattern`, array `minItems`) but pydantic still enforces them at response-parse time `src/claude_sql/core/schemas.py:82-92`.
+The LLM-analytics plane is validated entirely through pydantic v2 models (`domain/models.py`) — six structured-output schemas, each `extra="forbid"`, whose field-level `Literal` / range / length constraints ARE the validation layer. Bedrock's `output_config.format` enforces the flattened JSON-schema on generation; pydantic re-validates on parse. User-input validation is a thin CLI guard layer.
 
 | Rule | Domain | Citation | Failure mode |
 |---|---|---|---|
-| `autonomy_tier` ∈ {manual, assisted, autonomous} | Classification | `src/claude_sql/core/schemas.py:108` | Bedrock schema rejects; pydantic raises on parse |
-| `work_category` ∈ {sde, admin, strategy_business, events, thought_leadership, other} | Classification | `src/claude_sql/core/schemas.py:118-125` | Schema reject / pydantic raise |
-| `success` ∈ {success, partial, failure, unknown} | Classification | `src/claude_sql/core/schemas.py:139` | Schema reject / pydantic raise |
-| `goal` is 1–280 chars | Classification | `src/claude_sql/core/schemas.py:149-158` | pydantic raise at parse (length stripped from Bedrock schema) |
-| `confidence` ∈ [0.0, 1.0] | Classification, Trajectory, Conflicts, Friction | `src/claude_sql/core/schemas.py:159-167` | pydantic raise at parse |
-| `delta` ∈ {-2,-1,0,1,2,null} (integer-encoded curr−prev) | Trajectory | `src/claude_sql/core/schemas.py:218-226` | Out-of-set value fails JSON Schema validation |
-| `transition_kind` ∈ {frustration_spike, resolution, reset, drift, clarification, none} | Trajectory | `src/claude_sql/core/schemas.py:235-242` | Schema reject; worker coerces unknown to `none` `src/claude_sql/analytics/trajectory_worker.py:559` |
-| `prev_sentiment`/`curr_sentiment` ∈ {negative, neutral, positive} (prev nullable) | Trajectory | `src/claude_sql/core/schemas.py:205-217` | Schema reject |
-| `turn_a_uuid` / `turn_b_uuid` are 1–64 chars, copied verbatim from `[uuid=...]` headers | Conflicts | `src/claude_sql/core/schemas.py:303-323` | pydantic raise; worker skips degenerate pairs |
-| Conflict pair must have distinct, non-empty UUIDs | Conflicts | `src/claude_sql/analytics/conflicts_worker.py:227-238` | Defensive guard drops the row with a WARNING, keeps the rest |
-| `conflict_kind` ∈ {disagreement, correction, reversal, impasse} | Conflicts | `src/claude_sql/core/schemas.py:324` | Schema reject |
-| `severity` ∈ {low, medium, high} | Conflicts | `src/claude_sql/core/schemas.py:337` | Schema reject |
-| Friction `label` ∈ {status_ping, unmet_expectation, confusion, interruption, correction, frustration, none} | Friction | `src/claude_sql/core/schemas.py:423-431` | Schema reject |
-| Friction `rationale` is 1–200 chars | Friction | `src/claude_sql/core/schemas.py:453-462` | pydantic raise at parse |
-| Friction classifier only runs on user-role messages ≤ `friction_max_chars` (default 300) | Friction | `src/claude_sql/analytics/friction_worker.py:361`, `src/claude_sql/core/config.py:255` | Longer messages silently dropped from candidate SQL (treated as genuine task turns) |
-| Claude Code bookkeeping strings ("Continue from where you left off.", "[Request interrupted by user for tool use]") excluded from friction candidates | Friction | `src/claude_sql/analytics/friction_worker.py:343-346,363` | Filtered at the SQL boundary; never reach Bedrock |
-| `--glob` may contain at most one `**` recursive segment | Output/CLI | `src/claude_sql/core/output.py:156-177` | `InputValidationError` → exit 64 with hint |
-| Judge-scores parquet must carry columns {session_id, axis, judge_shortname, score} | Evals | `src/claude_sql/evals/kappa_worker.py:149-152,253-256` | `ValueError` naming the missing columns |
-| Trailer/note binding requires all three wire fields (digest, uri, agent_runtime) | Provenance | `src/claude_sql/provenance/binding.py:561-565,586-587` | Returns `None` (treated as "no binding") if any are missing |
-| If `team_corpus_root` is set, the three transcript globs are rewritten — unless the user pinned any glob, in which case none are rewritten | Config | `src/claude_sql/core/config.py:340-377` | All-or-nothing: a single user pin blocks the rewrite |
+| Session `autonomy_tier` ∈ {manual, assisted, autonomous} | Classification | `domain/models.py:34` | Reject (schema/parse) |
+| Session `work_category` ∈ {sde, admin, strategy_business, events, thought_leadership, other} | Classification | `domain/models.py:44` | Reject |
+| Session `success` ∈ {success, partial, failure, unknown} | Classification | `domain/models.py:65` | Reject |
+| Session `goal` length 1–280 chars | Classification | `domain/models.py:75` | Reject |
+| Session `confidence` in [0.0, 1.0] | Classification | `domain/models.py:85` | Reject |
+| Trajectory `curr_uuid` non-empty; must match a supplied `<window>` uuid | Trajectory | `domain/models.py:119` | Reject; host echo-verify re-runs missing windows |
+| Trajectory `prev_sentiment` / `curr_sentiment` ∈ {negative, neutral, positive} | Trajectory | `domain/models.py:128`, `:137` | Reject |
+| Trajectory `transition_kind` ∈ 6-value enum (frustration_spike, resolution, reset, drift, clarification, none) | Trajectory | `domain/models.py:158` | Reject at schema; coerce to `none` at row-build if out-of-set |
+| Trajectory `confidence` in [0.0, 1.0] | Trajectory | `domain/models.py:177` | Reject |
+| Conflict `turn_a_uuid` / `turn_b_uuid` length 1–64, copied verbatim, must differ | Conflicts | `domain/models.py:223`, `:234` | Reject |
+| Conflict `conflict_kind` ∈ {disagreement, correction, reversal, impasse} | Conflicts | `domain/models.py:244` | Reject |
+| Conflict `severity` ∈ {low, medium, high} | Conflicts | `domain/models.py:257` | Reject |
+| Conflict `agent_position` / `user_position` length 1–280 | Conflicts | `domain/models.py:268`, `:278` | Reject |
+| Friction `label` ∈ 7-value enum (status_ping, unmet_expectation, confusion, interruption, correction, frustration, none) | Friction | `domain/models.py:340` | Reject |
+| Friction `rationale` length 1–200 | Friction | `domain/models.py:370` | Reject |
+| Friction / conflict `confidence` in [0.0, 1.0] | Friction / Conflicts | `domain/models.py:380`, `:287` | Reject |
+| `--glob` may contain at most one `**` recursive segment | CLI input | `interfaces/cli/output.py:130` | `InputValidationError` → exit 64 with hint |
+| Team-corpus globs rewritten from `team_corpus_root` unless a per-glob user pin differs from factory default | Config | `infrastructure/settings.py:430` | User pin wins; no rewrite |
+| Retry-queue `pipeline` must be a known `PIPELINE_NAMES` value | Retry queue | `infrastructure/sqlite_state/retry_queue.py:98` | `raise ValueError` |
+| Embedding provider selector must be a known provider | Embedding | `infrastructure/embedding/__init__.py:57` | `raise ValueError` |
+| Lance vector-store metric must be supported | Embedding | `infrastructure/duckdb_views.py:1885` | `raise ValueError` |
+
+**Friction pre-filter.** Only user-role messages of length ≤ `friction_max_chars` (default 300) are classified at all; longer messages are treated as genuine task turns and skipped. This is a SQL `WHERE length(mt.text_content) <= {max_chars}` guard (`application/use_cases/friction.py:282`), keeping Bedrock cost linear in the interesting slice.
 
 ## Invariants
 
+Four invariants are formally proven in Lean 4 under `proofs/` and gated by `mise run check`; the rest are enforced in Python or SQL. The proven set is marked "Lean-proven".
+
 | Invariant | Where enforced | Citation |
 |---|---|---|
-| Pydantic schemas forbid extra fields (`extra="forbid"`), and every emitted JSON Schema sets `additionalProperties: false` at each object level | Application (pydantic + Bedrock schema) | `src/claude_sql/core/schemas.py:77-78,106` |
-| Every text turn in a session yields exactly one trajectory row; the session-first window has `prev_uuid IS NULL` and a synthetic `prev_sentiment="neutral"` | Application (trajectory_worker) | `src/claude_sql/analytics/trajectory_worker.py:5-8,527-545` |
-| Classifier output is idempotent: same input must produce same output across runs (no randomness, no invented detail) | Application (system-prompt quality bar) | `src/claude_sql/core/llm_shared.py:1258-1266` |
-| Community detection is deterministic: `settings.seed` flows into `find_partition(seed=...)` and `Optimiser.set_rng_seed`, and cluster IDs are relabeled by descending size, so same seed + same input ⇒ byte-identical parquet | Application (community_worker) | `src/claude_sql/analytics/community_worker.py:46-51,215,367-418` |
-| Kappa pipeline does zero Bedrock calls; pure stats, safe to run unlimited times | Application (kappa_worker) | `src/claude_sql/evals/kappa_worker.py:13` |
-| Cohen's / Fleiss' kappa return 0.0 (never NaN) when `pe >= 1.0`, keeping downstream stats valid | Application (kappa_worker) | `src/claude_sql/evals/kappa_worker.py:73-75,96-98` |
-| Cohen's kappa requires equal-shape rater arrays (`assert a.shape == b.shape`) | Application (assert) | `src/claude_sql/evals/kappa_worker.py:63` |
-| Re-running a worker on an unchanged session is a no-op: the checkpointer gates on advancing `(latest_ts, message_count)` bounds | Application (checkpointer) | `src/claude_sql/analytics/trajectory_worker.py:693-700`; `src/claude_sql/core/checkpointer.py:294-313` |
-| Conflicts is rekeyed on `(turn_a_uuid, turn_b_uuid)`; sessions with no conflicts produce ZERO rows (the legacy `empty=True` sentinel is gone) | Application (conflicts_worker + schema) | `src/claude_sql/core/schemas.py:379-400`; `src/claude_sql/analytics/conflicts_worker.py:5-6,220-224` |
-| Parquet column types are fixed module constants because the analytics view binding fails if types drift across reruns | Application (worker schema constants) | `src/claude_sql/analytics/trajectory_worker.py:588-601`; `src/claude_sql/analytics/conflicts_worker.py:70-80` |
-| Stale-shape parquet shards are purged on first run (trajectory v0 per-message shards; conflicts v0 `conflict_idx`/`empty` shards) so a mixed-schema directory never reaches view registration | Application (worker purge step) | `src/claude_sql/analytics/trajectory_worker.py:329-377`; `src/claude_sql/analytics/conflicts_worker.py:85-128` |
-| A growing active session is de-duplicated on rerun via `replace_sessions` before `write_part`, since the checkpointer does not touch the parquet cache (GH #45) | Application (trajectory_worker) | `src/claude_sql/analytics/trajectory_worker.py:890-905` |
-| Blind handover: trailer and note must agree on digest; disagreement is a loud failure, not a silent merge | Provenance (resolve) | `src/claude_sql/provenance/binding.py:718-727` |
-| Every transcript digest carries the `sha256:` prefix and is the SHA-256 of the JSONL's raw bytes (recomputable in one line of any language) | Provenance | `src/claude_sql/provenance/binding.py:61-63,232-246` |
-| Trailer writes are idempotent under `git commit --amend` via `--if-exists replace`; note writes overwrite via `-f` | Provenance | `src/claude_sql/provenance/binding.py:404-442,445-477` |
-| The cache-stats accumulator is protected by a `threading.Lock` and never breaks a real run (failures swallowed) | Trajectory/Conflicts/Friction shared | `src/claude_sql/core/llm_shared.py:147-148,193-214` |
+| Hamming distance is reflexive (`d(x,x)=0`), symmetric (`d(x,y)=d(y,x)`), and bounded by width 64 — so the `< 3` near-dup test is always meaningful | Lean-proven; Python impl at `domain/dedup.py:179` | `proofs/ClaudeSql/Hamming.lean:38`, `:46`, `:66` |
+| Retry backoff is capped at 60 min for any attempt count, is monotone non-decreasing in attempts, and saturates at exactly 60 once `2^a ≥ 60` — a runaway counter can never schedule a retry years out | Lean-proven; Python impl at `retry_queue.py:79` | `proofs/ClaudeSql/Backoff.lean:26`, `:30`, `:36` |
+| The transcript sort key `(ts, kind_rank, uuid)` is a total order on distinct rows (uuid tiebreak is load-bearing); the `(ts, kind_rank)`-only key is NOT connex, so dropping uuid would let DuckDB scan order leak in and break determinism | Lean-proven; Python impl at `domain/transcript.py:327` | `proofs/ClaudeSql/TurnSort.lean:54`, `:60`, `:68` |
+| Lean toolchain builds and discharges a trivial goal — a red `proofs` gate always means a real regression, never a broken toolchain | Lean-proven | `proofs/ClaudeSql/Basic.lean:9` |
+| `render_turn_text` is pure and deterministic: same input renders byte-identical bytes (rests on the TurnSort total-order proof above) | Application code | `domain/transcript.py:316` |
+| `SessionTextCorpus.assemble` output is byte-stable — the four LLM pipelines checkpoint on it, so string literals and tie-break ordering must not drift | Application code | `domain/transcript.py:126` |
+| Embedding store's stamped `(model, dim)` must match the active embedder; different models produce incompatible vector spaces even at matching width | Domain guard, invoked on both write and read/bind paths | `domain/embedding_guard.py:22`; write `application/use_cases/embed.py:321`; read `infrastructure/duckdb_views.py:1943` |
+| Near-dup canonical is the *earliest-seen* row within ≤3 Hamming bits; `MIN(b.uuid)` breaks ties so canonical assignment is deterministic | SQL self-join over `ingest_stamps` | `application/use_cases/ingest.py:319` |
+| SimHash signature coerced to signed 64-bit BIGINT range so it round-trips parquet → DuckDB without high-bit loss | Application code | `domain/dedup.py:176` |
+| Config value-objects (`ClusteringConfig`, `CommunityConfig`, `TermsConfig`, `TranscriptCaps`) are frozen — a config handed to a worker can't mutate mid-run, keeping `seed` determinism honest | Frozen dataclass | `domain/config.py:27` |
+| Analytics determinism: `seed` threads into both UMAP `random_state` calls, `leidenalg.find_partition(seed)`, and the resolution-profile bisection RNG — same seed + same input ⇒ byte-identical output | Application code | `domain/structure/cluster.py:64`, `:81`; `domain/structure/community.py:114`, `:186` |
+| Community relabel is stable: communities sorted by descending size, ties broken by smallest node index | Application code | `domain/structure/community.py:283` |
+| igraph edge attribute MUST be named `"weight"` — `leidenalg` looks it up by string | Application code | `domain/structure/community.py:92` |
+| `RefusalError` / `BedrockRefusalError` is terminal: pipelines stamp a neutral placeholder row and clear the retry queue rather than cycling forever | Domain error + worker handling | `domain/errors.py:48`; trajectory `application/use_cases/trajectory.py:554`; friction `:500` |
+| Retry queue enforces one row per `(pipeline, unit_id)` (PRIMARY KEY); repeat failures increment `attempts` in place | SQLite DDL + application | `infrastructure/sqlite_state/retry_queue.py:50` |
 
 ## Calculations
 
 | Calculation | Inputs | Output | Citation |
 |---|---|---|---|
-| Sentiment delta | prev sentiment, curr sentiment (each mapped negative=−1, neutral=0, positive=+1) | float `curr − prev` ∈ {−2…2}, or null when prev is null | `src/claude_sql/analytics/trajectory_worker.py:76,520-524` |
-| Cohen's kappa | two equal-length rater arrays | (po − pe) / (1 − pe), where pe is summed category-proportion products | `src/claude_sql/evals/kappa_worker.py:57-75` |
-| Fleiss' kappa | (n_items × n_categories) judge-count matrix | (P̄ − P̄ₑ) / (1 − P̄ₑ) | `src/claude_sql/evals/kappa_worker.py:78-98` |
-| Bootstrapped 95% CI on kappa | rater arrays, 1000 resamples, seed=42 | (2.5th, 97.5th) quantiles of resampled kappas | `src/claude_sql/evals/kappa_worker.py:24,101-139` |
-| Delta-kappa CI (stopping-rule input) | current + prior `FleissKappa` (kappa + CI bounds) | does the 95% CI on (current − prior) exclude zero? | `src/claude_sql/evals/kappa_worker.py:225-247` |
-| Session centroid embedding | per-message embeddings grouped by `session_id` | mean over rows, then L2-normalized | `src/claude_sql/analytics/community_worker.py:99-144` |
-| Mutual-kNN cosine graph | session centroids, k (default 15), edge floor | symmetric edge list where i,j are mutually top-k and `sim ≥ floor` | `src/claude_sql/analytics/community_worker.py:147-186` |
-| Community medoid + coherence | per-community similarity submatrix | medoid = node with max mean cosine to peers; coherence = mean pairwise off-diagonal cosine (singletons → coherence 1.0) | `src/claude_sql/analytics/community_worker.py:331-364` |
-| LLM cost estimate (`--dry-run`) | n_items, avg in/out tokens, (in_rate, out_rate) pricing | `(n·in·in_rate + n·out·out_rate) / 1e6` dollars | `src/claude_sql/core/llm_shared.py:1291-1299` |
-| Cache discount ratio (log line) | accumulated cache_read + fresh input tokens | `(cache_read + fresh) / fresh` as `Nx` | `src/claude_sql/core/llm_shared.py:238-241` |
-| Bedrock client pool size | `embed_concurrency`, `llm_concurrency` | `max(32, max(embed, llm) × 2)` | `src/claude_sql/core/llm_shared.py:375-378` |
+| SimHash 64-bit signature | text | signed 64-bit int | `domain/dedup.py:119` |
+| Hamming distance | two 64-bit ints | bit-difference count | `domain/dedup.py:179` |
+| Approx token count (Anthropic-billing scale) | list of texts | per-text int count | `domain/dedup.py:89` |
+| Token-budget bucket | approx token count | xs / sm / md / lg / xl | `domain/dedup.py:191` |
+| Dollar cost estimate (dry-run) | n_items, avg_in/out tokens, `(in_rate, out_rate)` $/MTok | dollars | `domain/costs.py:21` |
+| Sentiment delta | prev/curr sentiment labels | float in {-2..2} or None | `domain/trajectory.py:131` |
+| Exponential retry backoff | attempt count | timedelta in minutes | `infrastructure/sqlite_state/retry_queue.py:79` |
+| c-TF-IDF term weights | per-cluster pseudo-docs, `TermsConfig` | top-N `(cluster, term, weight, rank)` rows | `domain/structure/terms.py:27` |
+| UMAP + HDBSCAN cluster labels | `(N,dim)` float32 matrix, `ClusteringConfig` | per-row cluster labels + 2D viz coords | `domain/structure/cluster.py:30` |
+| Mutual-kNN edge list | symmetric similarity matrix, k, floor | `(edges, weights)` | `domain/structure/community.py:41` |
+| Medoid + coherence per community | similarity matrix, labels | medoid node set + `{cid: coherence}` | `domain/structure/community.py:225` |
+| Resolution-profile γ pick | Leiden profile, level | selected γ | `domain/structure/community.py:144` |
 
-**Leiden+CPM community pipeline (multi-step).** `run_communities` (`src/claude_sql/analytics/community_worker.py:472-667`) composes a derived clustering rather than a single value: (1) load + L2-normalize session centroids; (2) build the mutual-kNN cosine graph and symmetrize with `max(w_ij, w_ji)` (a no-op since the matrix is symmetric); (3) when no explicit γ is passed, run `Optimiser.resolution_profile` over `[range_lo, range_hi]` and pick γ via `_pick_zoom` — `medium` = midpoint of the longest plateau, `coarse` = lowest n_communities partition (n ≥ 2), `fine` = highest n_communities partition (`src/claude_sql/analytics/community_worker.py:250-278`); (4) run `find_partition(CPMVertexPartition, …, seed, n_iterations)`; (5) warn (not split) on disconnected induced subgraphs; (6) compute medoid + coherence; (7) relabel by descending size and collapse communities below `leiden_min_community_size` to `NOISE_COMMUNITY_ID = -1` (`src/claude_sql/analytics/community_worker.py:75,367-418`). The plain-prose delta encoding table the trajectory model is held to lives at `src/claude_sql/analytics/trajectory_worker.py:149-162`.
+**SimHash (`domain/dedup.py:119`).** Lower-case, split on `\w+`, take the set of word 3-grams (1-gram fallback for < 3 tokens). blake2b(digest_size=8) each gram into a uint64. Vote across all 64 bit positions vectorized: bit `b` of the signature is set iff a majority of grams have bit `b` set (`2 * set_count > n_grams`) — byte-identical to the scalar ±1 tally. Empty/degenerate input returns 0.
+
+**Approx tokens (`domain/dedup.py:89`).** Encode each text with cl100k_base (OpenAI's public tokenizer), then multiply by the empirical scaling factor `_ANTHROPIC_RATIO = 0.78` (`dedup.py:61`) to match Anthropic billing within ~5%. Anthropic's tokenizer is closed-source; 0.78 is the measured gap, recomputed against fresh cache receipts twice per minor release.
+
+**Cost estimate (`domain/costs.py:21`).** `n * (in_tokens * in_rate + out_tokens * out_rate) / 1e6` — a flat linear projection, no minimums, tiers, or cache accounting. Powers every `--dry-run` price. Model-ID dated-suffix normalization (`-YYYYMMDD` strip) is a separate concern living in the `cost_estimate` DuckDB macro, not this estimator (`domain/costs.py:14`).
+
+**Sentiment delta (`domain/trajectory.py:131`).** Labels map to `{negative: -1, neutral: 0, positive: 1}` (`trajectory.py:37`); delta = `curr - prev`, or None when either side is None. At row-build the model's emitted delta is trusted when it parses to a number, otherwise recomputed from labels as an audit trail (`trajectory.py:159`).
+
+**c-TF-IDF (`domain/structure/terms.py:27`).** Per-class term frequency (L1-normalized per cluster) times `idf = log(1 + avg_docs_per_term / col_sum)`, over `CountVectorizer` with configurable `min_df` / `max_df` / ngram bounds. Hand-rolled deliberately (no bertopic) to keep the weighting visible and patchable. Terms with non-positive weight are dropped; top-N kept per cluster, ranks 1-based.
+
+**Backoff (`retry_queue.py:79`).** `min(2^attempts, 60)` minutes — 2, 4, 8, 16, 32, then pinned at 60. Cap and monotonicity are the Lean-proven invariants above.
 
 ## Policy and gates
 
-- **Parquet-existence gating:** an analytics view or macro is registered only when its backing parquet is populated (at least one part file with `st_size > 16`); a missing parquet warns at DEBUG and no-ops rather than crashing the query path. `src/claude_sql/core/sql_views.py:1794-1806,1930-1942,1152-1162`.
-- **Defense-in-depth macro bind:** `_safe_macro` demotes a `duckdb.Error` (e.g. a parquet vanishing between gate-check and DDL-bind) to DEBUG so read-only commands never flood stderr. `src/claude_sql/core/sql_views.py:1165-1190`.
-- **Bedrock refusal handling:** a `stop_reason == "refusal"` response is terminal and non-retryable; the worker stamps a neutral placeholder row (trajectory) or a `label="none", source="refused"` row (friction) so the unit is not re-tried every run. `src/claude_sql/core/llm_shared.py:490-497,517-518`; `src/claude_sql/analytics/trajectory_worker.py:775-783`; `src/claude_sql/analytics/friction_worker.py:572-588`.
-- **Retryable-error policy:** only the throttle/transient Bedrock codes plus SSL/connection/read-timeout exceptions are retried (tenacity, 10 attempts, exponential backoff); everything else propagates to the per-unit retry queue. `src/claude_sql/core/llm_shared.py:61-75,328-339,395-401`.
-- **Trajectory missing-window gate:** when the model omits requested `(prev_uuid, curr_uuid)` windows, one bounded retry re-requests only the missing windows; anything still missing becomes a neutral placeholder so a single refusing chunk never wedges the pipeline. `src/claude_sql/analytics/trajectory_worker.py:805-842`.
-- **Friction source-priority gate:** classification of a short user message is decided by regex fast-path first (flat confidence 0.9), then three deterministic SQL stamps, then Sonnet — regex > sql > llm, so the LLM only sees what the cheap paths could not resolve. `src/claude_sql/analytics/friction_worker.py:148-162,171-173,271-312,475-516`.
-- **Friction SQL stamps (RFC §4.3, §9.4):** Rule 1 — a user message whose normalized text repeats an earlier user message within 10 turns → `unmet_expectation` (0.85); Rule 2 — ≤30-char message whose first token ∈ {stop, redo, revert, rollback, undo, restart} → `correction` (0.9); Rule 3 — a trailing-`?` user message immediately after an error tool_result → `confusion` (0.85). Rule 3 degrades gracefully (skips) when the `messages` view is absent. `src/claude_sql/analytics/friction_worker.py:195-312`.
-- **Kappa stopping-rule gate:** with `--floor 0.6 --delta-gate <prior.parquet>`, the run returns non-zero exit when the delta-kappa CI excludes zero, matching the pre-registered rebaseline policy. `src/claude_sql/evals/kappa_worker.py:8-12,225-247`.
-- **Disconnected-community policy:** Leiden communities whose induced subgraph is weakly disconnected are warned about but not split (delete-in-30s reversible); the splitter is deferred until the warning fires on the live corpus. `src/claude_sql/analytics/community_worker.py:16-21,302-328`.
-- **Community recompute gate:** if the communities parquet exists and `st_size > 16` and `force` is false, recomputation is skipped and cached stats are returned. `src/claude_sql/analytics/community_worker.py:509-525`.
-- **Blind-handover policy:** before a transcript is handed to a cross-provider judge, every identity marker (Slack IDs, agent persona tokens, protocol tokens, MCP tool names, OTel/UUID/work-item/thread-ts system IDs, mrkdwn refs) is stripped; the original session_id is replaced by a SHA256[:16] hash so bundles stay re-linkable without leaking identity. `src/claude_sql/evals/blind_handover.py:1-21,81-156`.
-- **Binding resolution precedence:** resolve commit→transcript by trailer first, note fallback, and loud failure (`BindingMismatchError`) on digest disagreement; neither present raises `LookupError` (CLI exit 2). `src/claude_sql/provenance/binding.py:674-743`.
-- **Trailer-duplication tolerance:** on read, the first occurrence of a duplicated trailer key wins, tolerating rebase/fixup-squash duplication. `src/claude_sql/provenance/binding.py:506-512`.
-- **Agent-runtime detection:** the binding reads `CLAUDE_AGENT_RUNTIME` from the environment, falling back to `claude-code/unknown`. `src/claude_sql/provenance/binding.py:249-262`.
-- **CLI exit-code contract:** stable codes agents can rely on — ok=0, no_embeddings=2, invalid_input/parse_error=64, catalog_error=65, runtime_error=70, duckdb_missing=127; `run_or_die` maps `InputValidationError` and `duckdb.Error` to these. `src/claude_sql/core/output.py:49-57,180-207,228-254`.
-- **AUTO output format:** `--format auto` resolves to TABLE on a TTY and JSON otherwise, so pipes and agent subprocesses get machine-readable output without a flag. `src/claude_sql/core/output.py:60-65`.
-- **`tasks_state_current` status contract:** a TaskCreate row defaults to status `pending` (`COALESCE(ls.status, 'pending')`) and reflects the latest `TaskUpdate.status` (e.g. `in_progress` → `completed`) keyed per `(session_id, task_id)`, with task_id recovered from the tool_result or per-session creation order. `src/claude_sql/core/sql_views.py:921-971`.
+- **Cost dry-run default:** every command that spends real money defaults to `--dry-run`; the dry-run path uses a pure-SQL `COUNT(DISTINCT session_id)` rather than a full materialization, so it stays fast on large corpora. Honored in classify/trajectory/conflicts/friction/embed use-cases and chained through the 10-stage `analyze` pipeline. `application/analyze.py:104`, `application/use_cases/classify.py:234`, `.../trajectory.py:829`, `.../conflicts.py:392`.
+- **Regex fast-path bypass:** unambiguous friction shapes (`status_ping`, `interruption`, `correction`) are caught by a frozen regex bank at flat 0.9 confidence, never paying Bedrock; anything ambiguous (e.g. `screenshot?`) deliberately falls through to the LLM so a single mis-tuned pattern can't poison the corpus. `domain/friction.py:102`, invoked at `application/use_cases/friction.py:405`.
+- **Fail-loud embedding-provider guard:** appending vectors into a store written by a different provider/model is refused (raises `EmbeddingProviderMismatch` naming both sides and the `rm -rf` recovery command); an empty store is a no-op that any provider may claim. `domain/embedding_guard.py:22`.
+- **Fail-open LLM-analytics:** the opt-in analytics provider surfacing `LlmAnalyticsUnavailable` NEVER crashes the core SQL/embedding pipeline — the worker treats it like any recoverable per-chunk failure (enqueue, stamp neutral placeholders, or skip). `domain/errors.py:94`, trajectory handling at `application/use_cases/trajectory.py:534`.
+- **Terminal-refusal gate:** a Bedrock content-policy refusal (`stop_reason == "refusal"`, no content) is terminal and non-retryable — pipelines stamp a neutral placeholder and clear the retry queue. `domain/errors.py:63`.
+- **CLI error taxonomy → exit codes:** DuckDB parse errors → 64, catalog errors → 65, everything else runtime → 70; missing embeddings → 2; malformed input → 64; missing `duckdb` binary → 127. Stable wire contract for agents. `domain/errors.py:26`, classified at `infrastructure/duckdb_errors.py:19`.
+- **Bounded windowed retry:** a trajectory chunk missing windows triggers exactly ONE retry of just the missing `(prev_uuid, curr_uuid)` keys; persistent misses become neutral placeholder rows so one refusing chunk never wedges the pipeline. `domain/trajectory.py:199`, `domain/trajectory.py:138`.
+- **Team-corpus glob rewrite (opt-in):** setting `team_corpus_root` replaces (does not union) the three personal-corpus globs — but only when the user hasn't pinned any glob away from its factory default. `infrastructure/settings.py:430`.
+- **Disconnected-community warn-only:** a Leiden community whose induced subgraph is weakly-disconnected logs a warning but is NOT split (Park et al. Connectivity Modifier deferred until the warning fires regularly on the live corpus). `domain/structure/community.py:196`.
+- **Small-community collapse:** communities below `leiden_min_community_size` are relabeled to the noise sentinel `-1` with `is_medoid=False`, `coherence=0.0`. `domain/structure/community.py:293`.
 
 ## See also
 
-- [claude-sql · Module map](../architecture/module-map.md) — 10 shared source files
-- [claude-sql · Contract map](contract-map.md) — 9 shared source files
-- [claude-sql · Debugging guide](debugging-guide.md) — 9 shared source files
-- [claude-sql · Public API](../reference/public-api.md) — 9 shared source files
-- [claude-sql · Tech debt](tech-debt.md) — 9 shared source files
+- [claude-sql · System overview](../architecture/system-overview.md) — 6 shared source citations

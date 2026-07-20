@@ -76,4 +76,4 @@ severity-tier tuning via scanner flags or an advisory allowlist).
 
 - claude-sql `.github/workflows/osv.yml` + `.github/workflows/semgrep.yml`
   on `chore/ci-hardening` (session-c4635d).
-- opencodehub `.github/workflows/ci.yml`'s osv job — the origin pattern.
+- A sibling Python repo's `ci.yml` osv job — the origin pattern.

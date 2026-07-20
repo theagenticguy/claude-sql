@@ -17,19 +17,19 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.core.config import Settings
-from claude_sql.core.schemas import (
+from claude_sql.infrastructure.bedrock.structured_output import (
     SESSION_CLASSIFICATION_SCHEMA,
     SESSION_CONFLICTS_SCHEMA,
     TRAJECTORY_ARRAY_SCHEMA,
 )
-from claude_sql.core.sql_views import (
+from claude_sql.infrastructure.duckdb_views import (
     register_analytics,
     register_macros,
     register_raw,
     register_views,
     register_vss,
 )
+from claude_sql.infrastructure.settings import Settings
 
 # ---------------------------------------------------------------------------
 # Schema contract
@@ -103,7 +103,7 @@ class _FakeBedrockClient:
 
 def test_llm_worker_invoke_body_shape_adaptive_thinking() -> None:
     """Body must use output_config.format (not tool_use) and include thinking."""
-    from claude_sql.core import llm_shared
+    from claude_sql.infrastructure.bedrock import client as llm_shared
 
     fake = _FakeBedrockClient({"output": {"autonomy_tier": "autonomous"}})
     result = llm_shared._invoke_classifier_sync(
@@ -127,7 +127,7 @@ def test_llm_worker_invoke_body_shape_adaptive_thinking() -> None:
 
 def test_llm_worker_no_thinking_flag() -> None:
     """thinking_mode='disabled' must omit the thinking field entirely."""
-    from claude_sql.core import llm_shared
+    from claude_sql.infrastructure.bedrock import client as llm_shared
 
     fake = _FakeBedrockClient({"output": {"foo": "bar"}})
     llm_shared._invoke_classifier_sync(
@@ -149,7 +149,7 @@ def test_llm_worker_no_thinking_flag() -> None:
 
 def test_register_analytics_skips_missing_parquets(tmp_path: Any) -> None:
     """register_analytics must not error when parquets are missing."""
-    from claude_sql.core.sql_views import register_analytics
+    from claude_sql.infrastructure.duckdb_views import register_analytics
 
     con = duckdb.connect(":memory:")
     # All paths point at nonexistent files -- every view creation should
@@ -167,7 +167,7 @@ def test_register_analytics_skips_missing_parquets(tmp_path: Any) -> None:
 
 def test_register_analytics_with_fixture_parquet(tmp_path: Any) -> None:
     """Given a real parquet, register_analytics creates a queryable view."""
-    from claude_sql.core.sql_views import register_analytics
+    from claude_sql.infrastructure.duckdb_views import register_analytics
 
     cls_df = pl.DataFrame(
         {

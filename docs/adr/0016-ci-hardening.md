@@ -15,8 +15,8 @@ The target: every check that runs locally also runs on pull requests and
 `push: main`, plus a second layer of security posture (SAST / SBOM /
 supply chain) that isn't reasonable to run on every local save.
 
-Reference implementation: `/efs/lalsaado/workplace/opencodehub/.github/
-workflows/` — same contributor, same convention set, translated Python.
+Reference implementation: a sibling Python repo by the same contributor —
+same convention set, translated for this project's layout.
 
 ## Decision
 
@@ -58,14 +58,14 @@ CI.
   closest thing to first-class uv support.
 
 - **OSV-scanner two-step.** Scan once with `|| true` + SARIF output →
-  upload SARIF → re-run without `--format` to fail the job. Mirrors
-  opencodehub; separates "report" from "gate" so findings still reach
-  code scanning when CI blocks.
+  upload SARIF → re-run without `--format` to fail the job. Separates
+  "report" from "gate" so findings still reach code scanning when CI
+  blocks.
 
 - **Action pinning.** Tag pins (`@v4`, `@v5`, `@v7`, `@v2.4.3`, `@v6`),
   not Dependabot SHAs. Scorecard will flag us on
-  `pinning-dependencies`; acceptable trade-off for v1 — matches
-  opencodehub, keeps the update cadence sane.
+  `pinning-dependencies`; acceptable trade-off for v1 — keeps the
+  update cadence sane.
 
 ## Consequences
 
@@ -92,6 +92,5 @@ CI.
 
 ## Sources
 
-- opencodehub workflows (`/efs/lalsaado/workplace/opencodehub/.github/
-  workflows/`).
+- A sibling Python repo's GitHub Actions workflows by the same contributor.
 - Session research `.erpaval/sessions/session-c4635d/research-sast.yaml`.

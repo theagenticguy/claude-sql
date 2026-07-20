@@ -16,10 +16,10 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.analytics import friction_worker
-from claude_sql.core.config import Settings
-from claude_sql.core.schemas import USER_FRICTION_SCHEMA
-from claude_sql.core.sql_views import register_analytics
+from claude_sql.application.use_cases import friction as friction_worker
+from claude_sql.infrastructure.bedrock.structured_output import USER_FRICTION_SCHEMA
+from claude_sql.infrastructure.duckdb_views import register_analytics
+from claude_sql.infrastructure.settings import Settings
 
 # ---------------------------------------------------------------------------
 # Schema contract
@@ -124,7 +124,7 @@ class _FakeBedrockClient:
 def test_llm_invoke_body_uses_user_friction_schema() -> None:
     """The friction pipeline goes through llm_shared._invoke_classifier_sync
     with USER_FRICTION_SCHEMA; no tool_use, output_config.format only."""
-    from claude_sql.core import llm_shared
+    from claude_sql.infrastructure.bedrock import client as llm_shared
 
     fake_payload = {
         "output": {

@@ -1,0 +1,366 @@
+"""DuckDB loaders that materialize the per-session timeline corpus.
+
+This is the infrastructure half of the ``TranscriptReaderPort`` seam. It reads
+the v1 ``messages_text``, ``tool_calls``, and ``tool_results`` views,
+interleaves them chronologically with role markers, and hands back the pure
+:class:`~claude_sql.domain.transcript.SessionTextCorpus` domain object. The
+collapse/format logic and the ordering live in the domain module; this module
+owns only the DuckDB round-trips.
+
+Why this module exists
+----------------------
+The naïve shape — one SQL round-trip per session — is quadratic against the
+zero-copy ``read_json`` glob: every ``SELECT ... WHERE session_id = ?`` rescans
+every JSONL file in the corpus.  On ~6K sessions that's unusable.  We
+materialize the three source views into in-memory arrow tables **once** per
+pipeline run, then do per-session slicing in Python.  One glob scan instead of
+6K.
+
+Public API
+----------
+session_text_corpus(con, *, since_days=None, limit=None) -> SessionTextCorpus
+    Build an in-memory corpus of per-session timelines.  Call this once at
+    the start of each classification / conflict / trajectory pipeline.
+
+iter_session_texts(con, *, settings, since_days=None, limit=None) -> Iterator[tuple[str, str]]
+    Thin wrapper that constructs a corpus and yields assembled texts.  Kept
+    for callers that only want the ``(session_id, text)`` stream.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import duckdb
+import pyarrow as pa
+from loguru import logger
+
+from claude_sql.domain.transcript import (
+    SessionTextCorpus,
+    _timeline_sort_key,
+    _TimelineRow,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from claude_sql.infrastructure.settings import Settings
+
+#: Name of the transient DuckDB relation holding the in-window session ids.
+#: The three timeline loaders JOIN against this instead of binding the id
+#: list as a ``?`` parameter — see :func:`session_text_corpus`.
+_SID_FILTER_RELATION = "_session_text_sid_filter"
+
+
+def _iso_expr(col: str) -> str:
+    """Engine-side SQL that reproduces Python ``datetime.isoformat()`` exactly.
+
+    Each timeline loader formats its ``ts`` column once in DuckDB instead of
+    calling ``ts.isoformat()`` per row in Python — that per-row call was ~37%
+    of the corpus build's *Python* time and ~157K invocations on the live
+    corpus (one per timeline event). ``strftime`` always emits the
+    fractional-second field, but Python's ``isoformat()`` omits it entirely
+    when the timestamp lands on a whole second, so the ``CASE`` drops the
+    ``.%f`` group exactly when ``{col}`` has no sub-second component. Verified
+    byte-identical to ``ts.isoformat()`` across all 157,981 rows of the live
+    corpus (messages_text + tool_calls + tool_results). The caller wraps this
+    in a ``NULL`` guard so a missing ``ts`` still yields ``''``.
+    """
+    return (
+        f"CASE WHEN {col} = date_trunc('second', {col}) "
+        f"THEN strftime({col}, '%Y-%m-%dT%H:%M:%S') "
+        f"ELSE strftime({col}, '%Y-%m-%dT%H:%M:%S.%f') END"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Corpus loader
+# ---------------------------------------------------------------------------
+
+
+def session_text_corpus(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+) -> SessionTextCorpus:
+    """Materialize the per-session timeline corpus in one DuckDB round-trip.
+
+    Parameters
+    ----------
+    con
+        Open DuckDB connection with the v1 views registered.
+    since_days
+        Optional recency filter applied to ``messages_text.ts``.  Sessions
+        whose most-recent text message is older than ``since_days`` are
+        excluded from the corpus entirely.
+    limit
+        Cap the number of sessions (newest-first) returned in ``order``.
+
+    Notes
+    -----
+    We issue three queries — one per source view (``messages_text``,
+    ``tool_calls``, ``tool_results``) — filtered by the session-id window
+    resolved from ``messages_text``.  The window is handed to DuckDB as a
+    registered Arrow relation that each query JOINs against, rather than
+    binding the id list as a ``?`` parameter: DuckDB probes ``import pandas``
+    ~twice per element while binding a Python ``list`` parameter, and on an
+    install without pandas each probe is a full failed ``sys.path`` scan
+    (~35K failed imports / ~2.5s on a 6K-session corpus). Each result set is
+    ordered by ``(session_id, ts)`` so we can stream it into a dict of lists;
+    a final per-session sort stitches the three streams into one
+    deterministic chronological order. IO errors from stale JSONLs are caught
+    and logged once with the session list that fell out.
+    """
+    order = _load_session_order(con, since_days=since_days, limit=limit)
+    if not order:
+        logger.info("session_text_corpus: 0 sessions matched the window")
+        return SessionTextCorpus(texts_by_session={}, order=[])
+
+    session_set = set(order)
+    texts_by_session: dict[str, list[_TimelineRow]] = {sid: [] for sid in order}
+
+    # Register the in-window session ids once as an Arrow relation; the three
+    # loaders JOIN against it (see the Notes above for why this beats a bound
+    # list parameter).
+    sid_filter = pa.table({"sid": pa.array(list(session_set), type=pa.string())})
+    con.register(_SID_FILTER_RELATION, sid_filter)
+    try:
+        _load_messages_text(con, texts_by_session)
+        _load_tool_calls(con, texts_by_session)
+        _load_tool_results(con, texts_by_session)
+    except duckdb.IOException as exc:
+        # A JSONL on the glob can be deleted between view registration and
+        # the materializing query.  Log and return whatever landed.
+        logger.warning("session_text_corpus: IO error while materializing ({})", exc)
+    finally:
+        con.unregister(_SID_FILTER_RELATION)
+
+    # DuckDB ordered each query by (session_id, ts), but the three streams are
+    # merged here, and the scan plan does not order rows that share a timestamp.
+    # _timeline_sort_key imposes a total order so the assembled transcript is
+    # byte-stable run-to-run.
+    for rows in texts_by_session.values():
+        rows.sort(key=_timeline_sort_key)
+
+    # Drop sessions that ended up with no rows at all -- keeps iteration
+    # clean for downstream pipelines.
+    non_empty_order = [sid for sid in order if texts_by_session.get(sid)]
+    texts_by_session = {sid: texts_by_session[sid] for sid in non_empty_order}
+
+    logger.info(
+        "session_text_corpus: materialized {} sessions ({} with content)",
+        len(order),
+        len(non_empty_order),
+    )
+    return SessionTextCorpus(texts_by_session=texts_by_session, order=non_empty_order)
+
+
+def _load_session_order(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    since_days: int | None,
+    limit: int | None,
+) -> list[str]:
+    """Return the newest-first session id list for the requested window."""
+    where = ["mt.text_content IS NOT NULL"]
+    if since_days is not None:
+        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
+    sql = f"""
+        SELECT CAST(mt.session_id AS VARCHAR) AS sid,
+               max(mt.ts) AS last_ts
+          FROM messages_text mt
+         WHERE {" AND ".join(where)}
+         GROUP BY 1
+         ORDER BY last_ts DESC
+    """
+    if limit is not None:
+        sql += f"\nLIMIT {int(limit)}"
+    return [r[0] for r in con.execute(sql).fetchall()]
+
+
+def session_bounds(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    since_days: int | None = None,
+    limit: int | None = None,
+) -> dict[str, tuple[datetime | None, datetime | None]]:
+    """Return ``{session_id: (last_ts, transcript_mtime)}`` for the window.
+
+    ``last_ts`` is ``max(messages_text.ts)`` for the session. ``transcript_mtime``
+    is ``os.stat(transcript_path).st_mtime`` for the JSONL file backing the
+    session — or ``None`` when the file is unreadable (stale glob entry, etc).
+
+    Used by the LLM worker pipelines to drive mtime-based checkpoint skip.
+    """
+    where = ["mt.text_content IS NOT NULL"]
+    if since_days is not None:
+        where.append(f"mt.ts >= current_timestamp - INTERVAL {int(since_days)} DAY")
+    sql = f"""
+        SELECT CAST(mt.session_id AS VARCHAR) AS sid,
+               max(mt.ts) AS last_ts,
+               any_value(s.transcript_path) AS transcript_path
+          FROM messages_text mt
+          LEFT JOIN sessions s ON CAST(s.session_id AS VARCHAR) = CAST(mt.session_id AS VARCHAR)
+         WHERE {" AND ".join(where)}
+         GROUP BY 1
+         ORDER BY last_ts DESC
+    """
+    if limit is not None:
+        sql += f"\nLIMIT {int(limit)}"
+    # Claude Code rotates transcripts; a file visible during glob scan can
+    # vanish before the JOIN onto ``sessions`` runs. One IOException retry
+    # refreshes the glob-backed views and succeeds on the second pass.
+    try:
+        rows = con.execute(sql).fetchall()
+    except duckdb.IOException as exc:
+        logger.warning("session_bounds: stale glob entry — retrying once ({})", exc)
+        rows = con.execute(sql).fetchall()
+    out: dict[str, tuple[datetime | None, datetime | None]] = {}
+    for sid, last_ts, path in rows:
+        mtime: datetime | None = None
+        if path:
+            try:
+                st = Path(path).stat()
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
+            except OSError:
+                mtime = None
+        out[str(sid)] = (last_ts, mtime)
+    return out
+
+
+def _load_messages_text(
+    con: duckdb.DuckDBPyConnection,
+    out: dict[str, list[_TimelineRow]],
+) -> None:
+    """Stream text blocks for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
+        SELECT CAST(mt.session_id AS VARCHAR) AS sid,
+               CASE WHEN mt.ts IS NULL THEN '' ELSE {_iso_expr("mt.ts")} END AS ts_iso,
+               mt.role,
+               mt.text_content,
+               CAST(mt.uuid AS VARCHAR) AS uuid
+          FROM messages_text mt
+         WHERE CAST(mt.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
+         ORDER BY sid, mt.ts
+    """
+    for sid, ts_iso, role, body, uuid in con.execute(sql).fetchall():
+        out[sid].append(
+            _TimelineRow(
+                ts_iso=ts_iso,
+                role=role or "user",
+                kind="text",
+                body=body,
+                aux=None,
+                uuid=uuid,
+            )
+        )
+
+
+def _load_tool_calls(
+    con: duckdb.DuckDBPyConnection,
+    out: dict[str, list[_TimelineRow]],
+) -> None:
+    """Stream tool_use events for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
+        SELECT CAST(tc.session_id AS VARCHAR) AS sid,
+               CASE WHEN tc.ts IS NULL THEN '' ELSE {_iso_expr("tc.ts")} END AS ts_iso,
+               tc.tool_name,
+               CAST(tc.tool_input AS VARCHAR) AS tool_input_json
+          FROM tool_calls tc
+         WHERE CAST(tc.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
+         ORDER BY sid, tc.ts
+    """
+    for sid, ts_iso, tool_name, tool_input_json in con.execute(sql).fetchall():
+        # Defensive: a session id can appear in tool_calls without being in
+        # messages_text (tool-use-only probe sessions).  Skip those.
+        rows = out.get(sid)
+        if rows is None:
+            continue
+        rows.append(
+            _TimelineRow(
+                ts_iso=ts_iso,
+                role="tool",
+                kind="tool_use",
+                body=tool_input_json,
+                aux=tool_name,
+            )
+        )
+
+
+def _load_tool_results(
+    con: duckdb.DuckDBPyConnection,
+    out: dict[str, list[_TimelineRow]],
+) -> None:
+    """Stream tool_result events for the windowed sessions into ``out``.
+
+    Filters via a JOIN onto the ``_SID_FILTER_RELATION`` Arrow relation that
+    :func:`session_text_corpus` registers, not a bound list parameter.
+    """
+    sql = f"""
+        SELECT CAST(tr.session_id AS VARCHAR) AS sid,
+               CASE WHEN tr.ts IS NULL THEN '' ELSE {_iso_expr("tr.ts")} END AS ts_iso,
+               tr.tool_use_id,
+               CAST(tr.content AS VARCHAR) AS content_json
+          FROM tool_results tr
+         WHERE CAST(tr.session_id AS VARCHAR) IN (SELECT sid FROM {_SID_FILTER_RELATION})
+         ORDER BY sid, tr.ts
+    """
+    for sid, ts_iso, tool_use_id, content_json in con.execute(sql).fetchall():
+        rows = out.get(sid)
+        if rows is None:
+            continue
+        rows.append(
+            _TimelineRow(
+                ts_iso=ts_iso,
+                role="tool",
+                kind="tool_result",
+                body=content_json,
+                aux=tool_use_id,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stream adapter
+# ---------------------------------------------------------------------------
+
+
+def iter_session_texts(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    settings: Settings,
+    since_days: int | None = None,
+    limit: int | None = None,
+    include_uuids: bool = False,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(session_id, text)`` for every session with at least one text block.
+
+    Newest-first.  Internally materializes a :class:`SessionTextCorpus` — one
+    glob scan regardless of how many sessions match the window.
+
+    ``include_uuids`` is forwarded to :meth:`SessionTextCorpus.assemble`; pass
+    True only for the conflicts pipeline, which needs per-turn uuids in the
+    transcript headers (issue #109). All other callers keep the default so
+    their prompts stay byte-identical.
+    """
+    corpus = session_text_corpus(con, since_days=since_days, limit=limit)
+    # Project the god-Settings down to the pure two-int caps slice at the
+    # adapter boundary so the domain ``assemble`` method never reads Settings
+    # directly (T-2-4 caps repoint). Output stays byte-identical — the two cap
+    # values are unchanged, only their source object differs.
+    caps = settings.transcript_caps()
+    for sid in corpus.order:
+        text = corpus.assemble(sid, settings=caps, include_uuids=include_uuids)
+        if text:
+            yield sid, text

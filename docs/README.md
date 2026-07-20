@@ -1,8 +1,8 @@
 # claude-sql · Doc tree
 
-Generated codebase docs for `claude-sql`.
+Generated codebase docs for `claude-sql` on the `feat/v2-hexagonal` branch.
 
-Prose is generated; structure is mechanical; cross-references are deterministic. Built against commit `a5589ee`: one package, five PEP 420 layer sub-packages under `src/claude_sql/`.
+Prose is generated; structure is mechanical. Cross-references are deterministic. Built against commit `7670b4c`: the completed v2 hexagonal tree — `domain` / `application` / `infrastructure` / `interfaces` layers plus the `composition.py` ClaudeSql facade and the Lean 4 `proofs/` track. The transitional `core` package is dissolved; the import-linter enforces one layers contract (`interfaces > application > infrastructure > domain`). The v2 specs at [docs/v2/DESIGN.md](v2/DESIGN.md) and [docs/v2/MIGRATION.md](v2/MIGRATION.md) are now historical (all phases DONE).
 
 ## Architecture
 
@@ -18,6 +18,7 @@ Prose is generated; structure is mechanical; cross-references are deterministic.
 ## Behavior
 
 - [Processes](behavior/processes.md)
+- [State machines](behavior/state-machines.md)
 
 ## Analysis
 

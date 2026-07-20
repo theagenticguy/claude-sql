@@ -2,66 +2,57 @@
 
 ```mermaid
 classDiagram
-    class CLI {
-        +embed()
-        +classify()
-        +analyze()
+    class ClaudeSql {
+        +reader()
+        +search()
+        +query(sql)
+        +build_reader()
+        +build_search()
+    }
+    class Interfaces {
         +query()
-        +community()
+        +analyze()
+        +search()
+        +embed()
     }
-    class Settings {
-        +active_model_id()
-        +_derive_team_corpus_globs()
-        +lance_uri
+    class Application {
+        +run_analyze()
+        +run_clustering()
+        +run_communities()
+        +run_terms()
     }
-    class SQLViews {
+    class Infrastructure {
         +register_all()
         +register_views()
         +register_macros()
         +register_vss()
-        +register_analytics()
     }
-    class LanceStore {
-        +connect_db()
-        +open_or_create_table()
-        +add_chunk()
-        +ensure_index()
-        +get_embedded_uuids()
+    class Domain {
+        +assemble()
+        +render_turn_text()
+        +ensure_store_matches()
+        +estimate_cost()
     }
-    class EmbedWorker {
-        +run_backfill()
-        +embed_query()
-        +discover_unembedded()
+    class TranscriptReader {
+        +session_messages()
+        +read_turn_text()
+        +session_ids()
+        +session_bounds()
     }
-    class LLMShared {
-        +classify_one()
-        +pipeline_cache_stats()
-        +_build_bedrock_client()
-        +_estimate_cost()
-        +extract_usage_metrics()
-    }
-    class TrajectoryWorker {
-        +trajectory_messages()
-        +_load_windows()
-        +_chunk_windows()
-        +_classify_chunk()
-    }
-    class CommunityWorker {
-        +run_communities()
-        +neighbors_of()
-        +_load_session_centroids()
-        +_run_leiden_cpm()
+    class SessionSearch {
+        +search(query, k)
+        +embed_query(text)
+        +close()
     }
 
-    CLI --> Settings : reads
-    CLI --> SQLViews : invokes
-    CLI --> EmbedWorker : invokes
-    CLI --> TrajectoryWorker : invokes
-    CLI --> CommunityWorker : invokes
-    SQLViews --> LanceStore : attaches
-    EmbedWorker --> LanceStore : writes
-    EmbedWorker --> Settings : reads
-    TrajectoryWorker --> LLMShared : invokes
-    LLMShared --> Settings : reads
-    CommunityWorker --> SQLViews : reads
+    Interfaces --> Application : invokes
+    Interfaces --> Infrastructure : wires
+    Application --> Infrastructure : builds
+    Application --> Domain : uses
+    Infrastructure --> Domain : uses
+    ClaudeSql --> TranscriptReader : builds
+    ClaudeSql --> SessionSearch : builds
+    ClaudeSql --> Infrastructure : registers
+    TranscriptReader ..|> Application : realizes
+    SessionSearch ..|> Application : realizes
 ```

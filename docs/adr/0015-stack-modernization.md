@@ -16,16 +16,23 @@ pathlib misuse), without drowning contributors in false positives.
 
 ## Decision
 
-### Python floor: `>=3.13`, not 3.14
+### Python: default `3.14`, floor `>=3.13`
 
-Every native dep in the closure **except hdbscan** ships cp314 wheels as of
-2026-05-08 (duckdb, numpy, scipy, scikit-learn, pyarrow, pydantic-core, pyyaml,
-numba, llvmlite). `hdbscan 0.8.42` stops at cp313. On 3.14, pip/uv fall back
-to the sdist — Cython + numpy + C toolchain at install time. Unacceptable for
-the `uv tool install claude-sql` end-user path per `CLAUDE.md`.
+**Update 2026-07-20:** `hdbscan 0.8.44` shipped cp314 wheels, so the flip
+below has been executed. `.python-version` and `mise.toml [tools].python`
+now pin `3.14`; `requires-python` stays `>=3.13` so the wheel installs on
+both interpreters. hdbscan floor bumped to `>=0.8.44`; the stale
+`leidenalg` pin was widened to `>=0.11.0,<0.13` (resolves to 0.12.0).
+Full suite (664 tests) green on 3.14.4, including the seed-determinism
+tests. See Consequences below.
 
-Follow-up: flip to 3.14 in a one-line PR once `hdbscan 0.8.43+` publishes
-cp314 wheels (build-pipeline overhaul commits on 2026-05-07 suggest imminent).
+Original rationale (pre-flip): every native dep in the closure **except
+hdbscan** shipped cp314 wheels as of 2026-05-08 (duckdb, numpy, scipy,
+scikit-learn, pyarrow, pydantic-core, pyyaml, numba, llvmlite).
+`hdbscan 0.8.42` stopped at cp313. On 3.14, pip/uv fell back to the sdist
+— Cython + numpy + C toolchain at install time. Unacceptable for the
+`uv tool install claude-sql` end-user path per `CLAUDE.md`. The floor was
+held at `>=3.13` until `hdbscan 0.8.43+` published cp314 wheels.
 
 ### Ruff: 32-family selector superset
 
@@ -122,12 +129,16 @@ fmt/typecheck/test for ~95% speedup on docs-only `mise run check` loops, new
 - **Test-dir blind spot closed.** ty now runs over `tests/`; 17 DuckDB-
   Optional false positives caught at config time and scoped to a tests/**
   override.
-- **Reproducibility.** `[tool.uv]` + `.python-version = 3.13` +
+- **Reproducibility.** `[tool.uv]` + `.python-version = 3.14` +
   `python-preference = only-managed` pins the exact interpreter across
   machines. `uv lock --check` available as a CI gate.
-- **Hdbscan cp314 watch.** When `hdbscan 0.8.43+` ships cp314 wheels, flip
-  `.python-version` / `requires-python` / `mise.toml` → 3.14 in a one-line
-  PR; no other dep is blocking.
+- **Hdbscan cp314 watch — resolved 2026-07-20.** `hdbscan 0.8.44` shipped
+  cp314 wheels, so the flip is done: `.python-version` and
+  `mise.toml [tools].python` → `3.14`, `requires-python` held at `>=3.13`
+  (wheel installs on both), hdbscan floor → `>=0.8.44`, and the stale
+  `leidenalg` pin widened to `>=0.11.0,<0.13` (resolves 0.12.0). The full
+  664-test suite is green on cp314 (Python 3.14.4), seed-determinism tests
+  included; no other dep was blocking.
 
 ## Sources
 

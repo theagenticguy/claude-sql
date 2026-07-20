@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING
 import duckdb
 import pytest
 
-from claude_sql.analytics import friction_worker
-from claude_sql.core.config import Settings
+from claude_sql.application.use_cases import friction as friction_worker
+from claude_sql.infrastructure.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -406,7 +406,7 @@ def test_regex_takes_precedence_over_sql(tmp_path: Path) -> None:
     # Read it back and verify ``source='regex'`` (not 'sql').
     import polars as pl
 
-    from claude_sql.core.parquet_shards import read_all
+    from claude_sql.infrastructure.parquet_cache import read_all
 
     df = read_all(settings.user_friction_parquet_path)
     assert df is not None

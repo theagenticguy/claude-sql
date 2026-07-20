@@ -58,8 +58,9 @@ pre-commit:
         - rebase
       fail_text: "ty typecheck failed — run `mise run typecheck` locally to reproduce."
 
-    # Layered DAG enforcement: core (L0) < {analytics, evals, provenance}
-    # (L1 siblings) < app (L2). Pre-commit catches accidental cross-layer
+    # Hexagonal DAG enforcement: interfaces > application > infrastructure >
+    # domain, plus a forbidden contract fencing the transitional `core` package
+    # out of the driving layers. Pre-commit catches accidental cross-layer
     # imports the moment they're staged. Fast — pure import-graph walk.
     - name: lint-imports
       run: "{uv} lint-imports"

@@ -35,7 +35,7 @@ jobs:
         # exit code.  See .erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md.
         # `-c pyproject.toml` honors the [tool.bandit] section (excludes,
         # principled skips matching ruff's S-ignores).
-        run: bandit -r packages -f sarif -o bandit.sarif --exit-zero -c pyproject.toml
+        run: bandit -r src -f sarif -o bandit.sarif --exit-zero -c pyproject.toml
       - uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:

@@ -1,64 +1,65 @@
 # claude-sql · Module map
 
-The codebase is one package (`claude-sql`) with five layer sub-packages under `src/claude_sql/` (`core`, `analytics`, `evals`, `provenance`, `app`), all declared by the single root `pyproject.toml`. The internal dependency graph is a fan: `core` has no internal dependencies and is imported by every other layer, while `app` depends on all four others and owns the console script (`pyproject.toml:53`). Modules below are ordered by that graph — orchestrator first (`app`), then the foundation (`core`), then the three worker layers (`analytics`, `evals`, `provenance`) that each depend only on `core`. Each layer's 1-LOC `__init__.py` is a namespace marker omitted from bullet lists except where a layer would otherwise have fewer than three files.
+`claude-sql` is one namespace root, `src/claude_sql/`, laid out as a strict hexagon — `interfaces` (drives) > `application` (ports + use-cases) > `infrastructure` (adapters) > `domain` (pure core) — with a single `import-linter` layers contract enforcing that dependency direction. The four layer packages plus the root `composition.py` facade are indexed below in dependency-flow order: the entry point first, the pure core last. Modules with fewer than three shortlisted files (`composition.py`, the root `__init__.py`) are collected under `## Supporting code`.
 
-## app
+## interfaces
 
-The entry-point layer `app`, whose only substantial module is the Cyclopts CLI that wires the `claude-sql` console script to thirteen subcommands and is the single place importing every other layer (`src/claude_sql/app/cli.py:1`). The CLI keeps the fast read-only path (`schema`, `query`, `explain`) cheap by lazy-importing asyncio, subprocess, and worker modules inside the commands that need them (`src/claude_sql/app/cli.py:17`). It classifies DuckDB errors into parse/catalog/runtime and maps them to stable exit codes 64/65/70 with a JSON error payload off-TTY (`src/claude_sql/app/cli.py:11`). The layer depends on `core`, `analytics`, `evals`, and `provenance` (root `pyproject.toml` dependencies block at `pyproject.toml:27`), and its only other module reads the `uv` install receipt so `--version` can report whether the binary on PATH came from a checkout or a git URL (`src/claude_sql/app/install_source.py:1`).
+The `interfaces` layer is the only place the outside world touches — a thin cyclopts CLI that wires the `claude-sql` console script to its 17 subcommands and is the composition root that injects concrete adapters into use-cases (`src/claude_sql/interfaces/cli/app.py:1`). `main` is the script entry (`src/claude_sql/interfaces/cli/app.py:2115`); shared flags (`--format`, `--glob`, `--quiet`) live on a flattened `Common` dataclass, and DuckDB errors classify into parse/catalog/runtime exit codes 64/65/70 (`src/claude_sql/interfaces/cli/app.py:8`). `output.py` renders the `{auto,table,json,ndjson,csv}` formats that make every subcommand agent-legible (`src/claude_sql/interfaces/cli/output.py:1`), and `install_source.py` resolves the version/install banner (`src/claude_sql/interfaces/cli/install_source.py:1`).
 
-- `src/claude_sql/app/cli.py` (3079 LOC)
-- `src/claude_sql/app/install_source.py` (78 LOC)
-- `src/claude_sql/app/__init__.py` (1 LOC)
+- `src/claude_sql/interfaces/cli/app.py` (2121 LOC)
+- `src/claude_sql/interfaces/cli/output.py` (197 LOC)
+- `src/claude_sql/interfaces/cli/install_source.py` (78 LOC)
+- `src/claude_sql/interfaces/cli/__init__.py` (13 LOC)
+- `src/claude_sql/interfaces/__init__.py` (14 LOC)
 
-## core
+## application
 
-The shared foundation `core`, imported by every other layer and depending on no internal layer; its `config` module alone is referenced 15 times across the package (`src/claude_sql/core/config.py:1`). The SQL backbone `sql_views.py` (2182 LOC) wires a DuckDB connection to the on-disk `~/.claude/` JSONL corpus and exposes it as zero-copy views, analytical macros, an HNSW-indexed embeddings table, and parquet-backed views for the v2 analytics outputs (`src/claude_sql/core/sql_views.py:1`). The LLM hub `llm_shared.py` (1341 LOC) owns Bedrock client construction, the retryable `invoke_model` wrapper, the `classify_one` structured-output dispatcher, the per-pipeline cache-stat accumulator, and the four task-framing system prompts — every stage worker imports from here and none import each other (`src/claude_sql/core/llm_shared.py:1`). Supporting modules cover the Pydantic v2 Bedrock-compatible schemas (`src/claude_sql/core/schemas.py:1`), per-session text-window assembly clipped to Sonnet 4.6's context (`src/claude_sql/core/session_text.py:1`), a SQLite-WAL checkpointer that lets re-runs skip unchanged sessions (`src/claude_sql/core/checkpointer.py:1`), the LanceDB embeddings store (`src/claude_sql/core/lance_store.py:1`), and sharded parquet append I/O for the worker caches (`src/claude_sql/core/parquet_shards.py:1`).
+The `application` layer holds the port surface and the use-case orchestrations that compose domain math with injected adapters, depending inward on `domain` but never on `interfaces` (`src/claude_sql/application/use_cases/__init__.py:1`). `ports.py` declares nine `@runtime_checkable` Protocols — `TranscriptReaderPort`, `SessionSearchPort`, `VectorStorePort`, `CheckpointPort`, `RetryQueuePort`, `CachePort`, `ReaderPort`, plus a `Clock` — modeled on the existing concrete call shapes so wrapping each adapter is a lift, not a redesign (`src/claude_sql/application/ports.py:64`). `analyze.py` is the composite `embed → structure → LLM analytics` pipeline lifted verbatim out of the CLI, with `run_analyze` preserving the RFC §9.6 two-axis rebind lifecycle byte-for-byte (`src/claude_sql/application/analyze.py:99`). The four LLM workers (`trajectory`, `friction`, `conflicts`, `classify`) and the six structure/ingest use-cases live under `use_cases/`, and `prompts.py` centralizes their system prompts (`src/claude_sql/application/prompts.py:1`).
 
-- `src/claude_sql/core/sql_views.py` (2182 LOC)
-- `src/claude_sql/core/llm_shared.py` (1341 LOC)
-- `src/claude_sql/core/schemas.py` (597 LOC)
-- `src/claude_sql/core/session_text.py` (387 LOC)
-- `src/claude_sql/core/config.py` (382 LOC)
-- `src/claude_sql/core/checkpointer.py` (378 LOC)
-- `src/claude_sql/core/lance_store.py` (261 LOC)
-- `src/claude_sql/core/parquet_shards.py` (253 LOC)
+- `src/claude_sql/application/use_cases/trajectory.py` (903 LOC)
+- `src/claude_sql/application/prompts.py` (717 LOC)
+- `src/claude_sql/application/use_cases/friction.py` (674 LOC)
+- `src/claude_sql/application/use_cases/conflicts.py` (434 LOC)
+- `src/claude_sql/application/use_cases/community.py` (434 LOC)
+- `src/claude_sql/application/use_cases/embed.py` (394 LOC)
+- `src/claude_sql/application/analyze.py` (318 LOC)
+- `src/claude_sql/application/ports.py` (306 LOC)
 
-## analytics
+## infrastructure
 
-The `analytics` layer holds the per-stage workers that stream sessions to Bedrock and append parquet caches, each importing only from `core` and never from each other (enforced by the import-linter layers contract at `pyproject.toml:264`). Its largest module runs the windowed sentiment-trajectory pipeline, pairing each text turn with its predecessor and batching windows into chunks of <=16 per Sonnet 4.6 request (`src/claude_sql/analytics/trajectory_worker.py:1`). The friction worker classifies short user-role messages into signals such as `status_ping`, `unmet_expectation`, and `correction` (`src/claude_sql/analytics/friction_worker.py:1`), the community worker builds session-centroid mutual-kNN cosine graphs and runs Leiden+CPM partitioning with auto-picked resolution (`src/claude_sql/analytics/community_worker.py:1`), and the embed worker backfills Cohere Embed v4 vectors in batches of up to 96 texts per Bedrock call (`src/claude_sql/analytics/embed_worker.py:1`).
+The `infrastructure` layer holds every concrete adapter — DuckDB, LanceDB, SQLite, Bedrock, parquet — that satisfies an application port (`src/claude_sql/infrastructure/__init__.py:1`). Its center of gravity is `duckdb_views.py`, which registers the zero-copy JSONL readers, 25 SQL views, and 26 analytical macros plus the VSS binding via `register_all` (`src/claude_sql/infrastructure/duckdb_views.py:2285`). `bedrock/client.py` carries the boto3 Converse plumbing, prompt-cache accounting, and tenacity retry policy (`src/claude_sql/infrastructure/bedrock/client.py:1`); `transcript_reader.py` is the importable `TranscriptReaderPort` seam downstream consumers consume (`src/claude_sql/infrastructure/transcript_reader.py:1`); and `settings.py` is the `CLAUDE_SQL_`-prefixed pydantic `BaseSettings`, rehomed here because reading env is I/O (`src/claude_sql/infrastructure/settings.py:152`). The embedding/, llm_analytics/, and sqlite_state/ subpackages carry the pluggable-provider adapters and the checkpoint/retry-queue state store.
 
-- `src/claude_sql/analytics/trajectory_worker.py` (1005 LOC)
-- `src/claude_sql/analytics/friction_worker.py` (741 LOC)
-- `src/claude_sql/analytics/community_worker.py` (667 LOC)
-- `src/claude_sql/analytics/ingest.py` (526 LOC)
-- `src/claude_sql/analytics/embed_worker.py` (507 LOC)
-- `src/claude_sql/analytics/skills_catalog.py` (354 LOC)
-- `src/claude_sql/analytics/conflicts_worker.py` (341 LOC)
-- `src/claude_sql/analytics/classify_worker.py` (254 LOC)
+- `src/claude_sql/infrastructure/duckdb_views.py` (2394 LOC)
+- `src/claude_sql/infrastructure/bedrock/client.py` (601 LOC)
+- `src/claude_sql/infrastructure/transcript_reader.py` (559 LOC)
+- `src/claude_sql/infrastructure/settings.py` (544 LOC)
+- `src/claude_sql/infrastructure/sqlite_state/checkpointer.py` (379 LOC)
+- `src/claude_sql/infrastructure/session_text_loader.py` (366 LOC)
+- `src/claude_sql/infrastructure/duckdb_connection.py` (338 LOC)
+- `src/claude_sql/infrastructure/lance_store.py` (300 LOC)
 
-## evals
+## domain
 
-The `evals` layer implements the cross-provider judge harness and its reliability statistics, depending only on `core` (enforced by the import-linter layers contract at `pyproject.toml:264`). Its judge worker runs a panel of Bedrock models over sessions through the Converse API — the path that works uniformly across Anthropic, Moonshot, DeepSeek, Mistral, Qwen, and other lineages — writing one parquet row per (session, axis, judge) (`src/claude_sql/evals/judge_worker.py:1`). The kappa worker consumes those score parquets and computes Cohen's and Fleiss' kappa with bootstrapped 95% CIs over 1000 resamples (`src/claude_sql/evals/kappa_worker.py:1`). Pre-registration is handled by `freeze.py`, which hashes the full study spec into a deterministic manifest SHA and rebuilds the `Study` on replay (`src/claude_sql/evals/freeze.py:1`), while `blind_handover.py` strips identity markers from a transcript so an external grader cannot use authorship as a cue (`src/claude_sql/evals/blind_handover.py:1`).
+The `domain` layer is the innermost hexagon — pure, dependency-free business types that import nothing heavier than stdlib and pydantic, with no duckdb, polars, lancedb, or boto3 (`src/claude_sql/domain/__init__.py:1`). `models.py` holds the pydantic v2 structured-output classification schemas that are the LLM-analytics contract (`src/claude_sql/domain/models.py:1`); `ports.py` declares the two pluggable-provider Protocols, `EmbeddingProvider` and `LlmAnalyticsProvider` (`src/claude_sql/domain/ports.py:34`); `errors.py` owns the `EXIT_CODES` taxonomy and the terminal `RefusalError` (`src/claude_sql/domain/errors.py:26`); and `transcript.py` renders a session's timeline into byte-stable transcript text for the four LLM pipelines (`src/claude_sql/domain/transcript.py:1`). The `structure/` subpackage is the deliberate exception to the stdlib-only rule: it is I/O-free but lazy-imports numpy/igraph/sklearn/umap/hdbscan for the cluster/community/terms math (`src/claude_sql/domain/structure/__init__.py:1`).
 
-- `src/claude_sql/evals/judge_worker.py` (462 LOC)
-- `src/claude_sql/evals/kappa_worker.py` (257 LOC)
-- `src/claude_sql/evals/judges.py` (239 LOC)
-- `src/claude_sql/evals/ungrounded_worker.py` (190 LOC)
-- `src/claude_sql/evals/freeze.py` (189 LOC)
-- `src/claude_sql/evals/blind_handover.py` (155 LOC)
+- `src/claude_sql/domain/models.py` (398 LOC)
+- `src/claude_sql/domain/transcript.py` (343 LOC)
+- `src/claude_sql/domain/structure/community.py` (326 LOC)
+- `src/claude_sql/domain/dedup.py` (224 LOC)
+- `src/claude_sql/domain/trajectory.py` (209 LOC)
+- `src/claude_sql/domain/errors.py` (149 LOC)
+- `src/claude_sql/domain/friction.py` (119 LOC)
+- `src/claude_sql/domain/ports.py` (114 LOC)
 
-## provenance
+## Supporting code
 
-The `provenance` layer binds merged commits back to the transcripts that produced them and renders PR review sheets, depending only on `core` (enforced by the import-linter layers contract at `pyproject.toml:264`). Its anchor module implements RFC 0001's transcript-to-PR binding through a three-trailer plus JSON git-note convention using pure-stdlib helpers (`src/claude_sql/provenance/binding.py:1`). The review-sheet worker compresses a bound transcript into a ~1K-token digest via Sonnet 4.6 structured output, so a reviewer gets "what was the agent trying to do, and what did it verify" without scrolling the raw JSONL (`src/claude_sql/provenance/review_sheet_worker.py:1`). A separate pure-formatting renderer turns that structured dict into Markdown, kept distinct from the worker so the CLI can choose JSON or Markdown output (`src/claude_sql/provenance/review_sheet_render.py:1`).
-
-- `src/claude_sql/provenance/binding.py` (743 LOC)
-- `src/claude_sql/provenance/review_sheet_worker.py` (465 LOC)
-- `src/claude_sql/provenance/review_sheet_render.py` (167 LOC)
+- `src/claude_sql/composition.py` (185 LOC)
+- `src/claude_sql/__init__.py` (24 LOC)
 
 ## See also
 
-- [claude-sql · Public API](../reference/public-api.md) — 13 shared source files
-- [claude-sql · Contract map](../insights/contract-map.md) — 12 shared source files
-- [claude-sql · Processes](../behavior/processes.md) — 12 shared source files
-- [claude-sql · Tech debt](../insights/tech-debt.md) — 12 shared source files
-- [claude-sql · Business logic](../insights/business-logic.md) — 10 shared source files
+- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 10 shared source citations
+- [claude-sql · Contract map](../insights/contract-map.md) — 8 shared source citations
+- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 6 shared source citations
+- [claude-sql · Public API](../reference/public-api.md) — 6 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 5 shared source citations

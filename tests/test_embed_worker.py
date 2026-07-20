@@ -35,8 +35,7 @@ from botocore.exceptions import (
     SSLError,
 )
 
-from claude_sql.analytics import embed_worker
-from claude_sql.analytics.embed_worker import (
+from claude_sql.application.use_cases.embed import (
     MAX_CHARS_PER_TEXT,
     _build_bedrock_client,
     _invoke_bedrock_sync,
@@ -46,8 +45,9 @@ from claude_sql.analytics.embed_worker import (
     embed_query,
     run_backfill,
 )
-from claude_sql.core import lance_store
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.infrastructure import lance_store
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.embedding import cohere_bedrock
 from conftest import FakeBedrockClient, make_user_msg, write_session_jsonl
 
 
@@ -327,7 +327,7 @@ def test_embed_documents_async_empty_short_circuit(
     def _explode(_settings: Any) -> Any:  # pragma: no cover - failure trap
         raise AssertionError("client should not be built for empty input")
 
-    monkeypatch.setattr(embed_worker, "_build_bedrock_client", _explode)
+    monkeypatch.setattr(cohere_bedrock, "_build_bedrock_client", _explode)
     out = asyncio.run(embed_documents_async([], settings=tmp_settings))
     assert out == []
 
@@ -345,7 +345,7 @@ def test_embed_documents_async_batches_correctly(
         {"embeddings": {"int8": [[5], [6]]}},
     ]
     fake = FakeBedrockClient(payloads)
-    monkeypatch.setattr(embed_worker, "_build_bedrock_client", lambda _s: fake)
+    monkeypatch.setattr(cohere_bedrock, "_build_bedrock_client", lambda _s: fake)
 
     texts = [f"t{i}" for i in range(6)]
     vectors = asyncio.run(embed_documents_async(texts, settings=tmp_settings))
@@ -367,7 +367,7 @@ def test_embed_query_uses_search_query_input_type(
     monkeypatch: pytest.MonkeyPatch, tmp_settings: Any
 ) -> None:
     fake = FakeBedrockClient({"embeddings": {"float": [[0.1, 0.2]]}})
-    monkeypatch.setattr(embed_worker, "_build_bedrock_client", lambda _s: fake)
+    monkeypatch.setattr(cohere_bedrock, "_build_bedrock_client", lambda _s: fake)
 
     out = embed_query("what did I work on", settings=tmp_settings)
     assert out == [pytest.approx(0.1), pytest.approx(0.2)]
@@ -427,7 +427,7 @@ def test_run_backfill_real_run_writes_shards(
     fake_vec = [0] * tmp_settings.output_dimension
     payload = {"embeddings": {"int8": [fake_vec for _ in range(pending)]}}
     fake = FakeBedrockClient(payload)
-    monkeypatch.setattr(embed_worker, "_build_bedrock_client", lambda _s: fake)
+    monkeypatch.setattr(cohere_bedrock, "_build_bedrock_client", lambda _s: fake)
 
     written = asyncio.run(run_backfill(con=views_con, settings=tmp_settings))
     assert written == pending
@@ -457,7 +457,7 @@ def test_run_backfill_no_pending_returns_zero(
     def _explode(_settings: Any) -> Any:  # pragma: no cover - failure trap
         raise AssertionError("Bedrock client must not be built when nothing pends")
 
-    monkeypatch.setattr(embed_worker, "_build_bedrock_client", _explode)
+    monkeypatch.setattr(cohere_bedrock, "_build_bedrock_client", _explode)
     written = asyncio.run(run_backfill(con=views_con, settings=tmp_settings))
     assert written == 0
 

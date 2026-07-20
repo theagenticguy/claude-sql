@@ -1,206 +1,200 @@
 # claude-sql · Processes
 
-`claude-sql` is a single-binary `cyclopts` CLI; it has no HTTP routes, cron jobs, or queue consumers. Every process is initiated by a subcommand registered on the `cyclopts` `App` at `src/claude_sql/app/cli.py:164`, dispatched through the `[project.scripts]` entry point `main()` at `src/claude_sql/app/cli.py:3073`. The eight processes below cover the load-bearing flows (the composite pipeline, the cheap read path, the embedding/search loop, the LLM analytics workers, graph community detection, ingest stamping, and provenance review). Every other subcommand appears under `## Minor flows`.
+`claude-sql` has no HTTP routes, RPC handlers, or scheduled jobs. Every process
+is initiated by a cyclopts CLI subcommand registered on the `app` object in
+`src/claude_sql/interfaces/cli/app.py`; the console-script entry point is
+`main` (`src/claude_sql/interfaces/cli/app.py:2115`), bound to
+`claude_sql.interfaces.cli.app:main`. Command bodies are thin: they configure
+logging, resolve `Settings`, open a DuckDB connection, and delegate to an
+application-layer use case under `src/claude_sql/application/`. The eight
+full-treatment processes below are the load-bearing analytics and read paths;
+the rest are collected under `## Minor flows`.
+
+A shared connection lifecycle underlies most processes — `open_connection_full`
+(`src/claude_sql/infrastructure/duckdb_connection.py:149`) registers raw views,
+derived views, VSS, and analytics via `register_all`
+(`src/claude_sql/infrastructure/duckdb_views.py:2285`); `refresh_analytics_views`
+(`src/claude_sql/infrastructure/duckdb_connection.py:189`) and `rebind_vss`
+(`src/claude_sql/infrastructure/duckdb_connection.py:207`) re-bind parquet- and
+Lance-backed views after a stage writes new data (RFC §9.6).
 
 ## analyze
 
-The composite end-to-end pipeline. Opens one shared DuckDB connection and threads it through every stage, re-binding the VSS view and refreshing analytics views between stages so each stage sees the prior stage's freshly-written parquet/Lance data.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1992` (`analyze` command) → `run_analyze` (`src/claude_sql/application/analyze.py:99`)
 
-Entry point: `src/claude_sql/app/cli.py:2207`
-
-1. Sync the skills catalog (filesystem walk, zero cost) unless `--skip-skills-sync` `src/claude_sql/app/cli.py:2281-2282`.
-2. Open one shared full connection registering all views, macros, and VSS `src/claude_sql/app/cli.py:2299`.
-3. Ingest stamps (tiktoken + blake2b SimHash), then refresh views and resolve canonical UUIDs unless `--skip-ingest` `src/claude_sql/app/cli.py:2306-2315`.
-4. Embed pending messages via Cohere v4, then re-bind VSS and refresh views so later stages see the new vectors unless `--skip-embed` `src/claude_sql/app/cli.py:2318-2335`.
-5. Cluster embeddings (UMAP+HDBSCAN), refresh views, then compute c-TF-IDF terms unless `--skip-cluster` `src/claude_sql/app/cli.py:2338-2354`.
-6. Re-bind VSS and run Leiden+CPM community detection unless `--skip-community` `src/claude_sql/app/cli.py:2362-2370`.
-7. Run the four Sonnet 4.6 workers in sequence — classify, trajectory, conflicts, friction — each followed by a view refresh `src/claude_sql/app/cli.py:2373-2424`.
-8. Close the shared connection in the `finally` block and log completion `src/claude_sql/app/cli.py:2425-2428`.
+1. Apply `--embedding-provider` / `--llm-analytics-provider` overrides to `Settings` before delegating `src/claude_sql/interfaces/cli/app.py:2069`.
+2. Stage 0 — skills catalog sync (filesystem walk, zero-cost) `src/claude_sql/application/analyze.py:169`.
+3. Open one shared DuckDB connection for every catalog-reading stage `src/claude_sql/application/analyze.py:187`.
+4. Stage 1 — ingest stamps, then double-refresh bracketing `resolve_canonicals` so `embed` sees canonical UUIDs `src/claude_sql/application/analyze.py:195`.
+5. Stage 2 — embed backfill, then `rebind_vss("embed")` + `refresh_analytics_views` so downstream stages see the fresh vectors `src/claude_sql/application/analyze.py:207`.
+6. Stage 3 — cluster (UMAP+HDBSCAN), refresh, then terms (c-TF-IDF) `src/claude_sql/application/analyze.py:227`.
+7. Stage 5 — community detection, preceded by the RFC §9.6 `rebind_vss("cluster_terms")` + refresh (the named stale-connection bug site) `src/claude_sql/application/analyze.py:251`.
+8. Stages 6–9 — classify, trajectory, conflicts, friction (each LLM, each `refresh_analytics_views` after), then `con.close()` in `finally` `src/claude_sql/application/analyze.py:262`.
 
 ### Related
-- `src/claude_sql/app/cli.py:378` (`_refresh_analytics_views`)
-- `src/claude_sql/app/cli.py:398` (`_rebind_vss`)
-- `src/claude_sql/app/cli.py:338` (`_open_connection_full`)
-- `src/claude_sql/analytics/skills_catalog.py:296` (`sync`)
-- `src/claude_sql/core/sql_views.py:2078` (`register_all`)
+
+- `src/claude_sql/application/analyze.py:56` (`DuckDbReader` — ReaderPort impl holding the shared connection)
+- `src/claude_sql/infrastructure/duckdb_connection.py:207` (`rebind_vss`)
+- `src/claude_sql/infrastructure/duckdb_connection.py:189` (`refresh_analytics_views`)
+- `src/claude_sql/application/use_cases/embed.py:222` (`run_backfill`)
+- `src/claude_sql/application/use_cases/community.py:228` (`run_communities`)
 
 ## query
 
-The cheapest read path: a single SQL statement against the registered catalog, with a connection chosen by a substring pre-flight so trivial scalar queries skip the ~25s view-registration chain.
+Entry point: `src/claude_sql/interfaces/cli/app.py:540` (`query` command)
 
-Entry point: `src/claude_sql/app/cli.py:727`
-
-1. Configure logging and resolve `Settings` (validating any `--glob`) `src/claude_sql/app/cli.py:786-788`.
-2. Pre-flight the SQL text: route to the full connection only when it references a registered view/macro/VSS token, else to a bare introspect connection `src/claude_sql/app/cli.py:789-793`.
-3. Optionally arm DuckDB JSON profiling before the query runs when `--profile-json` is set `src/claude_sql/app/cli.py:795-797`.
-4. Execute the statement into a Polars DataFrame under `run_or_die`, which classifies DuckDB errors into parse/catalog/runtime exit codes `src/claude_sql/app/cli.py:798`.
-5. Emit the DataFrame in the resolved format (table on TTY, JSON on pipe) `src/claude_sql/app/cli.py:799`.
-6. Close the connection in the `finally` block `src/claude_sql/app/cli.py:802-803`.
+1. Configure logging and resolve `Settings` with `--glob` validation `src/claude_sql/interfaces/cli/app.py:599`.
+2. Route connection: full-catalog if the SQL references a view/macro, else a bare introspection connection, via `sql_uses_catalog` `src/claude_sql/interfaces/cli/app.py:602`.
+3. Optionally set the DuckDB profiling PRAGMAs when `--profile-json` is passed `src/claude_sql/interfaces/cli/app.py:609`.
+4. Execute the SQL through `run_or_die` (classifies DuckDB errors into exit 64/65/70) and materialize a polars frame `src/claude_sql/interfaces/cli/app.py:611`.
+5. Emit the frame in the resolved format (table on TTY, JSON on pipe) `src/claude_sql/interfaces/cli/app.py:612`.
+6. Close the connection in `finally` `src/claude_sql/interfaces/cli/app.py:616`.
 
 ### Related
-- `src/claude_sql/app/cli.py:469` (`_sql_uses_catalog`)
-- `src/claude_sql/app/cli.py:364` (`_open_connection_introspect`)
-- `src/claude_sql/core/output.py` (`run_or_die`, `emit_dataframe`, imported at `cli.py:68-79`)
-- `src/claude_sql/core/sql_views.py:2078` (`register_all`)
+
+- `src/claude_sql/infrastructure/duckdb_connection.py:281` (`sql_uses_catalog`)
+- `src/claude_sql/infrastructure/duckdb_connection.py:149` (`open_connection_full`)
+- `src/claude_sql/infrastructure/duckdb_connection.py:175` (`open_connection_introspect`)
+- `src/claude_sql/interfaces/cli/output.py` (`run_or_die`, `emit_dataframe`, `resolve_format`)
+- `src/claude_sql/infrastructure/duckdb_views.py:2285` (`register_all`)
 
 ## embed
 
-Cohere Embed v4 backfill: discover unembedded messages, embed them in parallel batches, and append the float vectors to the LanceDB HNSW store.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1306` (`embed` command) → `run_backfill` (`src/claude_sql/application/use_cases/embed.py:222`)
 
-Entry point: `src/claude_sql/app/cli.py:1558`
-
-1. Open a bare in-memory DuckDB connection and register the raw transcript scans plus the v1 views (no VSS) `src/claude_sql/app/cli.py:1607-1615`.
-2. Discover `(uuid, text)` pairs absent from the Lance store, dropping near-dup rows when `ingest_stamps` is bound `src/claude_sql/analytics/embed_worker.py:395-400` → `embed_worker.py:100`.
-3. Return a plan dict early under `--dry-run`, otherwise proceed to embed `src/claude_sql/analytics/embed_worker.py:425-437`.
-4. Open or create the Lance table and loop chunk-by-chunk for crash-resilient checkpointing `src/claude_sql/analytics/embed_worker.py:444-447`.
-5. Embed each chunk's texts in parallel `search_document` batches via Bedrock under a semaphore, casting int8 to float `src/claude_sql/analytics/embed_worker.py:457` → `embed_worker.py:264`.
-6. Write each chunk to a fixed-size `FLOAT[]` Array column and add it to the Lance table `src/claude_sql/analytics/embed_worker.py:469-488`.
-7. Compact periodically, then run a final compaction and ensure the HNSW index on the way out `src/claude_sql/analytics/embed_worker.py:491-498`.
-8. Emit the row count (or plan dict) as machine-readable JSON `src/claude_sql/app/cli.py:1626`.
+1. Apply the `--embedding-provider` override and open an in-memory connection with raw + derived views registered `src/claude_sql/interfaces/cli/app.py:1361`.
+2. Discover unembedded `(uuid, text)` pairs by anti-joining the Lance store's embedded UUIDs (and the optional `ingest_stamps` canonical-dedup gate) `src/claude_sql/application/use_cases/embed.py:258`.
+3. Short-circuit to a plan dict when `--dry-run` or nothing is pending `src/claude_sql/application/use_cases/embed.py:264`.
+4. Build the embedding provider once; capture its `model_id` and `dimension` as the vector-space contract `src/claude_sql/application/use_cases/embed.py:304`.
+5. Fail loud if the store's stamped `(model, dim)` differs from the provider's, via `ensure_store_matches` `src/claude_sql/application/use_cases/embed.py:318`.
+6. Embed each chunk, write fixed-size `Array(Float32, dim)` rows to LanceDB, and periodically `store.optimize()` `src/claude_sql/application/use_cases/embed.py:334`.
+7. Final `store.optimize()` + `store.ensure_index(metric=...)` so `search` hits the HNSW index `src/claude_sql/application/use_cases/embed.py:384`.
 
 ### Related
-- `src/claude_sql/analytics/embed_worker.py:365` (`run_backfill`)
-- `src/claude_sql/analytics/embed_worker.py:191` (`_invoke_bedrock_sync`, tenacity-retried)
-- `src/claude_sql/core/lance_store.py` (`connect_db`, `open_or_create_table`, `add_chunk`, `ensure_index`)
-- `src/claude_sql/core/llm_shared.py` (`_build_bedrock_client`)
-- `src/claude_sql/core/sql_views.py:476` (`register_raw`)
+
+- `src/claude_sql/application/use_cases/embed.py:82` (`discover_unembedded`)
+- `src/claude_sql/infrastructure/embedding/__init__.py` (`build_embedder`, `ensure_store_matches`)
+- `src/claude_sql/infrastructure/adapters.py` (`build_vector_store`, `LanceVectorStore`)
+- `src/claude_sql/infrastructure/embedding/cohere_bedrock.py` (`_embed_one_batch`, `_invoke_bedrock_sync`)
+- `src/claude_sql/infrastructure/settings.py` (`expected_embedding_identity`)
 
 ## search
 
-Semantic top-k nearest-neighbor search: embed the query string, run a DuckDB VSS HNSW cosine lookup, and join back to message text for snippets.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1388` (`search` command) → `DuckDbSessionSearch.search` (`src/claude_sql/infrastructure/session_search.py:129`)
 
-Entry point: `src/claude_sql/app/cli.py:1631`
-
-1. Open a full connection (registers VSS / `message_embeddings`) `src/claude_sql/app/cli.py:1690`.
-2. Guard on embedding availability: count rows in `message_embeddings` and exit code 2 when empty `src/claude_sql/app/cli.py:1692-1696`.
-3. Embed the query string with Cohere v4 `search_query` mode, forcing float vectors `src/claude_sql/app/cli.py:1698` → `src/claude_sql/analytics/embed_worker.py:334`.
-4. Run the HNSW lookup: `ORDER BY array_cosine_distance` ASC to trigger the cosine index, joining to `messages_text` for a 200-char snippet `src/claude_sql/app/cli.py:1706-1723`.
-5. Emit the result DataFrame capped at `k` rows `src/claude_sql/app/cli.py:1724`.
-6. Close the connection in the `finally` block `src/claude_sql/app/cli.py:1725-1726`.
+1. Apply the `--embedding-provider` override and subclass the search adapter so the query embedding routes through the `embed_query` use case (monkeypatch seam) `src/claude_sql/interfaces/cli/app.py:1464`.
+2. Open + minimally register the connection (raw + views + VSS only) on first `search` call `src/claude_sql/infrastructure/session_search.py:87`.
+3. Guard on an empty embeddings store — return `[]` rather than run the kNN `src/claude_sql/infrastructure/session_search.py:137`.
+4. Embed the query string to a float vector at the store's native width `src/claude_sql/infrastructure/session_search.py:142`.
+5. Run the inline cosine-kNN SQL: `ORDER BY array_cosine_distance ASC` to trigger the HNSW cosine index, joined back to `messages_text` for a 200-char snippet `src/claude_sql/infrastructure/session_search.py:160`.
+6. Map rows to typed `SearchHit`s; the CLI emits them as a frame and exits code 2 on an empty store `src/claude_sql/interfaces/cli/app.py:1471`.
 
 ### Related
-- `src/claude_sql/analytics/embed_worker.py:334` (`embed_query`)
-- `src/claude_sql/app/cli.py:456` (`_sql_uses_vss`)
-- `src/claude_sql/core/sql_views.py:1668` (`register_vss`)
-- `src/claude_sql/core/output.py` (`run_or_die`, `emit_dataframe`)
+
+- `src/claude_sql/infrastructure/session_search.py:38` (`DuckDbSessionSearch`)
+- `src/claude_sql/application/use_cases/embed.py:199` (`embed_query`)
+- `src/claude_sql/infrastructure/duckdb_views.py:1824` (`register_vss` — fail-loud provider/dim guard)
+- `src/claude_sql/domain/retrieval.py` (`SearchHit`)
 
 ## classify
 
-Representative Sonnet 4.6 structured-output worker (the same pull-once/write-many shape drives `trajectory`, `conflicts`, and `friction`). Classifies whole sessions into autonomy tier, work category, success, and goal.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1491` (`classify` command) → `classify_sessions` (`src/claude_sql/application/use_cases/classify.py:204`)
 
-Entry point: `src/claude_sql/app/cli.py:1729`
-
-1. Resolve the thinking mode and, under `--dry-run`, count pending sessions and return a cost-estimate plan dict `src/claude_sql/analytics/classify_worker.py:211-243`.
-2. Anti-join the existing classifications parquet to find sessions already done `src/claude_sql/analytics/classify_worker.py:54-57`.
-3. Apply the checkpointer skip — drop sessions whose `(last_ts, mtime)` is unchanged since the last run `src/claude_sql/analytics/classify_worker.py:60-67`.
-4. Drain the retry queue and union those session ids back into the keep set `src/claude_sql/analytics/classify_worker.py:69-73`.
-5. Assemble pending `(session_id, text)` pairs from `iter_session_texts` `src/claude_sql/analytics/classify_worker.py:75-81`.
-6. Dispatch parallel `classify_one` Bedrock calls per chunk under an anyio capacity limiter `src/claude_sql/analytics/classify_worker.py:101-119`.
-7. Split successes from exceptions, enqueueing failures for retry, and write OK rows to a fresh parquet shard `src/claude_sql/analytics/classify_worker.py:123-162`.
-8. Mark completed sessions in the checkpointer and clear them from the retry queue `src/claude_sql/analytics/classify_worker.py:167-178`.
+1. Resolve thinking mode and default the parquet `CachePort`; short-circuit to a cost-estimate plan dict on `--dry-run` `src/claude_sql/application/use_cases/classify.py:231`.
+2. Read already-classified session IDs from the cache for the anti-join `src/claude_sql/application/use_cases/classify.py:66`.
+3. Compute session bounds and skip unchanged sessions via the checkpointer `src/claude_sql/application/use_cases/classify.py:75`.
+4. Drain the retry queue and merge failed sessions back into the keep set `src/claude_sql/application/use_cases/classify.py:89`.
+5. Assemble pending session texts via `iter_session_texts` `src/claude_sql/application/use_cases/classify.py:95`.
+6. Dispatch parallel `classify_one` structured-output calls under a `CapacityLimiter`, gathering results per chunk `src/claude_sql/application/use_cases/classify.py:124`.
+7. Write OK rows to a parquet shard, mark sessions completed in the checkpoint, and clear them from the retry queue `src/claude_sql/application/use_cases/classify.py:176`.
 
 ### Related
-- `src/claude_sql/analytics/classify_worker.py:195` (`classify_sessions`)
-- `src/claude_sql/core/llm_shared.py` (`classify_one`, `CLASSIFY_SYSTEM_PROMPT`, `pipeline_cache_stats`)
-- `src/claude_sql/core/checkpointer.py` (`filter_unchanged`, `mark_completed`)
-- `src/claude_sql/core/retry_queue.py` (`drain`, `enqueue`, `mark_done`)
-- `src/claude_sql/core/session_text.py` (`iter_session_texts`, `session_bounds`)
+
+- `src/claude_sql/application/use_cases/classify.py:53` (`_classify_sessions_async`)
+- `src/claude_sql/infrastructure/bedrock/client.py` (`classify_one`, `_build_bedrock_client`, `pipeline_cache_stats`)
+- `src/claude_sql/infrastructure/session_text_loader.py` (`iter_session_texts`, `session_bounds`)
+- `src/claude_sql/infrastructure/sqlite_state/checkpointer.py` (`filter_unchanged`)
+- `src/claude_sql/infrastructure/adapters.py` (`build_cache`, `build_checkpoint`, `build_retry_queue`)
 
 ## community
 
-Session-level Leiden+CPM community detection over a mutual-kNN cosine graph of session centroids, with auto-γ selection from a resolution profile.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1859` (`community` command) → `run_communities` (`src/claude_sql/application/use_cases/community.py:228`)
 
-Entry point: `src/claude_sql/app/cli.py:2069`
-
-1. Reject `--neighbors-of` combined with partition flags, then open a full connection `src/claude_sql/app/cli.py:2132-2145`.
-2. Take the early-return `--neighbors-of` path (top-k cosine neighbors, no Leiden) when requested `src/claude_sql/app/cli.py:2147-2149` → `src/claude_sql/analytics/community_worker.py:421`.
-3. Under `--dry-run`, count candidate sessions through the `message_embeddings` view and emit a plan `src/claude_sql/app/cli.py:2152-2180`.
-4. Load and L2-normalize per-session centroids by averaging message embeddings grouped by session `src/claude_sql/analytics/community_worker.py:527` → `community_worker.py:82`.
-5. Build the symmetric mutual-kNN graph: cosine matrix, top-k mask, edge floor, then an igraph `src/claude_sql/analytics/community_worker.py:531-546`.
-6. Pick γ — explicit value, configured resolution, or the longest-plateau midpoint of `Optimiser.resolution_profile` `src/claude_sql/analytics/community_worker.py:548-576`.
-7. Run `leidenalg.find_partition` with `CPMVertexPartition`, warn on disconnected communities, and compute medoid + coherence `src/claude_sql/analytics/community_worker.py:578-602`.
-8. Stable-relabel by descending size (collapsing sub-min-size communities to noise) and write the primary parquet plus optional resolution-profile sidecar `src/claude_sql/analytics/community_worker.py:604-649`.
+1. Reject `--neighbors-of` combined with partition flags (exit 64); route the early-return neighbors path when requested `src/claude_sql/interfaces/cli/app.py:1928`.
+2. On `--dry-run`, count candidate sessions with embeddings via pure SQL and emit a plan `src/claude_sql/interfaces/cli/app.py:1948`.
+3. Return cached stats if `session_communities.parquet` exists and `--force` is off `src/claude_sql/application/use_cases/community.py:265`.
+4. Load per-session centroids: join `message_embeddings` to `messages`, mean-reduce with `np.add.reduceat`, L2-normalize `src/claude_sql/application/use_cases/community.py:290`.
+5. Build the mutual-kNN cosine graph and the igraph object `src/claude_sql/application/use_cases/community.py:297`.
+6. Auto-pick CPM γ from the resolution profile (unless `--gamma` given), then run `_run_leiden_cpm` `src/claude_sql/application/use_cases/community.py:310`.
+7. Compute medoid + coherence, relabel by descending size and collapse sub-min-size to noise `src/claude_sql/application/use_cases/community.py:361`.
+8. Write `session_communities.parquet` and, when auto-γ ran, the `community_profile.parquet` sidecar `src/claude_sql/application/use_cases/community.py:384`.
 
 ### Related
-- `src/claude_sql/analytics/community_worker.py:472` (`run_communities`)
-- `src/claude_sql/analytics/community_worker.py:421` (`neighbors_of`)
-- `src/claude_sql/analytics/community_worker.py:147` (`_build_mutual_knn`)
-- `src/claude_sql/analytics/community_worker.py:202` (`_compute_resolution_profile`)
-- `src/claude_sql/analytics/community_worker.py:367` (`_relabel_and_collapse`)
+
+- `src/claude_sql/application/use_cases/community.py:73` (`_load_session_centroids`)
+- `src/claude_sql/application/use_cases/community.py:177` (`neighbors_of`)
+- `src/claude_sql/domain/structure/community.py` (`_build_mutual_knn`, `_run_leiden_cpm`, `_compute_resolution_profile`, `_relabel_and_collapse`)
+- `src/claude_sql/infrastructure/settings.py` (`community_config`)
+
+## friction
+
+Entry point: `src/claude_sql/interfaces/cli/app.py:1666` (`friction` command) → `detect_user_friction` (`src/claude_sql/application/use_cases/friction.py:572`)
+
+1. On `--dry-run`, count short user-message candidates and emit a cost-estimate plan `src/claude_sql/application/use_cases/friction.py:616`.
+2. Read already-classified UUIDs, filter unchanged sessions via the checkpointer, and drain retries `src/claude_sql/application/use_cases/friction.py:354`.
+3. Pull user-role messages under `friction_max_chars`, excluding Claude Code system markers `src/claude_sql/application/use_cases/friction.py:378`.
+4. Regex fast-path: stamp unambiguous `status_ping` / `interruption` / `correction` at 0.9 confidence `src/claude_sql/application/use_cases/friction.py:404`.
+5. SQL stamp layer: three deterministic DuckDB rules (repeated body, imperative revert, trailing-`?` after an error) tag remaining rows without Bedrock `src/claude_sql/application/use_cases/friction.py:425`.
+6. Write the fast-path rows to a parquet shard; return early if nothing needs the LLM `src/claude_sql/application/use_cases/friction.py:454`.
+7. LLM path: parallel `classify_one` calls with `USER_FRICTION_SCHEMA`; refusals become neutral `none` rows, failures enqueue for retry `src/claude_sql/application/use_cases/friction.py:474`.
+8. Write OK rows, mark done in the retry queue, and checkpoint processed sessions `src/claude_sql/application/use_cases/friction.py:539`.
+
+### Related
+
+- `src/claude_sql/application/use_cases/friction.py:341` (`_classify_async`)
+- `src/claude_sql/application/use_cases/friction.py:192` (`sql_stamp`)
+- `src/claude_sql/domain/friction.py` (`regex_fast_path`, `_REGEX_BANK`)
+- `src/claude_sql/infrastructure/bedrock/structured_output.py` (`USER_FRICTION_SCHEMA`)
+- `src/claude_sql/infrastructure/bedrock/client.py` (`classify_one`, `pipeline_cache_stats`)
 
 ## ingest
 
-Zero-cost per-message stamping: `approx_tokens` (cl100k × 0.78), `simhash64`, `token_budget_bucket`, then a DuckDB self-join that resolves near-duplicate messages to a canonical UUID.
+Entry point: `src/claude_sql/interfaces/cli/app.py:1718` (`ingest` command)
 
-Entry point: `src/claude_sql/app/cli.py:1938`
-
-1. Open a full connection `src/claude_sql/app/cli.py:1978`.
-2. Under `--dry-run`, count pending rows via pure SQL and emit a plan dict `src/claude_sql/app/cli.py:1980-1994` → `src/claude_sql/analytics/ingest.py:274`.
-3. Pull `messages_text` rows absent from the existing `ingest_stamps` shards via an anti-join `src/claude_sql/analytics/ingest.py:331-333` → `ingest.py:226`.
-4. Compute `approx_tokens`, `simhash64`, and `token_budget_bucket` per chunk and write each chunk to a fresh part-file shard `src/claude_sql/analytics/ingest.py:342-369`.
-5. Re-bind the analytics views so the resolve pass sees the newly-written shards `src/claude_sql/app/cli.py:1998`.
-6. Resolve canonical UUIDs via a top-16-bit-bucketed `bit_count(xor) <= 3` self-join, writing the earliest-seen near-dup as canonical `src/claude_sql/app/cli.py:1999` → `src/claude_sql/analytics/ingest.py:410`.
-7. Truncate the cache and rewrite one consolidated shard with the resolved `canonical_uuid` column `src/claude_sql/analytics/ingest.py:500-504`.
-8. Emit the stamped row count as JSON `src/claude_sql/app/cli.py:2001`.
+1. On `--dry-run`, count pending rows via pure SQL and emit a plan `src/claude_sql/interfaces/cli/app.py:1766`.
+2. Stamp messages: pull `messages_text` rows not yet in `ingest_stamps`, compute `approx_tokens` + `simhash64` + `token_budget_bucket`, write shards `src/claude_sql/application/use_cases/ingest.py:142`.
+3. Re-bind the analytics views so the freshly written stamp shards are visible `src/claude_sql/interfaces/cli/app.py:1784`.
+4. Resolve canonical UUIDs: DuckDB SimHash self-join gated on the top-16-bit bucket, `bit_count(xor(...)) <= 3` `src/claude_sql/application/use_cases/ingest.py:252`.
+5. Truncate the cache and rewrite one consolidated shard with `canonical_uuid` populated `src/claude_sql/application/use_cases/ingest.py:344`.
+6. Emit the stamped-row count as the worker result `src/claude_sql/interfaces/cli/app.py:1787`.
 
 ### Related
-- `src/claude_sql/analytics/ingest.py:295` (`stamp_messages`)
-- `src/claude_sql/analytics/ingest.py:410` (`resolve_canonicals`)
-- `src/claude_sql/analytics/ingest.py:115` (`simhash64`)
-- `src/claude_sql/analytics/ingest.py:85` (`approx_tokens_batch`)
-- `src/claude_sql/core/parquet_shards.py` (`write_part`, `iter_part_files`)
 
-## review-sheet
-
-Provenance flow: resolve a merged commit's bound transcript, flatten it to review text, and ask Sonnet 4.6 to compress it into a structured PR review sheet.
-
-Entry point: `src/claude_sql/app/cli.py:2938`
-
-1. Pick the review render format (markdown on TTY, JSON off-TTY) and resolve `Settings` `src/claude_sql/app/cli.py:2980-2985`.
-2. Resolve the commit's bound transcript via RFC 0001 precedence (trailer first, note fallback), mapping `LookupError` / mismatch / git failures to canonical exit codes `src/claude_sql/app/cli.py:2992-3019` → `src/claude_sql/provenance/binding.py:674`.
-3. Translate the resolved `file://` URI to a path and flatten the JSONL into one-event-per-line review text `src/claude_sql/provenance/review_sheet_worker.py:387-396`.
-4. Under `--dry-run`, emit a plan dict (commit, URI, transcript digest, model id, prompt size) and stop `src/claude_sql/app/cli.py:3032-3038` → `src/claude_sql/provenance/review_sheet_worker.py:399-409`.
-5. Build the user prompt and call the structured-output classifier against `PR_REVIEW_SHEET_SCHEMA` with the XML-tagged system prompt `src/claude_sql/provenance/review_sheet_worker.py:412-435`.
-6. Return `{"refused": True, ...}` on a Bedrock refusal, else `{"sheet": ..., "metadata": ...}` `src/claude_sql/provenance/review_sheet_worker.py:436-459`.
-7. Render the refusal or the sheet as markdown or JSON per the resolved format `src/claude_sql/app/cli.py:3040-3053`.
-
-### Related
-- `src/claude_sql/provenance/review_sheet_worker.py:342` (`generate_review_sheet`)
-- `src/claude_sql/provenance/binding.py:674` (`resolve_commit_to_transcript`)
-- `src/claude_sql/provenance/review_sheet_render.py` (`render_markdown`, `render_refusal_markdown`)
-- `src/claude_sql/core/schemas.py` (`PR_REVIEW_SHEET_SCHEMA`)
-- `src/claude_sql/core/llm_shared.py` (`_invoke_classifier_sync`, `BedrockRefusalError`)
+- `src/claude_sql/application/use_cases/ingest.py:121` (`count_pending`)
+- `src/claude_sql/application/use_cases/ingest.py:73` (`_pending_stamp_sql`)
+- `src/claude_sql/domain/dedup.py` (`simhash64`, `approx_tokens_batch`, `token_budget_bucket`, `NEAR_DUP_HAMMING_THRESHOLD`)
+- `src/claude_sql/infrastructure/duckdb_connection.py:189` (`refresh_analytics_views`)
 
 ## Minor flows
 
-- shell — entry at `src/claude_sql/app/cli.py:639`. Materializes a temp on-disk DuckDB with all views/macros/HNSW registered, then execs the system `duckdb` REPL against it (exit 127 if the binary is missing).
-- explain — entry at `src/claude_sql/app/cli.py:806`. Runs `EXPLAIN` / `EXPLAIN ANALYZE` and highlights pushdown / HNSW / hash operators in the plan text.
-- schema — entry at `src/claude_sql/app/cli.py:916`. Emits the static `VIEW_SCHEMA` + `MACRO_SIGNATURES` plus a parquet-existence `cached` map; no DuckDB connection.
-- list-cache — entry at `src/claude_sql/app/cli.py:979`. Reports presence/bytes/mtime/rows for every parquet cache, the Lance store, and the SQLite checkpoint.
-- peek — entry at `src/claude_sql/app/cli.py:1070`. One-shot session summary: line count, role mix, top tools, and first/last message samples.
-- cluster — entry at `src/claude_sql/app/cli.py:2006`. UMAP (8D) + HDBSCAN over embeddings → `clusters.parquet` (`run_clustering` at `src/claude_sql/analytics/cluster_worker.py:50`).
-- terms — entry at `src/claude_sql/app/cli.py:2037`. c-TF-IDF per-cluster term labels → `cluster_terms.parquet` (`run_terms` at `src/claude_sql/analytics/terms_worker.py:29`).
-- trajectory — entry at `src/claude_sql/app/cli.py:1796`. Regex prefilter then Sonnet 4.6 per-message sentiment + topic-transition (`trajectory_messages` at `src/claude_sql/analytics/trajectory_worker.py:933`).
-- conflicts — entry at `src/claude_sql/app/cli.py:1844`. Sonnet 4.6 per-session stance-conflict detection (`detect_conflicts` at `src/claude_sql/analytics/conflicts_worker.py:286`).
-- friction — entry at `src/claude_sql/app/cli.py:1888`. Regex fast-path then Sonnet 4.6 friction labels for short user messages (`detect_user_friction` at `src/claude_sql/analytics/friction_worker.py:655`).
-- skills sync — entry at `src/claude_sql/app/cli.py:1470`. Filesystem walk of `~/.claude/skills` + plugins cache → `skills_catalog.parquet` (`sync` at `src/claude_sql/analytics/skills_catalog.py:296`).
-- skills ls — entry at `src/claude_sql/app/cli.py:1510`. Lists the skills catalog parquet, filterable by `--kind` / `--plugin`.
-- cache compact — entry at `src/claude_sql/app/cli.py:1269`. Consolidates many `part-*.parquet` shards into one compacted part (defaults to `--dry-run`).
-- cache migrate — entry at `src/claude_sql/app/cli.py:1367`. Moves legacy single-file caches into the sharded directory layout, preserving mtime.
-- judges — entry at `src/claude_sql/app/cli.py:2431`. Lists the cross-provider Bedrock judge catalog (`catalog` at `src/claude_sql/evals/judges.py:237`).
-- freeze — entry at `src/claude_sql/app/cli.py:2451`. Pre-registers an eval study, writing an immutable manifest under `~/.claude/studies/<sha>/` (`freeze` at `src/claude_sql/evals/freeze.py:115`).
-- replay — entry at `src/claude_sql/app/cli.py:2493`. Loads and echoes a frozen study manifest by SHA (`replay` at `src/claude_sql/evals/freeze.py:151`).
-- judge — entry at `src/claude_sql/app/cli.py:2533`. Dispatches a frozen study's judge panel over a sessions parquet (`run` at `src/claude_sql/evals/judge_worker.py:430`); defaults to `--dry-run`.
-- ungrounded-claim — entry at `src/claude_sql/app/cli.py:2587`. Runs the ungrounded-claim detector over a turns parquet (`detect` at `src/claude_sql/evals/ungrounded_worker.py:133`).
-- kappa — entry at `src/claude_sql/app/cli.py:2624`. Computes Cohen's + Fleiss' kappa with bootstrapped CI; exits 66 when an axis is below floor or the delta gate trips (`compute_fleiss` at `src/claude_sql/evals/kappa_worker.py:186`).
-- blind-handover — entry at `src/claude_sql/app/cli.py:2502`. Strips identity markers from a sessions parquet and adds an `original_hash` column (`strip_text` at `src/claude_sql/evals/blind_handover.py:81`).
-- bind — entry at `src/claude_sql/app/cli.py:2699`. Pre-commit-hook flow attaching transcript-PR trailers + a git-notes JSON to a commit (`find_active_transcript` at `src/claude_sql/provenance/binding.py:265`, `build_binding` at `binding.py:320`).
-- resolve — entry at `src/claude_sql/app/cli.py:2832`. Resolves a commit's bound transcript per RFC 0001 precedence, raising loudly on trailer/note digest disagreement (`resolve_commit_to_transcript` at `src/claude_sql/provenance/binding.py:674`).
+- trajectory — entry at `src/claude_sql/interfaces/cli/app.py:1560` → `trajectory_messages` (`src/claude_sql/application/use_cases/trajectory.py:808`). Per-session windowed sentiment + transition classification; purges stale shards, checkpoints, loads windows, batches ≤16 windows per structured-output call via `build_llm_analytics_provider`, echoes uuid-pairs to verify completeness.
+- conflicts — entry at `src/claude_sql/interfaces/cli/app.py:1620` → `detect_conflicts` (`src/claude_sql/application/use_cases/conflicts.py:366`). Pair-keyed stance-conflict detection over sessions; same checkpoint/retry/`classify_one` shape as `classify`, validating turn UUIDs via `_valid_turn_uuids` before writing shards.
+- cluster — entry at `src/claude_sql/interfaces/cli/app.py:1792` → `run_clustering` (`src/claude_sql/application/use_cases/cluster.py:63`). UMAP+HDBSCAN over the Lance embeddings; mtime-sidecar fast path skips the refit, writes `clusters.parquet`.
+- terms — entry at `src/claude_sql/interfaces/cli/app.py:1825` → `run_terms` (`src/claude_sql/application/use_cases/terms.py:31`). c-TF-IDF per-cluster term labels via `compute_ctfidf`; writes `cluster_terms.parquet`.
+- skills sync — entry at `src/claude_sql/interfaces/cli/app.py:1216` → `sync` (`src/claude_sql/application/use_cases/skills.py:72`). Filesystem walk of user skills + plugin cache + builtins via `_collect_rows`; atomic tmp-then-replace write of `skills_catalog.parquet`.
+- skills ls — entry at `src/claude_sql/interfaces/cli/app.py:1258`. Reads and filters `skills_catalog.parquet` by `--kind` / `--plugin`; exits code 2 if the catalog is missing.
+- schema — entry at `src/claude_sql/interfaces/cli/app.py:729`. Emits the static `VIEW_SCHEMA` + `MACRO_SIGNATURES` plus a parquet-existence `cached` map; no DuckDB connection.
+- list-cache — entry at `src/claude_sql/interfaces/cli/app.py:792`. Reports `{name, path, exists, bytes, mtime, rows}` for every parquet cache, the Lance store, and the checkpoint DB.
+- peek — entry at `src/claude_sql/interfaces/cli/app.py:877` → `peek_session` (`src/claude_sql/application/use_cases/peek.py:31`). One-shot per-session summary (roles, top tools, samples); maps unknown session to exit 65.
+- explain — entry at `src/claude_sql/interfaces/cli/app.py:619`. Prints the DuckDB plan (`EXPLAIN`, or `EXPLAIN ANALYZE` under `--analyze`) with pushdown operators highlighted.
+- shell — entry at `src/claude_sql/interfaces/cli/app.py:451`. Creates a temp on-disk DuckDB, runs `register_all`, and execs the system `duckdb` binary (exit 127 if absent).
+- cache compact — entry at `src/claude_sql/interfaces/cli/app.py:1015`. Consolidates `part-*.parquet` shards of the five worker-append caches into one compacted file; defaults to `--dry-run`.
+- cache migrate — entry at `src/claude_sql/interfaces/cli/app.py:1113`. Moves legacy single-file caches into the sharded directory layout, preserving mtime; defaults to `--dry-run`.
 
 ## See also
 
-- [claude-sql · Contract map](../insights/contract-map.md) — 13 shared source files
-- [claude-sql · Public API](../reference/public-api.md) — 13 shared source files
-- [claude-sql · Module map](../architecture/module-map.md) — 12 shared source files
-- [claude-sql · Tech debt](../insights/tech-debt.md) — 10 shared source files
-- [claude-sql · Business logic](../insights/business-logic.md) — 7 shared source files
+- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 10 shared source citations
+- [claude-sql · Tech debt](../insights/tech-debt.md) — 10 shared source citations
+- [claude-sql · Data flow](../architecture/data-flow.md) — 5 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 5 shared source citations
+- [claude-sql · Contract map](../insights/contract-map.md) — 5 shared source citations

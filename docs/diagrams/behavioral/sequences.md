@@ -3,99 +3,115 @@
 Diagram-only companion to [`behavior/processes.md`](../../behavior/processes.md)
 and [`architecture/data-flow.md`](../../architecture/data-flow.md). One
 `sequenceDiagram` per top process, showing the outbound call order across
-participants. Every participant maps to a real module in the current
-`src/claude_sql/` layout.
+participants. Every participant maps to a real module in the POST-reshape
+hexagonal tree (`interfaces / application / infrastructure / domain`).
 
 ## query
 
-Read-only SQL over the DuckDB catalog — no Bedrock, no cost. Entry at
-`src/claude_sql/app/cli.py:728`; body at `cli.py:786-803`.
+Cheapest read path — one SQL statement against the DuckDB catalog, no Bedrock,
+no cost. Entry at `src/claude_sql/interfaces/cli/app.py:541`; body at
+`app.py:599-616`. The connection is gated by `_sql_uses_catalog`
+(`app.py:604`), which routes to `open_connection_full`
+(`src/claude_sql/infrastructure/duckdb_connection.py:149`) →
+`register_all`/`register_vss`
+(`src/claude_sql/infrastructure/duckdb_views.py:1824`). Results flow through
+`run_or_die` + `emit_dataframe` (`src/claude_sql/interfaces/cli/output.py:160,61`).
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant CLI as cli.query
-    participant DuckDB as DuckDB+views
-    participant Out as output
+    participant CLI as cli.app query
+    participant Conn as duckdb_connection
+    participant Views as duckdb_views
+    participant DuckDB as DuckDB
+    participant Out as cli.output
 
-    User->>CLI: query cmd
-    CLI->>CLI: resolve cfg
-    CLI->>DuckDB: open+register
-    DuckDB-->>CLI: connection
-    CLI->>DuckDB: execute sql
-    DuckDB-->>CLI: DataFrame
+    CLI->>Conn: open_full sql
+    Conn->>Views: register_all
+    Views->>DuckDB: bind views
+    Views->>DuckDB: register_vss
+    DuckDB-->>Conn: connection
+    Conn-->>CLI: con
+    CLI->>Out: run_or_die
+    Out->>DuckDB: execute sql
+    DuckDB-->>Out: DataFrame
+    Out-->>CLI: df
     CLI->>Out: emit_dataframe
-    Out-->>User: table or JSON
-    CLI->>DuckDB: close
 ```
 
 ## embed
 
-Embeds unembedded messages via Cohere Embed v4 on Bedrock and appends
-FLOAT[1024] vectors to LanceDB. Entry at `cli.py:1559`; body at
-`cli.py:1603-1628`; worker `run_backfill` at
-`src/claude_sql/analytics/embed_worker.py:365`;
-`discover_unembedded` at `embed_worker.py:100`.
+Embeds unembedded messages through the active `EmbeddingProvider` port and
+appends fixed-size FLOAT vectors to LanceDB, guarded by the fail-loud dimension
+contract. Entry at `src/claude_sql/interfaces/cli/app.py:1307`; body at
+`app.py:1356-1385`. `run_backfill`
+(`src/claude_sql/application/use_cases/embed.py:222`) builds the provider once —
+its `model_id`/`dimension` (`src/claude_sql/domain/ports.py:34`) are the single
+dimension contract (`embed.py:304-306`) — then `ensure_store_matches`
+(`src/claude_sql/domain/embedding_guard.py`) refuses a cross-provider append
+before the chunk loop writes to the `VectorStorePort`
+(`src/claude_sql/application/ports.py:132`, Lance impl
+`src/claude_sql/infrastructure/lance_store.py:107`).
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant CLI as cli.embed
-    participant Worker as embed_worker
-    participant DuckDB as DuckDB+views
-    participant Bedrock as Bedrock Cohere
-    participant Lance as lance_store
+    participant CLI as cli.app embed
+    participant BF as use_cases.embed
+    participant Prov as EmbeddingProvider
+    participant Guard as embedding_guard
+    participant Store as VectorStorePort
 
-    User->>CLI: embed cmd
-    CLI->>DuckDB: register views
-    CLI->>Worker: run_backfill
-    Worker->>Lance: get_uuids
-    Lance-->>Worker: embedded set
-    Worker->>DuckDB: scan pending
-    DuckDB-->>Worker: uuid text
-    Worker->>Bedrock: invoke_model
-    Bedrock-->>Worker: vectors
-    Worker->>Lance: add_chunk
-    Worker-->>CLI: rows written
-    CLI-->>User: result JSON
+    CLI->>BF: run_backfill
+    BF->>Store: discover uuids
+    Store-->>BF: embedded set
+    BF->>Prov: model_id dim
+    Prov-->>BF: identity
+    BF->>Store: table_identity
+    Store-->>BF: stored id
+    BF->>Guard: ensure_matches
+    Guard-->>BF: ok or raise
+    BF->>Prov: embed_documents
+    Prov-->>BF: vectors
+    BF->>Store: add_chunk
+    BF->>Store: ensure_index
 ```
 
-## classify
+## library path (ClaudeSql facade)
 
-Classifies sessions with Sonnet 4.6 structured output and writes parquet
-shards with session-level checkpointing. Entry at `cli.py:1730`; body at
-`cli.py:1778-1793`; worker `_classify_sessions_async` at
-`src/claude_sql/analytics/classify_worker.py:45`;
-`classify_one` at `src/claude_sql/core/llm_shared.py:563`.
+The importable surface for downstream callers. The
+`ClaudeSql` facade (`src/claude_sql/composition.py:36`) lazily builds and caches
+the ports; `search()` (`composition.py:90`) hands back a `DuckDbSessionSearch`
+(`src/claude_sql/infrastructure/session_search.py:38`). Its `search`
+(`session_search.py:129`) opens + registers a connection, counts
+`message_embeddings`, embeds the query via the `EmbeddingProvider` port
+(`embed_query`, `session_search.py:125`), then runs the cosine-kNN join ordered
+by `array_cosine_distance ASC` (`session_search.py:160-174`) to return typed
+`SearchHit` rows.
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant CLI as cli.classify
-    participant Worker as classify_worker
-    participant Ckpt as checkpointer
-    participant LLM as llm_shared
-    participant Bedrock as Bedrock Sonnet
-    participant Shards as parquet_shards
+    participant App as caller
+    participant Facade as ClaudeSql
+    participant Search as DuckDbSessionSearch
+    participant Prov as EmbeddingProvider
+    participant DuckDB as DuckDB
 
-    User->>CLI: classify cmd
-    CLI->>Worker: classify_run
-    Worker->>Ckpt: filter
-    Ckpt-->>Worker: pending sids
-    Worker->>LLM: classify_one
-    LLM->>Bedrock: invoke_model
-    Bedrock-->>LLM: json output
-    LLM-->>Worker: parsed dict
-    Worker->>Shards: write_part
-    Worker->>Ckpt: mark_completed
-    Worker-->>CLI: rows written
-    CLI-->>User: result JSON
+    App->>Facade: search()
+    Facade-->>App: search port
+    App->>Search: search q k
+    Search->>DuckDB: open+register
+    Search->>DuckDB: count embeds
+    DuckDB-->>Search: n rows
+    Search->>Prov: embed_query
+    Prov-->>Search: query vector
+    Search->>DuckDB: cosine kNN
+    DuckDB-->>Search: ranked rows
+    Search-->>App: SearchHit list
 ```
 
 ## See also
 
-- [claude-sql · Contract map](../../insights/contract-map.md) — 5 shared source files
-- [claude-sql · Processes](../../behavior/processes.md) — 5 shared source files
-- [claude-sql · Data flow](../../architecture/data-flow.md) — 4 shared source files
-- [claude-sql · Debugging guide](../../insights/debugging-guide.md) — 3 shared source files
-- [claude-sql · Module map](../../architecture/module-map.md) — 3 shared source files
+- [claude-sql · Contract map](../../insights/contract-map.md) — 9 shared source citations
+- [claude-sql · Impact analysis](../../insights/impact-analysis.md) — 9 shared source citations
+- [claude-sql · Module map](../../architecture/module-map.md) — 5 shared source citations
+- [claude-sql · Processes](../../behavior/processes.md) — 5 shared source citations
+- [claude-sql · Tech debt](../../insights/tech-debt.md) — 5 shared source citations

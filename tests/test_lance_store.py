@@ -28,8 +28,8 @@ from typing import Any
 import duckdb
 import polars as pl
 
-from claude_sql.core import lance_store
-from claude_sql.core.sql_views import register_vss
+from claude_sql.infrastructure import lance_store
+from claude_sql.infrastructure.duckdb_views import register_vss
 
 
 def _seed_one_row(lance_uri: Path, uuid: str, *, dim: int = 4) -> None:

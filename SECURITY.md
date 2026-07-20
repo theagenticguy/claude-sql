@@ -1,21 +1,33 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+claude-sql ships from a single `main` line. Security fixes land on the latest
+released minor and are published to PyPI. Older releases receive no backports;
+upgrade to the latest version.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+| Version | Supported |
+| ------- | --------- |
+| latest `1.x` | yes |
+| < latest `1.x` | no: upgrade |
 
-## Reporting a Vulnerability
+## What claude-sql touches
 
-Use this section to tell people how to report a vulnerability.
+claude-sql reads your local Claude Code transcripts under `~/.claude/projects/`
+(or an S3 corpus you point it at) into an in-memory DuckDB connection. It writes
+derived artifacts (parquet shards, a LanceDB vector store, a SQLite checkpoint)
+under `~/.claude-sql/`. It calls Amazon Bedrock for embeddings and LLM
+analytics, authenticating through the standard AWS credential chain. It never
+transmits transcript content anywhere except the Bedrock endpoints you
+configure, and it holds no long-lived secrets of its own.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+## Reporting a vulnerability
+
+Report suspected vulnerabilities privately through GitHub Security Advisories on
+the repository (`Security` tab → `Report a vulnerability`), or to the maintainer
+listed in `pyproject.toml`. Please do not open a public issue for a security
+report.
+
+Include the version, a description, and a reproduction if you have one. Expect
+an acknowledgement within a few business days. Accepted reports are fixed on
+`main` and released promptly; declined reports get a written rationale.

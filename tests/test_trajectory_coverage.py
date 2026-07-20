@@ -5,14 +5,15 @@ branches that the semantically-organized ``test_trajectory_windowed.py``
 suite doesn't exercise — corrupt-parquet probe, unlinkable shard,
 ``_load_windows`` / ``_chunk_windows`` / ``_format_chunk_xml`` edge
 cases, ``_delta_value`` / ``_build_row`` fallbacks, ``_classify_chunk``
-happy/refusal/exception/non-list paths, retry-queue drain logging,
+happy/refusal/exception/provider-unavailable paths, retry-queue drain logging,
 0-window short-circuit, refusal + non-Bedrock exception branches in
 ``_process_session``, the outer ``except Exception`` that swallows
 mid-loop failures, and the ``--dry-run`` ``since_days`` + ``limit`` cap.
 
-Bedrock plumbing is fully mocked. ``_build_bedrock_client`` always
-returns a sentinel and ``_classify_chunk`` (or its dependency
-``classify_one``) is monkeypatched per test.
+The LLM path is fully mocked. ``_classify_chunk`` is monkeypatched per
+test, or its ``LlmAnalyticsProvider`` seam is driven with a fake provider
+(``_FakeProvider``) that returns a canned ``TrajectoryArrayResult`` or
+raises a canned terminal error: no Bedrock / Strands / Luna call ever runs.
 """
 
 from __future__ import annotations
@@ -28,12 +29,13 @@ import polars as pl
 import pytest
 from loguru import logger
 
-from claude_sql.analytics import trajectory_worker
-from claude_sql.core import llm_shared, retry_queue
-from claude_sql.core.config import Settings
-from claude_sql.core.llm_shared import BedrockRefusalError
-from claude_sql.core.parquet_shards import read_all
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.application.use_cases import trajectory as trajectory_worker
+from claude_sql.domain.errors import BedrockRefusalError
+from claude_sql.infrastructure.bedrock import client as llm_shared
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.parquet_cache import read_all
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.infrastructure.sqlite_state import retry_queue
 from conftest import _seed_subagent_stub, make_user_msg, write_session_jsonl
 
 # ---------------------------------------------------------------------------
@@ -426,42 +428,46 @@ def test_build_row_uncoercible_delta_recomputes_from_labels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _classify_chunk via classify_one monkeypatch (624-660)
+# _classify_chunk via the LlmAnalyticsProvider seam (Wave D)
 # ---------------------------------------------------------------------------
 
 
-def _drive_classify_chunk(
-    classify_one_impl: Any, chunk: list[tuple[Any, ...]], settings: Settings
-) -> Any:
-    """Run ``_classify_chunk`` against the supplied ``classify_one`` fake and return its result."""
+class _FakeProvider:
+    """Minimal ``LlmAnalyticsProvider`` whose ``classify_structured`` returns a
+    canned :class:`TrajectoryArrayResult` or raises a canned exception."""
+
+    provider = "fake"
+
+    def __init__(self, *, result: Any = None, exc: BaseException | None = None) -> None:
+        self._result = result
+        self._exc = exc
+
+    async def classify_structured(self, *, system: str, prompt: str, schema: Any) -> Any:
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+
+def _drive_classify_chunk(provider: Any, chunk: list[tuple[Any, ...]]) -> Any:
+    """Run ``_classify_chunk`` against the supplied provider and return its result."""
     import asyncio
 
-    import anyio
-
     async def _run() -> Any:
-        sem = anyio.CapacityLimiter(1)
-        return await trajectory_worker._classify_chunk(
-            object(),
-            settings,
-            sem,
-            chunk=chunk,
-            thinking_mode="disabled",
-        )
+        return await trajectory_worker._classify_chunk(provider, chunk=chunk)
 
     return asyncio.run(_run())
 
 
-def test_classify_chunk_happy_path_returns_indexed_dict(
-    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Happy path: classify_one returns a dict with a ``windows`` list → indexed by (prev,curr)."""
+def test_classify_chunk_happy_path_returns_indexed_dict() -> None:
+    """Happy path: provider returns a TrajectoryArrayResult → indexed by (prev,curr)."""
+    from claude_sql.domain.models import TrajectoryArrayResult
+
     chunk = [
         ("sid", None, "c1", None, "user", None, "first body"),
         ("sid", "c1", "c2", "user", "user", "first body", "second body"),
     ]
-
-    async def fake_classify_one(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        return {
+    result_model = TrajectoryArrayResult.model_validate(
+        {
             "windows": [
                 {
                     "prev_uuid": None,
@@ -483,66 +489,41 @@ def test_classify_chunk_happy_path_returns_indexed_dict(
                     "transition_kind": "none",
                     "confidence": 0.9,
                 },
-                "not_a_dict",  # exercises the ``isinstance(win, dict)`` skip branch
-                {  # exercises the ``key[1] is None`` skip branch
-                    "prev_uuid": "c1",
-                    "curr_uuid": None,
-                    "curr_sentiment": "neutral",
-                },
             ]
         }
-
-    monkeypatch.setattr(trajectory_worker, "classify_one", fake_classify_one)
-    result = _drive_classify_chunk(fake_classify_one, chunk, tmp_settings)
+    )
+    result = _drive_classify_chunk(_FakeProvider(result=result_model), chunk)
     assert isinstance(result, dict)
     assert (None, "c1") in result
     assert ("c1", "c2") in result
-    # Non-dict and null-curr skipped.
     assert len(result) == 2
 
 
-def test_classify_chunk_returns_refusal_error(
-    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A BedrockRefusalError from classify_one is returned as the value (not raised)."""
+def test_classify_chunk_returns_refusal_error() -> None:
+    """A BedrockRefusalError from the provider is returned as the value (not raised)."""
     chunk = [("sid", None, "c1", None, "user", None, "body")]
-
-    async def fake_classify_one(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise BedrockRefusalError("policy refusal")
-
-    monkeypatch.setattr(trajectory_worker, "classify_one", fake_classify_one)
-    result = _drive_classify_chunk(fake_classify_one, chunk, tmp_settings)
+    result = _drive_classify_chunk(_FakeProvider(exc=BedrockRefusalError("policy refusal")), chunk)
     assert isinstance(result, BedrockRefusalError)
 
 
-def test_classify_chunk_returns_generic_exception(
-    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-refusal Exception from classify_one is returned as the value."""
+def test_classify_chunk_returns_generic_exception() -> None:
+    """A non-refusal Exception from the provider is returned as the value."""
     chunk = [("sid", None, "c1", None, "user", None, "body")]
-
-    async def fake_classify_one(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise RuntimeError("network blip")
-
-    monkeypatch.setattr(trajectory_worker, "classify_one", fake_classify_one)
-    result = _drive_classify_chunk(fake_classify_one, chunk, tmp_settings)
+    result = _drive_classify_chunk(_FakeProvider(exc=RuntimeError("network blip")), chunk)
     assert isinstance(result, RuntimeError)
     assert "network blip" in str(result)
 
 
-def test_classify_chunk_non_list_windows_returns_runtime_error(
-    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A response with ``windows`` not a list (e.g. a dict) returns a RuntimeError."""
+def test_classify_chunk_returns_provider_unavailable() -> None:
+    """A Luna fail-open LlmAnalyticsUnavailable is returned as the value so the
+    dispatch loop enqueues the session for a later run (not a crash)."""
+    from claude_sql.domain.errors import LlmAnalyticsUnavailable
+
     chunk = [("sid", None, "c1", None, "user", None, "body")]
-
-    async def fake_classify_one(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"windows": {"this": "is_not_a_list"}, "extra": "k"}
-
-    monkeypatch.setattr(trajectory_worker, "classify_one", fake_classify_one)
-    result = _drive_classify_chunk(fake_classify_one, chunk, tmp_settings)
-    assert isinstance(result, RuntimeError)
-    assert "unexpected response shape" in str(result)
+    result = _drive_classify_chunk(
+        _FakeProvider(exc=LlmAnalyticsUnavailable("Luna transport down")), chunk
+    )
+    assert isinstance(result, LlmAnalyticsUnavailable)
 
 
 # ---------------------------------------------------------------------------
@@ -568,11 +549,10 @@ def test_chunk_refusal_stamps_neutral_placeholders(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return BedrockRefusalError("refused")
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 2
@@ -603,11 +583,10 @@ def test_chunk_generic_exception_enqueues_to_retry_queue(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return RuntimeError("transient bedrock failure")
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 0
@@ -642,12 +621,11 @@ def test_outer_exception_in_classify_chunk_path_enqueues_session(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         # RAISE rather than return — the outer ``except Exception`` catches it.
         raise ValueError("schema invariant broken mid-loop")
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 0
@@ -688,7 +666,7 @@ def test_retry_queue_drain_logs_count(
         now=datetime(2020, 1, 1, tzinfo=UTC),
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return {
             (r[1], r[2]): {
                 "prev_uuid": r[1],
@@ -704,7 +682,6 @@ def test_retry_queue_drain_logs_count(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     captured: list[str] = []
 
@@ -755,7 +732,9 @@ def test_skipped_via_checkpoint_logs_count(
         "filter_unchanged",
         lambda *a, **kw: ([], 1),
     )
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
+    # The skipped-log fires before windows are loaded; stub loading to [] so
+    # the run short-circuits hermetically (no provider / Bedrock call).
+    monkeypatch.setattr(trajectory_worker, "_load_windows", lambda *a, **kw: [])
 
     captured: list[str] = []
 
@@ -835,7 +814,6 @@ def test_zero_windows_after_filtering_short_circuits(
 
     # Force _load_windows to return [] regardless of the corpus.
     monkeypatch.setattr(trajectory_worker, "_load_windows", lambda *a, **kw: [])
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     captured: list[str] = []
 

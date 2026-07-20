@@ -1,167 +1,182 @@
 # claude-sql · Impact analysis
 
-This file answers one question: *if I change surface X, what else do I have to touch or carefully validate?*
+This file answers one question for each of the codebase's most-connected surfaces: *if I touch X, what else do I have to think about?*
 
-**"High-impact surface" definition.** A surface is ranked by inbound reference count — the number of distinct source and test files that import a symbol from the module. The count was measured with `grep -rhoE 'from claude_sql\.<pkg>\.<module> import'` over `src/claude_sql/` and `tests/`. The raw ranking of `core.*` modules by inbound files is: `config` (41), `sql_views` (29), `parquet_shards` (16), `llm_shared` (13), `schemas` (12), `output` (12), `session_text` (7), `logging_setup` (4), `home` (3), `checkpointer` (3), `retry_queue` (1).
+**High-impact surface** here means: a symbol (Protocol, class, function, or schema) selected by **inbound reference count** across `src/` and `tests/`, weighted toward the seams of the v2 hexagonal architecture. The hexagon puts the highest-fan-in symbols at two boundaries — the port Protocols in `application/ports.py` (every use-case depends on them) and the infrastructure registration/config surface (`Settings`, `register_all`) that every adapter reads. A third class is the **byte-parity contracts** (`render_turn_text`, `SessionTextCorpus.assemble`, the pydantic schemas): low file-count fan-in but high *behavioral* blast radius, because external consumers and checkpoint caches depend on exact output bytes. The eight surfaces below are the ones where a careless change breaks the most downstream code or silently corrupts cached artifacts.
 
-The top eight surfaces below deviate from pure count in three deliberate places: `cli` (the user-facing entry point), `checkpointer` (the incremental-rebuild cache contract), and `binding` (the git wire format that implements the transcript-provenance contract) displace `output` and `session_text`. Those three are the load-bearing *contracts* a changer reasons about, even though `output` outranks two of them on raw fan-in. `output` and `session_text` are mechanical helpers and are listed under `## Other notable surfaces`.
+Each `Type` cell is one of `direct import` / `indirect` / `runtime dispatch` / `test` / `config`. Each `Touch on change` cell is `yes` (must edit), `likely` (review even without a signature change), or `no` (only a behavioral change reaches it).
 
-`Type` vocabulary: `direct import` (file imports the symbol), `indirect` (file consumes a value the surface produces without importing it directly), `runtime dispatch` (reached through CLI subcommand orchestration or SQL string, not a Python import), `test`, `config`. `Touch on change`: `yes` (signature change forces an edit), `likely` (review needed even without a signature change), `no` (only a behavioral change reaches it).
+## The port Protocol surface (`application/ports.py`)
 
-## core.config — Settings, DEFAULT_PRICING
+Defined at: `src/claude_sql/application/ports.py:63-306` (9 `@runtime_checkable` Protocols plus re-exported `EmbeddingProvider` / `LlmAnalyticsProvider` / `SearchHit` / `PortResult`).
 
-Defined at: `src/claude_sql/core/config.py:126` (`class Settings(BaseSettings)`); `DEFAULT_PRICING` at `src/claude_sql/core/config.py:117`.
-
-Highest fan-in surface in the repo (41 inbound files). Every analytics worker, the CLI, and the SQL-view registrar pull configuration from `Settings`.
+This is the DIP seam of the whole reshape. Every use-case is typed against these Protocols; every infrastructure adapter must structurally satisfy them. A signature change to any method here ripples to both the adapter that implements it and the use-case that calls it.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `app/cli.py` | direct import | yes | `src/claude_sql/app/cli.py` |
-| analytics workers (`classify_worker`, `conflicts_worker`, `friction_worker`, `trajectory_worker`, `embed_worker`, `cluster_worker`, `community_worker`, `terms_worker`, `skills_catalog`, `ingest`) | direct import | yes | `src/claude_sql/analytics/classify_worker.py` |
-| `provenance/review_sheet_worker.py` | direct import | yes | `src/claude_sql/provenance/review_sheet_worker.py` |
-| `core/llm_shared.py`, `core/session_text.py`, `core/sql_views.py` | direct import (TYPE_CHECKING in `llm_shared`/`session_text`) | likely | `src/claude_sql/core/sql_views.py` |
-| `tests/test_config.py`, `tests/test_team_corpus.py`, `tests/conftest.py`, + 15 more test files | test | likely | `tests/test_config.py` |
+| --- | --- | --- | --- |
+| `infrastructure/adapters.py` (ParquetCache, SqliteCheckpoint, SqliteRetryQueue, LanceVectorStore) | direct import | yes | `src/claude_sql/infrastructure/adapters.py:54-222` |
+| `application/use_cases/classify.py` (ReaderPort, CheckpointPort, RetryQueuePort, CachePort) | direct import | yes | `src/claude_sql/application/use_cases/classify.py:44` |
+| `application/use_cases/trajectory.py` | direct import | yes | `src/claude_sql/application/use_cases/trajectory.py:75` |
+| `application/use_cases/conflicts.py` | direct import | yes | `src/claude_sql/application/use_cases/conflicts.py:64` |
+| `application/use_cases/friction.py` | direct import | yes | `src/claude_sql/application/use_cases/friction.py:72` |
+| `application/use_cases/embed.py` (VectorStorePort) | direct import | yes | `src/claude_sql/application/use_cases/embed.py:47` |
+| `application/use_cases/cluster.py` (VectorStorePort) | direct import | yes | `src/claude_sql/application/use_cases/cluster.py:35` |
+| `application/use_cases/ingest.py` (CachePort) | direct import | yes | `src/claude_sql/application/use_cases/ingest.py:50` |
+| `composition.py` build_* factories (return the port types) | direct import | likely | `src/claude_sql/composition.py:24-32` |
+| `tests/test_ports.py`, `tests/test_port_wiring.py` (import-discipline + structural conformance) | test | yes | `tests/test_port_wiring.py:145` |
 
 Blast-radius notes:
-- Env-var binding uses `env_prefix="CLAUDE_SQL_"` (`src/claude_sql/core/config.py:134`); renaming a field silently changes the public environment-variable contract operators rely on, with no compile-time signal.
-- The `_derive_team_corpus_globs` validator runs `mode="after"` (`src/claude_sql/core/config.py:339`), so team-corpus glob fields are computed, not user-set — code that writes those fields directly is overwritten on the next model construction.
-- `DEFAULT_PRICING` is a per-model `(input, output)` rate map (`src/claude_sql/core/config.py:117`); cost-reporting consumers assume a key exists for every model id they pass, so adding a model without a pricing entry raises `KeyError` at report time, not at config load.
+- **`ReaderPort` is stateful, not a stateless query executor.** Its docstring pins the register→write→rebind lifecycle: a use-case that writes parquet or LanceDB mid-run (`embed`, `cluster`) must call `refresh_analytics_views()` / `rebind_vss(stage)` before its next read, or it silently reads 0 rows (the RFC §9.6 stale-connection bug). Do not collapse these methods into a bare `query()`. `src/claude_sql/application/ports.py:248-290`
+- **`ports.py` may import only stdlib, `typing`, `returns`, and the pure `domain` modules** (`domain.errors`, `domain.ports`, `domain.retrieval`); heavy types (`duckdb`, `pl.DataFrame`, `datetime`) are `TYPE_CHECKING`-only. Adding a top-level heavy import breaks the layering test. `src/claude_sql/application/ports.py:16-51`
+- **Every port method returning a container is contractually total on empty state** — e.g. `VectorStorePort.count_rows()` returns `0` and `table_identity()` returns `None` for an empty store rather than raising (the empty-namespace gate). Changing a method to raise on empty breaks callers that rely on the sentinel. `src/claude_sql/application/ports.py:153-159`
 
-## core.sql_views — VIEW_NAMES, VIEW_SCHEMA, MACRO_NAMES, MACRO_SIGNATURES, register_all
+## `Settings` (`infrastructure/settings.py`)
 
-Defined at: `src/claude_sql/core/sql_views.py:62` (`VIEW_NAMES`), `:116` (`VIEW_SCHEMA`), `:314` (`MACRO_NAMES`), `:355` (`MACRO_SIGNATURES`), `:2078` (`register_all`).
+Defined at: `src/claude_sql/infrastructure/settings.py:152` (`class Settings(BaseSettings)`).
 
-Second-highest fan-in (29 inbound files), almost entirely from the test suite, which asserts the view/macro contract.
+The single environment-driven config object, threaded into nearly every adapter and use-case. Adding or renaming a field, or changing a derived method, touches the widest set of files in the repo (~36 src files reference the name).
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `app/cli.py` | direct import | yes | `src/claude_sql/app/cli.py` |
-| analytics workers | runtime dispatch | likely | `src/claude_sql/analytics/conflicts_worker.py` |
-| `tests/test_sql_views.py` (schema/macro drift) | test | yes | `tests/test_sql_views.py` |
-| `tests/test_skill_views.py`, `tests/test_turn_window.py`, `tests/test_session_bounds.py`, `tests/test_v2_analytics.py`, + 15 more | test | likely | `tests/test_v2_analytics.py` |
+| --- | --- | --- | --- |
+| `infrastructure/duckdb_views.py` (`register_all(settings=...)`, glob + identity) | direct import | yes | `src/claude_sql/infrastructure/duckdb_views.py:2285-2333` |
+| `infrastructure/duckdb_connection.py` (PRAGMA tuning, glob binding) | direct import | yes | `src/claude_sql/infrastructure/duckdb_connection.py:171` |
+| `infrastructure/session_search.py`, `session_text_loader.py` | direct import | yes | `src/claude_sql/infrastructure/session_text_loader.py:49` |
+| `infrastructure/embedding/cohere_bedrock.py` (`output_dimension`) | direct import | yes | `src/claude_sql/infrastructure/settings.py:232` |
+| `application/use_cases/embed.py` (`expected_embedding_identity`) | direct import | yes | `src/claude_sql/application/use_cases/embed.py:318` |
+| `composition.py` / `interfaces/cli/app.py` (composition root) | direct import | yes | `src/claude_sql/composition.py:73-78` |
+| `adapters.py` build_checkpoint/build_retry_queue/build_vector_store (take `Settings`) | direct import | yes | `src/claude_sql/infrastructure/adapters.py:230-240` |
+| `tests/test_config.py`, `test_config_dir.py` (env override, relocated CONFIG_DIR) | test | likely | `tests/test_config_dir.py:194` |
 
 Blast-radius notes:
-- `VIEW_SCHEMA` and `MACRO_SIGNATURES` are the source of truth for drift tests (`src/claude_sql/core/sql_views.py:116`, `:355`); changing a view's column set or a macro's argument list without updating these dicts fails `tests/test_sql_views.py` rather than runtime.
-- Analytics workers consume the registered views through SQL strings and CLI orchestration, not Python imports — they will not appear in an import grep, but renaming a view in `VIEW_NAMES` breaks every query string referencing the old name (`src/claude_sql/core/sql_views.py:62`).
-- `register_all` registers the full view/macro set in one call (`src/claude_sql/core/sql_views.py:2078`); any consumer that opens a fresh DuckDB connection must call it before querying, so a new code path that skips it sees missing-view errors.
+- **`output_dimension` (Literal 256/512/1024/1536) is the head of the dimension contract.** It feeds `expected_embedding_identity()` (`settings.py:475-493`), which threads into the Lance fixed-size vector schema, the `register_vss` `FLOAT[dim]` view cast, and the query-time cast. Changing it after a store is written triggers the fail-loud guard — it requires a full re-embed, not a config edit. `src/claude_sql/infrastructure/settings.py:232`
+- **The pure value-object projections are the domain firewall.** `transcript_caps()` (:539) hands `domain.transcript` a two-int `TranscriptCaps` slice, and `clustering_config()`/`community_config()`/`terms_config()` (:502-539) hand `domain.structure` their frozen VOs, so domain never imports the god-`Settings`. Widening what a projection returns must not leak infrastructure types into domain. `src/claude_sql/infrastructure/settings.py:502-539`
+- **`Settings` lives in `infrastructure`, not `domain`** — importing it into a `domain` or `application` module top-level violates the layering contract (`ports.py` and `composition.py` only reference it under `TYPE_CHECKING`). `src/claude_sql/composition.py:33`
 
-## core.parquet_shards — write_part, read_all, replace_sessions, iter_part_files, count_rows, is_sharded_dir
+## `render_turn_text` (`domain/transcript.py`)
 
-Defined at: `src/claude_sql/core/parquet_shards.py:87` (`write_part`), `:131` (`read_all`), `:167` (`replace_sessions`), `:72` (`iter_part_files`), `:149` (`count_rows`), `:54` (`is_sharded_dir`).
+Defined at: `src/claude_sql/domain/transcript.py:287-336`.
 
-The on-disk sharded-parquet storage layer. Every worker that persists rows and the CLI that reads them depend on the directory layout these functions enforce.
+A pure function that collapses raw message-envelope rows into the downstream consumer's transcript text — **one line per message**, with a specific ordering (`(ts, kind_rank, uuid)`), inline `[tool_use:name]`/`[tool_result]` markers, and cap behavior. It is the drop-in retrieval contract downstream consumers depend on, so its output must stay **byte-identical**.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `app/cli.py` | direct import | yes | `src/claude_sql/app/cli.py` |
-| `analytics/ingest.py`, `classify_worker.py`, `conflicts_worker.py`, `friction_worker.py`, `trajectory_worker.py` | direct import | yes | `src/claude_sql/analytics/ingest.py` |
-| `core/sql_views.py` | direct import | likely | `src/claude_sql/core/sql_views.py` |
-| `tests/test_parquet_shards.py`, `tests/test_ingest.py`, `tests/test_conflicts_storage_v2.py`, + 6 more | test | likely | `tests/test_parquet_shards.py` |
+| --- | --- | --- | --- |
+| `infrastructure/transcript_reader.py` `read_turn_text` (sole src caller) | direct import | yes | `src/claude_sql/infrastructure/transcript_reader.py:543` |
+| downstream consumers (external repos consuming the collapse contract) | indirect | likely | `src/claude_sql/domain/transcript.py:184-194` |
+| `tests/test_collapse_parity.py` (ported-fixture byte-parity proof) | test | yes | `tests/test_collapse_parity.py:176` |
+| `tests/test_transcript_domain.py` (ordering, folding, caps, determinism) | test | yes | `tests/test_transcript_domain.py:87-269` |
+| `tests/property/test_transcript_properties.py` (shuffle-invariance, idempotence, caps) | test | yes | `tests/property/test_transcript_properties.py:62-176` |
 
 Blast-radius notes:
-- `is_sharded_dir` (`src/claude_sql/core/parquet_shards.py:54`) and `iter_part_files` (`:72`) encode the part-file naming convention; changing the filename pattern silently strands existing shards, since `read_all` discovers parts by globbing rather than from a manifest.
-- `replace_sessions` (`src/claude_sql/core/parquet_shards.py:167`) is the in-place update primitive workers call on re-run; it assumes session-id is the partition key, so a worker that writes rows without a stable session id duplicates rather than replaces on the next run.
-- `read_all` returns `pl.DataFrame | None` (`src/claude_sql/core/parquet_shards.py:131`) — `None` for an empty or absent shard dir; every caller must handle the `None` branch or it raises on first attribute access.
+- **Byte-parity with the consumer's collapse routine is a hard acceptance gate.** `test_collapse_parity.py` feeds ported fixtures straight to `render_turn_text` and asserts exact string equality. Any change to line shape, ordering, marker text, or the per-turn `` …`` ellipsis (note the leading space) breaks parity even if it "looks equivalent." `src/claude_sql/domain/transcript.py:296-313`
+- **Do not conflate with `SessionTextCorpus.assemble`.** That is a *separate* byte-stable contract for the four LLM pipelines (classify/trajectory/conflicts/friction), with a different ordering (block-level `_KIND_RANK`, not envelope `_COLLAPSE_KIND_RANK`) and different header/marker shapes. The two must not be unified. `src/claude_sql/domain/transcript.py:41-49, 126-178`
+- **The function is Settings-free by design** — caps arrive as keyword args (`per_turn_chars`, `total_chars`, `truncation_notice`), and it uses the RAW timestamp string verbatim (no TIMESTAMP round-trip). Reintroducing a `Settings` dependency or reformatting the timestamp breaks the pure-domain guarantee and parity. `src/claude_sql/domain/transcript.py:314-336`
 
-## core.llm_shared — classify_one, _invoke_classifier_sync, _build_bedrock_client, _parse_structured_payload, BedrockRefusalError
+## `ClaudeSql` facade + `build_*` factories (`composition.py`)
 
-Defined at: `src/claude_sql/core/llm_shared.py:563` (`async def classify_one`), `:402` (`_invoke_classifier_sync`), `:346` (`_build_bedrock_client`), `:500` (`_parse_structured_payload`), `:490` (`class BedrockRefusalError`).
+Defined at: `src/claude_sql/composition.py:36` (`class ClaudeSql`) and `:125-168` (`build_reader` / `build_search` / `build_cache` / `build_checkpoint` / `build_retry_queue` / `build_vector_store`).
 
-The shared Bedrock-invocation layer behind every LLM-backed analytics pipeline.
+The one importable composition root — `from claude_sql import ClaudeSql` (or `from claude_sql.composition import ClaudeSql`). It is the public surface for downstream consumers, so its shape and lazy-import discipline are external contracts.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `analytics/classify_worker.py`, `conflicts_worker.py`, `friction_worker.py`, `trajectory_worker.py` | direct import | yes | `src/claude_sql/analytics/classify_worker.py` |
-| `analytics/embed_worker.py` (`_build_bedrock_client` only) | direct import | likely | `src/claude_sql/analytics/embed_worker.py` |
-| `provenance/review_sheet_worker.py` | direct import | yes | `src/claude_sql/provenance/review_sheet_worker.py` |
-| `tests/test_llm_worker.py`, `tests/test_llm_worker_parser.py`, `tests/test_llm_worker_cache.py`, `tests/test_llm_worker_pipelines.py`, + 2 more | test | yes | `tests/test_llm_worker.py` |
+| --- | --- | --- | --- |
+| `claude_sql/__init__.py` (re-export via lazy `__getattr__`) | direct import | yes | `src/claude_sql/__init__.py:16-23` |
+| `infrastructure/adapters.py` build_* (the real constructors these delegate to) | indirect | likely | `src/claude_sql/infrastructure/adapters.py:225-240` |
+| `infrastructure/duckdb_views.py` `register_all` (called by `ClaudeSql.query`) | indirect | likely | `src/claude_sql/composition.py:115-119` |
+| downstream consumers (external importers) | runtime dispatch | likely | `src/claude_sql/composition.py:1-6` |
+| `tests/test_retrieval_seam.py` (facade + port wiring, no-duckdb-on-import proof) | test | yes | `tests/test_retrieval_seam.py:405-453` |
 
 Blast-radius notes:
-- `_parse_structured_payload` (`src/claude_sql/core/llm_shared.py:500`) is the single point that turns a Bedrock response into a dict; every worker's schema-validation step depends on its output shape, and `tests/test_llm_worker_parser.py` pins that shape directly.
-- `BedrockRefusalError` (`src/claude_sql/core/llm_shared.py:490`) is a typed control-flow signal, not a generic failure; callers branch on it to skip-and-continue, so widening it to a plain `Exception` would silently swallow refusals into the retry path.
-- `classify_one` is `async` (`src/claude_sql/core/llm_shared.py:563`) while `_invoke_classifier_sync` is the sync core (`:402`); a new synchronous call site needs the sync helper, not `classify_one`, or it must run inside an event loop.
+- **Zero heavy imports at module top.** `import claude_sql.composition` (and `import claude_sql`) must stay sub-millisecond and dependency-free — every duckdb/polars/adapter import lives inside a method or factory, and port-typed annotations are `TYPE_CHECKING`-only. Adding a top-level heavy import regresses the cold-import cost the siblings depend on. `src/claude_sql/composition.py:8-33`
+- **`ClaudeSql.query` binds through `register_all`, not the CLI's private `_open_connection_full`.** This keeps `composition.py` decoupled from the `interfaces` layer while giving identical full-registration semantics. Do not repoint it at a CLI helper. `src/claude_sql/composition.py:107-119`
+- **`reader()` / `search()` are lazily built and cached** — construction is cheap and the DuckDB connections are not built until first accessor call. A change making construction eager breaks the "cheap to instantiate" contract. `src/claude_sql/composition.py:80-96`
 
-## core.schemas — pydantic models + Bedrock JSON-schema dicts
+## `register_all` + the registration chain (`infrastructure/duckdb_views.py`)
 
-Defined at: `src/claude_sql/core/schemas.py:99` (`SessionClassification`), `:173` (`TrajectoryWindow`), `:266` (`TrajectoryArrayResult`), `:292` (`ConflictPair`), `:379` (`ConflictsResult`), `:406` (`UserFrictionSignal`), `:477` (`Correction`), `:509` (`PRReviewSheet`); `__all__` at `:583`.
+Defined at: `src/claude_sql/infrastructure/duckdb_views.py:2285` (`register_all`); sub-steps `register_raw` :490, `register_views` :638, `register_macros` :1244, `register_vss` :1824, `register_analytics` :2000.
 
-The structured-output contract shared between workers and the LLM. Each model has a paired `*_SCHEMA` dict generated by `_bedrock_schema` for the Bedrock tool-use call.
+The stable infrastructure entrypoint that materializes 18 views + 14 macros + VSS against an open DuckDB connection. Every path that needs a query-ready connection goes through here; its ordering constraints and parameters are load-bearing.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `analytics/classify_worker.py`, `conflicts_worker.py`, `friction_worker.py`, `trajectory_worker.py` | direct import | yes | `src/claude_sql/analytics/classify_worker.py` |
-| `provenance/review_sheet_worker.py` | direct import | yes | `src/claude_sql/provenance/review_sheet_worker.py` |
-| `tests/test_schemas.py`, `tests/test_v2_analytics.py`, `tests/test_review_sheet_worker.py`, + 4 more | test | yes | `tests/test_schemas.py` |
+| --- | --- | --- | --- |
+| `interfaces/cli/app.py` (`_open_connection_full`) | direct import | yes | `src/claude_sql/interfaces/cli/app.py:491` |
+| `infrastructure/duckdb_connection.py` (shared connection builder) | direct import | yes | `src/claude_sql/infrastructure/duckdb_connection.py:171` |
+| `composition.py` `ClaudeSql.query` | direct import | yes | `src/claude_sql/composition.py:119` |
+| `domain/embedding_guard.py` `ensure_store_matches` (called inside `register_vss`) | indirect | likely | `src/claude_sql/infrastructure/duckdb_views.py:1941` |
+| `tests/test_config_dir.py`, `test_team_corpus.py`, `test_s3_source.py` | test | yes | `tests/test_config_dir.py:232`, `tests/test_team_corpus.py:277`, `tests/test_s3_source.py:328` |
+| `tests/test_pr3_perf.py` (monkeypatches `register_all` as the cold-start sentinel) | test | likely | `tests/test_pr3_perf.py:122-125` |
 
 Blast-radius notes:
-- Each `*_SCHEMA` dict is derived from its model via `_bedrock_schema` (`src/claude_sql/core/schemas.py:170`, `:289`, `:403`, `:474`, `:580`); editing a model field changes the JSON schema sent to Bedrock, so the LLM prompt contract moves even when no Python signature changes.
-- The stored parquet column set mirrors these model fields; renaming a field changes both the LLM contract and the downstream `VIEW_SCHEMA` expectation, coupling this surface to `core.sql_views`.
-- `__all__` (`src/claude_sql/core/schemas.py:583`) is the curated public export list; adding a model without listing it leaves it importable but undocumented, and the drift check in `tests/test_schemas.py` reads the export set.
+- **Registration order is a hard invariant.** `register_vss` must run before `register_macros` (the `semantic_search` macro body references the `message_embeddings` table, resolved at macro-creation time), and `register_analytics` must also precede `register_macros` (analytics macros bind against analytics views at creation). Reordering silently breaks macro binding. `src/claude_sql/infrastructure/duckdb_views.py:2320-2333`
+- **`skip_vss=True` must skip both `register_vss` and the `semantic_search` macro**, or the macro references a table that was never bound. The two flags travel together. `src/claude_sql/infrastructure/duckdb_views.py:2308-2319`
+- **Missing parquet is a warn-and-skip, never a raise.** Views register only the caches that exist; adding a new analytics view must preserve this so a fresh install doesn't crash. `src/claude_sql/infrastructure/duckdb_views.py:2000` (register_analytics)
 
-## app.cli — App, subcommands, main
+## `ensure_store_matches` — the dimension guard (`domain/embedding_guard.py`)
 
-Defined at: `src/claude_sql/app/cli.py:164` (`app = App(...)`, cyclopts); `main` at `:3073`. Entry point `claude-sql = "claude_sql.app.cli:main"` (`pyproject.toml:53`).
+Defined at: `src/claude_sql/domain/embedding_guard.py:22-61`.
 
-The single user-facing entry point and the integration seam that wires every package together. Sub-apps `cache_app` (`:1239`) and `skills_app` (`:1457`) mount under it.
+The fail-loud provider/dimension guard: a pure rule that refuses to bind or write a vector store whose stamped `(model, dim)` differs from the active embedder. Small surface, high stakes — the alternative is silent kNN corruption.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `claude-sql` console script | config | yes | `pyproject.toml:53` |
-| `tests/test_cli.py`, `tests/test_cli_coverage.py` | test | yes | `tests/test_cli.py` |
-| `tests/test_analyze_chain.py`, `tests/test_ingest.py`, `tests/test_peek.py`, `tests/test_profile_json.py`, `tests/test_pr3_perf.py`, + 2 more | test | likely | `tests/test_analyze_chain.py` |
+| --- | --- | --- | --- |
+| `infrastructure/duckdb_views.py` `register_vss` (read/bind path) | direct import | yes | `src/claude_sql/infrastructure/duckdb_views.py:1941` |
+| `infrastructure/embedding/__init__.py` (re-export for the write path) | direct import | yes | `src/claude_sql/infrastructure/embedding/__init__.py:26` |
+| `application/use_cases/embed.py` (`store.table_identity()` before backfill) | indirect | likely | `src/claude_sql/application/use_cases/embed.py:318` |
+| `infrastructure/lance_store.py` / `adapters.py` `table_identity` (supplies the stored side) | indirect | likely | `src/claude_sql/infrastructure/lance_store.py:245`, `adapters.py:206` |
+| `domain/errors.py` `EmbeddingProviderMismatch` (the exception raised) | direct import | yes | `src/claude_sql/domain/errors.py:80` |
+| `tests/test_embedding_providers.py` (guard raise + no-op paths) | test | yes | `tests/test_embedding_providers.py:251-283` |
 
 Blast-radius notes:
-- The console-script entry point binds `main` by string path (`pyproject.toml:53`); renaming `main` or moving `cli.py` breaks the installed `claude-sql` command without any import-time error in the library.
-- cyclopts maps subcommand and parameter names to the user-facing CLI surface (`src/claude_sql/app/cli.py:164`); renaming a subcommand function or its arguments is a breaking change to operator usage and to the many tests that invoke commands by name.
-- `cli.py` is the only file that imports `sql_views.register_all`, `parquet_shards`, and `binding` together; it is the de facto orchestration seam, so a change to any of those surfaces most often lands here first.
+- **`model_id` is the primary identity; `dim` is checked only when `expected_dim` is supplied.** Cohere is the one provider whose single `model_id` emits multiple Matryoshka widths, so dim is checked there; probe-only providers (ollama/onnx) pass `expected_dim=None` and trust `model_id` alone. Changing the identity-comparison logic must preserve this asymmetry. `src/claude_sql/domain/embedding_guard.py:38-50`
+- **`None` on either stored field means empty store — the guard is a no-op** so a fresh install lets any provider claim the store. Making the guard raise on `None` would break first-embed. `src/claude_sql/domain/embedding_guard.py:47-48`
+- **This is pure domain (string/int compare, no I/O).** Both the write path (`embed.run_backfill`) and the read path (`register_vss`) must call it; dropping either call reopens the silent-corruption hole. `src/claude_sql/domain/embedding_guard.py:1-15`
 
-## core.checkpointer — PIPELINE_NAMES, filter_unchanged, mark_completed, load_as_map, _connect
+## `EXIT_CODES` + the error taxonomy (`domain/errors.py`)
 
-Defined at: `src/claude_sql/core/checkpointer.py:41` (`PIPELINE_NAMES`), `:285` (`filter_unchanged`), `:329` (`mark_completed`), `:264` (`load_as_map`), `:226` (`_connect`).
+Defined at: `src/claude_sql/domain/errors.py:26` (`EXIT_CODES`) plus `DomainError` :37, `RefusalError` :48, `BedrockRefusalError` :63, `EmbeddingProviderMismatch` :80, `LlmAnalyticsUnavailable` :94, `ClassifiedError` :110, `InputValidationError` :128.
 
-Low fan-in (3 inbound files) but a write-side cache contract: it decides which sessions a re-run skips. Included for its contract weight, not its count.
+The agent-facing CLI contract: DuckDB errors map to stable exit codes (parse→64, catalog→65, runtime→70) and structured stderr JSON. Changing a code or class hierarchy breaks the documented agent-subprocess surface.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `core/retry_queue.py` | direct import | yes | `src/claude_sql/core/retry_queue.py:28` |
-| `tests/test_checkpointer.py` | test | yes | `tests/test_checkpointer.py` |
-| `tests/test_retry_queue.py` | test | likely | `tests/test_retry_queue.py` |
+| --- | --- | --- | --- |
+| `interfaces/cli/output.py` (`EXIT_CODES`, `ClassifiedError`, `InputValidationError`) | direct import | yes | `src/claude_sql/interfaces/cli/output.py:28` |
+| `infrastructure/duckdb_errors.py` `classify_duckdb_error` | direct import | yes | `src/claude_sql/infrastructure/duckdb_errors.py:15-42` |
+| `domain/embedding_guard.py` (raises `EmbeddingProviderMismatch`) | direct import | yes | `src/claude_sql/domain/embedding_guard.py:19` |
+| LLM worker use-cases (catch `BedrockRefusalError` / `RefusalError` as terminal) | indirect | likely | `src/claude_sql/domain/errors.py:48-75` |
+| error-path tests (`test_output.py` exit-code mapping, refusal handling) | test | likely | `tests/test_output.py:12-90` |
 
 Blast-radius notes:
-- `retry_queue` shares the same SQLite file and reuses `_connect` (`src/claude_sql/core/retry_queue.py:56`); both tables live in one DB, so a schema or connection-handling change in the checkpointer affects the retry queue even though the two are nominally separate features.
-- `PIPELINE_NAMES` is the closed set of valid pipeline keys (`src/claude_sql/core/checkpointer.py:41`); `retry_queue` validates against it (`src/claude_sql/core/retry_queue.py:97`), so adding a pipeline requires updating this tuple or the new pipeline is rejected.
-- `filter_unchanged` is the skip decision (`src/claude_sql/core/checkpointer.py:285`) and `mark_completed` is its write-back counterpart (`:329`); they form an ordered pair — a worker that calls `filter_unchanged` but fails to call `mark_completed` reprocesses the same sessions on every run.
+- **`RefusalError` is terminal by contract.** Workers stamp a neutral placeholder row and clear the retry queue on it, so refused units don't cycle forever. `BedrockRefusalError` subclasses `RefusalError` so existing `except`/`isinstance` sites keep working — do not flatten the hierarchy. `src/claude_sql/domain/errors.py:48-75`
+- **The exit-code numbers are a published agent contract** (64/65/70). `classify_duckdb_error` must stay in sync with new DuckDB exception subclasses, and the numbers must not drift. `src/claude_sql/infrastructure/duckdb_errors.py:18-42`
 
-## provenance.binding — TranscriptBinding, git trailer/note wire format, resolvers
+## The pydantic LLM schemas (`domain/models.py`)
 
-Defined at: `src/claude_sql/provenance/binding.py:143` (`class TranscriptBinding`); wire constants `DIGEST_PREFIX` (`:61`), `NOTES_REF` (`:65`), `TRAILER_DIGEST` (`:69`), `TRAILER_URI` (`:72`), `TRAILER_RUNTIME` (`:81`); `resolve_all_sources` (`:653`), `resolve_commit_to_transcript` (`:674`); writers `write_trailer` (`:404`), `write_note` (`:445`); readers `read_trailer` (`:515`), `read_note` (`:599`).
+Defined at: `src/claude_sql/domain/models.py:25` (`SessionClassification`), `:189` (`TrajectoryArrayResult`), `:299` (`ConflictsResult`), `:323` (`UserFrictionSignal`).
 
-Implements the transcript-to-commit provenance contract (RFC 0001). Low fan-in, but the wire format is durable on-disk state in git.
+The structured-output schemas for the four LLM pipelines. They are flattened into Bedrock JSON schemas and echoed in prompts, so a field change ripples to the schema flattener, the prompts, the worker parse logic, and the parquet cache shape.
 
 | Downstream | Type | Touch on change | Citation |
-|---|---|---|---|
-| `app/cli.py` (`bind` / `resolve` commands) | direct import | yes | `src/claude_sql/app/cli.py` |
-| `provenance/review_sheet_worker.py` (`resolve_commit_to_transcript`) | direct import | yes | `src/claude_sql/provenance/review_sheet_worker.py` |
-| `tests/test_binding.py`, `tests/test_binding_extras.py` | test | yes | `tests/test_binding.py` |
-| `tests/test_cli.py`, `tests/test_pr3_perf.py` | test | likely | `tests/test_cli.py` |
+| --- | --- | --- | --- |
+| `infrastructure/bedrock/structured_output.py` (`_bedrock_schema` flatten) | direct import | yes | `src/claude_sql/infrastructure/bedrock/structured_output.py:24-27, 117-120` |
+| `application/prompts.py` (prompt bodies echo the schema's label semantics; no import, docstring-coupled) | indirect | likely | `src/claude_sql/application/prompts.py:3` |
+| `application/use_cases/trajectory.py` (`schema=TrajectoryArrayResult`) | direct import | yes | `src/claude_sql/application/use_cases/trajectory.py:552` |
+| analytics parquet caches + `duckdb_views.py` analytics views (column shape) | indirect | likely | `src/claude_sql/infrastructure/duckdb_views.py:2000` |
+| `tests/test_schemas.py`, `test_trajectory_windowed.py`, `test_conflicts_storage_v2.py`, `test_llm_analytics.py` | test | yes | `tests/test_schemas.py:8-12` |
 
 Blast-radius notes:
-- The `TRAILER_*` constants (`src/claude_sql/provenance/binding.py:69`, `:72`, `:81`) are the literal commit-message trailer keys written to git history; renaming one breaks `read_trailer` against any commit written by an older version, since the parser keys on the exact string (`:561`).
-- `NOTES_REF = "transcripts"` (`src/claude_sql/provenance/binding.py:65`) is the git-notes ref the binding is stored under; changing it orphans every previously written note, because `read_note` looks only under the current ref.
-- `write_trailer`/`read_trailer` and `write_note`/`read_note` are matched writer/reader pairs (`src/claude_sql/provenance/binding.py:404`/`:515`, `:445`/`:599`); a change to one side's serialization must land on the other in the same commit or round-trip resolution breaks.
+- **A schema field rename/removal changes the parquet column shape**, which the analytics views and downstream macros read. Stale shards from a prior schema are detected via parquet metadata and deleted on first run — but the view SQL and the `sentiment_arc`/`conflicts_summary` macros must be updated in lockstep. `src/claude_sql/domain/models.py:189-321`
+- **`output_config.format` structured output rejects parts of the JSON-Schema draft**, so `_bedrock_schema` inlines `$ref`, injects `additionalProperties: false`, and strips numeric/string constraints. Adding a constrained field (regex, min/max) without matching the flattener's stripping breaks the Bedrock call. `src/claude_sql/infrastructure/bedrock/structured_output.py:117-120`
 
 ## Other notable surfaces
 
-- `core.output` — table/JSON rendering helpers (`src/claude_sql/core/output.py`); 12 inbound files but a mechanical formatting layer. Touch on change: `likely` for callers that pin column order.
-- `core.session_text` — transcript-to-text flattening (`src/claude_sql/core/session_text.py`); 7 inbound files, feeds the LLM workers. Touch on change: `likely`, since prompt content shifts if the flattening changes.
-- `core.lance_store` — vector store wrapper (`src/claude_sql/core/lance_store.py`); does not appear in the module-path import grep (reached internally and through `embed_worker`), exercised by `tests/test_lance_store.py` and `tests/test_hnsw_persistence.py`.
-- `core.retry_queue` — single inbound (`cli.py`); a thin layer over `checkpointer`'s SQLite file (`src/claude_sql/core/retry_queue.py`).
-- `core.logging_setup` (4 inbound) and `core.home` (3 inbound) — cross-cutting setup helpers with shallow blast radius.
+- **`EmbeddingProvider` / `LlmAnalyticsProvider` Protocols** (`src/claude_sql/domain/ports.py`) — the pluggable-provider seam; implemented by `infrastructure/embedding/{cohere_bedrock,ollama,onnx_bge}.py` and `infrastructure/llm_analytics/{sonnet_bedrock,strands_luna}.py`. 15 / 9 inbound references; a method-signature change touches every adapter under those two packages. Re-exported through `application/ports.py`, so covered by the port-surface section above.
+- **`SearchHit`** (`src/claude_sql/domain/retrieval.py`) — the pure value-object returned by `SessionSearchPort.search`; consumed by `infrastructure/session_search.py`, `composition.py`, and CLI output. A field change touches the search adapter and the JSON/table formatters.
+- **`interfaces/cli/app.py`** (cyclopts app) — the top-level command surface and composition root; imports every use-case via lazy in-function imports (`app.py:903-2066`). High fan-out rather than fan-in: it is the thing that changes when a subcommand's contract changes, not a thing others import.
+- **`infrastructure/lance_store.py`** — the LanceDB read/write module behind `VectorStorePort`; `table_identity` (:245) is the source of the guard's stored side. Covered under the dimension-guard section.
 
 ## See also
 
-- [claude-sql · Module map](../architecture/module-map.md) — 8 shared source files
-- [claude-sql · Contract map](contract-map.md) — 7 shared source files
-- [claude-sql · Debugging guide](debugging-guide.md) — 7 shared source files
-- [claude-sql · Business logic](business-logic.md) — 6 shared source files
-- [claude-sql · Public API](../reference/public-api.md) — 6 shared source files
+- [claude-sql · Contract map](../insights/contract-map.md) — 17 shared source citations
+- [claude-sql · Module map](../architecture/module-map.md) — 10 shared source citations
+- [claude-sql · Processes](../behavior/processes.md) — 10 shared source citations
+- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 10 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 9 shared source citations
