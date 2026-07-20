@@ -46,12 +46,12 @@ jobs:
   proofs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Lean 4 proof layer (Track A): machine-checked domain invariants under
       # proofs/. Mirrors the local `mise run proofs` gate (lake build, core
       # Lean only, no mathlib). lean-action installs elan per
       # proofs/lean-toolchain and caches .lake keyed on toolchain + manifest.
-      - uses: leanprover/lean-action@v1
+      - uses: leanprover/lean-action@38fbc41a8c28c4cbaec22d7f7de508ec2e7c0dd9 # v1.5.0
         with:
           lake-package-directory: proofs
           auto-config: "false"
