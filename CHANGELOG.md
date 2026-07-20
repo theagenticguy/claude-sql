@@ -1,3 +1,18 @@
+## v2.0.0 (2026-07-20)
+
+### BREAKING CHANGE
+
+- module paths moved from claude_sql.{core,analytics,app} to
+claude_sql.{domain,application,infrastructure,interfaces}; core is fully
+dissolved (Settings -> infrastructure.settings, models -> domain.models,
+provider ports -> domain.ports). Console script binds
+claude_sql.interfaces.cli.app:main. The evals and provenance planes are
+removed.
+
+### Feat
+
+- **v2**: hexagonal architecture — domain/application/infrastructure/interfaces (#159)
+
 ## v1.2.1 (2026-07-08)
 
 ### Refactor
