@@ -14,9 +14,9 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.analytics.terms_worker import run_terms
-from claude_sql.core.config import Settings
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.application.use_cases.terms import run_terms
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.settings import Settings
 from conftest import (
     _seed_subagent_stub,
     make_user_msg,

@@ -18,14 +18,14 @@ import duckdb
 import pytest
 from moto.server import ThreadedMotoServer
 
-from claude_sql.core.config import Settings
-from claude_sql.core.s3_source import (
+from claude_sql.infrastructure.duckdb_s3 import (
     S3_SECRET_NAME,
     configure_s3,
     is_s3_uri,
     settings_need_s3,
 )
-from claude_sql.core.sql_views import register_views
+from claude_sql.infrastructure.duckdb_views import register_views
+from claude_sql.infrastructure.settings import Settings
 
 _BUCKET = "claude-sessions"
 _PREFIX = "transcripts"
@@ -285,7 +285,7 @@ def test_read_s3_sessionstore_layout_end_to_end(moto_s3: dict[str, Any]) -> None
     con = duckdb.connect(":memory:")
     try:
         configure_s3(con, settings)
-        from claude_sql.core.sql_views import register_raw
+        from claude_sql.infrastructure.duckdb_views import register_raw
 
         register_raw(
             con,
@@ -322,7 +322,7 @@ def test_register_all_wires_s3(moto_s3: dict[str, Any]) -> None:
     settings = _s3_settings(moto_s3["endpoint"])
     con = duckdb.connect(":memory:")
     try:
-        from claude_sql.core.sql_views import register_all
+        from claude_sql.infrastructure.duckdb_views import register_all
 
         # skip_vss + no analytics: this corpus has no embeddings/parquet caches.
         register_all(con, settings=settings, include_analytics=False, skip_vss=True)

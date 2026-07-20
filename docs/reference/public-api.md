@@ -1,154 +1,311 @@
 # claude-sql · Public API
 
-`claude-sql` is a single package with five layer sub-packages (`core`, `analytics`, `evals`, `provenance`, `app`) under `src/claude_sql/`; each carries a docstring-only barrel `__init__.py` with no re-exports. The public surface below is the set of non-underscore symbols ranked by inbound cross-module import count across `src/claude_sql/**/*.py`; ties are broken alphabetically. The `claude-sql` distribution also ships a cyclopts CLI binary (`claude-sql = claude_sql.app.cli:main`, `pyproject.toml:53`); its command surface is documented in `reference/cli.md`. No HTTP routes exist, so no `## HTTP` section is rendered.
+`claude-sql` is a CLI-and-library tool. This page documents the importable Python surface after the v2 hexagonal reshape; the command-line surface lives in `reference/cli.md`. The one convenience re-export is `claude_sql.ClaudeSql`; the full port + domain surface is imported from `claude_sql.composition`, `claude_sql.application.ports`, and the `claude_sql.domain.*` modules. There is no HTTP surface — this is not a server.
 
-### Settings
+### ClaudeSql
 
 ```py
-class Settings(BaseSettings):
-    """Environment-driven settings for claude-sql.
-
-    All fields are overridable via env vars prefixed ``CLAUDE_SQL_`` (e.g.
-    ``CLAUDE_SQL_REGION=us-west-2``) or via ``.env`` in the working directory.
-    """
+class ClaudeSql:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        embedder: EmbeddingProvider | None = None,
+        config_root: str | Path | None = None,
+    ):
 ```
 
-Environment-driven settings model (env prefix `CLAUDE_SQL_`) that every package threads through; the dominant public type by inbound references.
-`src/claude_sql/core/config.py:126`
+The composition facade: lazily builds and caches a transcript reader and semantic-search port, and exposes a `query` convenience for ad-hoc SQL over the fully-registered corpus. This is the one importable entry point (`from claude_sql import ClaudeSql`).
+`src/claude_sql/composition.py:36`
 
-### iter_part_files
-
-```py
-def iter_part_files(target: Path) -> list[Path]:
-```
-
-Returns a sorted list of parquet files backing a sharded cache directory or a legacy single-file path.
-`src/claude_sql/core/parquet_shards.py:72`
-
-### write_part
+### render_turn_text
 
 ```py
-def write_part(target: Path, df: pl.DataFrame) -> Path:
-```
-
-Writes a DataFrame as a new shard in a sharded directory, or appends-and-rewrites the legacy single parquet file.
-`src/claude_sql/core/parquet_shards.py:87`
-
-### read_all
-
-```py
-def read_all(target: Path, *, dtypes: dict[str, Any] | None = None) -> pl.DataFrame | None:
-```
-
-Returns the union of all part files (or the legacy single file), or `None` when the cache is empty or missing.
-`src/claude_sql/core/parquet_shards.py:131`
-
-### classify_one
-
-```py
-async def classify_one(
-    client: Any,
-    model_id: str,
-    schema: dict,
-    text: str,
+def render_turn_text(
+    rows: Iterable[TranscriptRow],
     *,
-    max_tokens: int,
-    thinking_mode: str,
-    sem: asyncio.Semaphore | anyio.CapacityLimiter,
-    system: str | None = None,
-    pipeline: str = "classifier",
-) -> dict:
+    per_turn_chars: int = 8_000,
+    total_chars: int = 200_000,
+    truncation_notice: bool = False,
+) -> str:
 ```
 
-Runs one structured-output Bedrock classification call under a concurrency limiter, returning the parsed payload dict.
-`src/claude_sql/core/llm_shared.py:563`
+Pure, deterministic port of the downstream consumer's `_collapse` contract that folds raw message-envelope rows into one transcript line per message with inline `[tool_use:name]` / `[tool_result]` markers.
+`src/claude_sql/domain/transcript.py:287`
 
-### pipeline_cache_stats
+### TranscriptReaderPort
 
 ```py
-@contextmanager
-def pipeline_cache_stats(pipeline: str) -> Iterator[None]:
+@runtime_checkable
+class TranscriptReaderPort(Protocol):
 ```
 
-Context manager that resets, accumulates, then emits-and-clears Bedrock cache-token statistics for a named pipeline.
-`src/claude_sql/core/llm_shared.py:259`
+Port for reading assembled transcript text and session structure (per-session messages, `read_turn_text`, session bounds, session ids); the DuckDB connection and `read_json` glob are adapter state.
+`src/claude_sql/application/ports.py:78`
 
-### BedrockRefusalError
+### SessionSearchPort
 
 ```py
-class BedrockRefusalError(Exception):
-    """Bedrock declined to classify the input under its content policy.
-
-    Raised when the response has ``stop_reason == "refusal"`` and no
-    content blocks. Callers treat this as a terminal, non-retryable
-    outcome and can write a neutral placeholder row so the message is
-    not re-tried in every future run.
-    """
+@runtime_checkable
+class SessionSearchPort(Protocol):
 ```
 
-Terminal, non-retryable exception raised when Bedrock declines to classify input under its content policy.
-`src/claude_sql/core/llm_shared.py:490`
+Port for semantic top-k search over message embeddings, wrapping the `search` command's embed-query + cosine-kNN path.
+`src/claude_sql/application/ports.py:116`
 
-### loguru_before_sleep
+### VectorStorePort
 
 ```py
-def loguru_before_sleep(level: str = "WARNING") -> Callable[[RetryCallState], None]:
+@runtime_checkable
+class VectorStorePort(Protocol):
 ```
 
-Returns a tenacity `before_sleep` callback that logs retry attempts via loguru instead of stdlib logging.
-`src/claude_sql/core/logging_setup.py:53`
+Port for the LanceDB embeddings store read/write + kNN seam, preserving the empty-namespace gate (an absent table reports `0` rows / `None` identity rather than raising).
+`src/claude_sql/application/ports.py:133`
 
-### session_bounds
+### CheckpointPort
 
 ```py
-def session_bounds(
-    con: duckdb.DuckDBPyConnection,
+@runtime_checkable
+class CheckpointPort(Protocol):
+```
+
+Port for the per-`(session_id, pipeline)` processing watermark backed by the SQLite `state.db`; the staleness math stays in the domain.
+`src/claude_sql/application/ports.py:167`
+
+### RetryQueuePort
+
+```py
+@runtime_checkable
+class RetryQueuePort(Protocol):
+```
+
+Port for the durable retry queue of failed LLM units of work; the SQLite path and clock are adapter state and the exponential-backoff math is domain.
+`src/claude_sql/application/ports.py:194`
+
+### CachePort
+
+```py
+@runtime_checkable
+class CachePort(Protocol):
+```
+
+Port for the sharded-parquet artifact store of one worker cache, preserving the parquet-existence gate whereby views register only caches that exist.
+`src/claude_sql/application/ports.py:219`
+
+### ReaderPort
+
+```py
+@runtime_checkable
+class ReaderPort(Protocol):
+```
+
+Port for the DuckDB query seam with its register→write→rebind lifecycle made explicit, so use-cases that write mid-run re-bind views instead of reintroducing the analyze stale-connection bug.
+`src/claude_sql/application/ports.py:249`
+
+### Clock
+
+```py
+@runtime_checkable
+class Clock(Protocol):
+```
+
+Port over `datetime.now(UTC)` so checkpoint watermarks, retry backoff, and `classified_at` stamps are deterministic under test.
+`src/claude_sql/application/ports.py:64`
+
+### EmbeddingProvider
+
+```py
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+```
+
+Provider port that turns text into vectors (one adapter per backend), exposing `model_id` / `provider` / `dimension` identity plus async `embed_documents` and sync `embed_query`.
+`src/claude_sql/domain/ports.py:34`
+
+### LlmAnalyticsProvider
+
+```py
+@runtime_checkable
+class LlmAnalyticsProvider(Protocol):
+```
+
+Provider port for one structured-output classification call — a system prompt, a user prompt, and a Pydantic schema in; a validated instance out.
+`src/claude_sql/domain/ports.py:79`
+
+### SearchHit
+
+```py
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+```
+
+The typed row a `SessionSearchPort` returns: uuid, session_id, timestamp, role, snippet, and cosine similarity, so a use-case gets a typed value instead of a raw DataFrame row.
+`src/claude_sql/domain/retrieval.py:24`
+
+### SessionTextCorpus
+
+```py
+@dataclass(slots=True)
+class SessionTextCorpus:
+```
+
+An in-memory corpus of per-session timelines built with one glob scan; its `assemble` method renders one session as a single byte-stable transcript for the four LLM pipelines.
+`src/claude_sql/domain/transcript.py:112`
+
+### TranscriptRow
+
+```py
+@dataclass(slots=True)
+class TranscriptRow:
+```
+
+One raw message-envelope row (uuid, type, timestamp, message) — the message-grained input to `render_turn_text`.
+`src/claude_sql/domain/transcript.py:198`
+
+### PortResult
+
+```py
+type PortResult[T] = Result[T, DomainError]
+```
+
+The uniform result type crossing a port boundary: a `Success[T]` carries the value, a `Failure[DomainError]` carries a domain error.
+`src/claude_sql/application/ports.py:60`
+
+### build_reader
+
+```py
+def build_reader(
+    settings: Settings | None = None, *, config_root: str | Path | None = None
+) -> TranscriptReaderPort:
+```
+
+Construct a standalone `TranscriptReaderPort` adapter.
+`src/claude_sql/composition.py:125`
+
+### build_search
+
+```py
+def build_search(
+    settings: Settings | None = None, *, embedder: EmbeddingProvider | None = None
+) -> SessionSearchPort:
+```
+
+Construct a standalone `SessionSearchPort` adapter.
+`src/claude_sql/composition.py:134`
+
+### build_cache
+
+```py
+def build_cache(target: Path) -> CachePort:
+```
+
+Construct the default `CachePort` over a parquet cache `target`.
+`src/claude_sql/composition.py:143`
+
+### build_checkpoint
+
+```py
+def build_checkpoint(settings: Settings) -> CheckpointPort:
+```
+
+Construct the default `CheckpointPort` over the SQLite `state.db`.
+`src/claude_sql/composition.py:150`
+
+### build_retry_queue
+
+```py
+def build_retry_queue(settings: Settings) -> RetryQueuePort:
+```
+
+Construct the default `RetryQueuePort` over the SQLite `state.db`.
+`src/claude_sql/composition.py:157`
+
+### build_vector_store
+
+```py
+def build_vector_store(settings: Settings, *, dim: int | None = None) -> VectorStorePort:
+```
+
+Construct the default `VectorStorePort` over `settings.lance_uri`.
+`src/claude_sql/composition.py:164`
+
+### build_embedder
+
+```py
+def build_embedder(settings: Settings) -> EmbeddingProvider:
+```
+
+Return the `EmbeddingProvider` adapter selected by `settings.embedding_provider`, importing each backend's heavy dependency lazily inside its branch.
+`src/claude_sql/infrastructure/embedding/__init__.py:34`
+
+### estimate_cost
+
+```py
+def estimate_cost(
+    n_items: int,
+    avg_in_tokens: int,
+    avg_out_tokens: int,
+    pricing: tuple[float, float],
+) -> float:
+```
+
+Pure back-of-envelope dollar estimate for `n_items` classification calls given `(input_rate, output_rate)` in $/MTok — the arithmetic every `--dry-run` path uses.
+`src/claude_sql/domain/costs.py:21`
+
+### ensure_store_matches
+
+```py
+def ensure_store_matches(
     *,
-    since_days: int | None = None,
-    limit: int | None = None,
-) -> dict[str, tuple[datetime | None, datetime | None]]:
+    stored_model: str | None,
+    stored_dim: int | None,
+    expected_model: str,
+    expected_dim: int | None,
+) -> None:
 ```
 
-Returns `{session_id: (last_ts, transcript_mtime)}` for the requested time window, used to detect which sessions need reprocessing.
-`src/claude_sql/core/session_text.py:224`
+The fail-loud embedding provider/dimension guard: raises `EmbeddingProviderMismatch` when a Lance store's stamped `(model, dim)` differs from the active embedder's identity.
+`src/claude_sql/domain/embedding_guard.py:22`
 
-### iter_session_texts
+### classify_duckdb_error
 
 ```py
-def iter_session_texts(
-    con: duckdb.DuckDBPyConnection,
-    *,
+def classify_duckdb_error(exc: duckdb.Error) -> ClassifiedError:
+```
+
+Map a concrete `duckdb.Error` onto a stable `ClassifiedError` kind + exit code (parse 64, catalog 65, runtime 70).
+`src/claude_sql/infrastructure/duckdb_errors.py:18`
+
+### run_analyze
+
+```py
+def run_analyze(
     settings: Settings,
-    since_days: int | None = None,
+    *,
+    since_days: int | None = 30,
     limit: int | None = None,
-) -> Iterator[tuple[str, str]]:
+    dry_run: bool = True,
+    no_thinking: bool = False,
+    skip_ingest: bool = False,
+    skip_embed: bool = False,
+    skip_classify: bool = False,
+    skip_trajectory: bool = False,
+    skip_conflicts: bool = False,
+    skip_friction: bool = False,
+    skip_cluster: bool = False,
+    skip_community: bool = False,
+    skip_skills_sync: bool = False,
+    force_cluster: bool = False,
+    force_community: bool = False,
+    open_connection: Callable[..., duckdb.DuckDBPyConnection] | None = None,
+    refresh_fn: Callable[[duckdb.DuckDBPyConnection, Settings], None] | None = None,
+    rebind_fn: Callable[..., None] | None = None,
+) -> dict[str, Any]:
 ```
 
-Yields `(session_id, text)` newest-first for every session with at least one text block, from a single glob scan.
-`src/claude_sql/core/session_text.py:371`
-
-### claude_sql_home
-
-```py
-def claude_sql_home() -> Path:
-```
-
-Returns (creating on first call) the parent directory for every claude-sql derived cache, resolved per-platform from env vars.
-`src/claude_sql/core/home.py:51`
-
-### run_or_die
-
-```py
-def run_or_die(
-    fn: Any,
-    *args: Any,
-    fmt: OutputFormat | str = OutputFormat.AUTO,
-    **kwargs: Any,
-) -> Any:
-```
-
-Invokes a callable and translates DuckDB and input-validation errors into classified errors with matching process exit codes.
-`src/claude_sql/core/output.py:228`
+Run the full analytics pipeline end-to-end (embed → structure → LLM analytics), honoring `dry_run` on every spending stage.
+`src/claude_sql/application/analyze.py:99`
 
 ### register_all
 
@@ -162,245 +319,35 @@ def register_all(
 ) -> None:
 ```
 
-Registers raw views, derived views, VSS, analytics, and macros on a DuckDB connection in dependency order.
-`src/claude_sql/core/sql_views.py:2078`
+Register raw views, derived views, VSS, analytics, and macros in order against an open DuckDB connection — the stable full-registration entrypoint the facade's `query` uses.
+`src/claude_sql/infrastructure/duckdb_views.py:2285`
 
-### classify_sessions
-
-```py
-def classify_sessions(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
-```
-
-Classifies pending sessions and returns the count of successful classifications (or a plan dict in dry-run mode).
-`src/claude_sql/analytics/classify_worker.py:195`
-
-### detect_conflicts
+### DuckDbTranscriptReader
 
 ```py
-def detect_conflicts(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
+class DuckDbTranscriptReader:
+    def __init__(self, settings: Settings | None = None, *, config_root: str | Path | None = None):
 ```
 
-Detects stance conflicts per session and returns the count of sessions processed.
-`src/claude_sql/analytics/conflicts_worker.py:286`
+The DuckDB adapter implementing `TranscriptReaderPort`; the `read_json` glob triple is adapter state derived from `settings` or an explicit `config_root`.
+`src/claude_sql/infrastructure/transcript_reader.py:250`
 
-### detect_user_friction
+### DuckDbSessionSearch
 
 ```py
-def detect_user_friction(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
+class DuckDbSessionSearch:
+    def __init__(
+        self, settings: Settings | None = None, *, embedder: EmbeddingProvider | None = None
+    ):
 ```
 
-Classifies short user messages for friction signals across the session corpus.
-`src/claude_sql/analytics/friction_worker.py:655`
-
-### trajectory_messages
-
-```py
-def trajectory_messages(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    no_thinking: bool = False,
-) -> int | dict[str, Any]:
-```
-
-Computes per-session windowed sentiment and transition classifications and returns the count of windows written.
-`src/claude_sql/analytics/trajectory_worker.py:933`
-
-### run_clustering
-
-```py
-def run_clustering(settings: Settings, *, force: bool = False) -> dict[str, int]:
-```
-
-Runs UMAP plus HDBSCAN over the embeddings parquet and returns a counts summary.
-`src/claude_sql/analytics/cluster_worker.py:50`
-
-### run_communities
-
-```py
-def run_communities(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    force: bool = False,
-    gamma: float | None = None,
-    resolution: ResolutionLevel = "medium",
-) -> dict[str, int | float | str]:
-```
-
-Runs Leiden plus CPM community detection on session centroids and writes the primary parquet output.
-`src/claude_sql/analytics/community_worker.py:472`
-
-### neighbors_of
-
-```py
-def neighbors_of(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    session_id: str,
-    *,
-    top_k: int = 15,
-) -> pl.DataFrame:
-```
-
-Returns the top-k cosine neighbors of a session in centroid space, bypassing Leiden.
-`src/claude_sql/analytics/community_worker.py:421`
-
-### run_terms
-
-```py
-def run_terms(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    *,
-    force: bool = False,
-) -> dict[str, int]:
-```
-
-Computes c-TF-IDF top terms per cluster and writes the parquet output.
-`src/claude_sql/analytics/terms_worker.py:29`
-
-### embed_query
-
-```py
-def embed_query(text: str, *, settings: Settings) -> list[float]:
-```
-
-Embeds a single query string for HNSW nearest-neighbor search, forcing a float embedding vector.
-`src/claude_sql/analytics/embed_worker.py:334`
-
-### run_backfill
-
-```py
-async def run_backfill(
-    *,
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    since_days: int | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-) -> int | dict[str, Any]:
-```
-
-Discovers unembedded messages, embeds them, and appends the vectors to the embeddings parquet.
-`src/claude_sql/analytics/embed_worker.py:365`
-
-### Judge
-
-```py
-@dataclass(frozen=True)
-class Judge:
-    """One Bedrock foundation model wired into the judge panel."""
-```
-
-Frozen dataclass describing one Bedrock foundation model wired into the eval judge panel.
-`src/claude_sql/evals/judges.py:24`
-
-### resolve
-
-```py
-def resolve(name: str) -> Judge:
-```
-
-Resolves a judge shortname or model ID to a `Judge`, raising `KeyError` with the full catalog on an unknown name.
-`src/claude_sql/evals/judges.py:198`
-
-### freeze
-
-```py
-def freeze(
-    rubric_path: Path,
-    panel_shortnames: tuple[str, ...],
-    embed_model_id: str = "global.cohere.embed-v4:0",
-    session_scope: SessionScope | None = None,
-    seed: int = 42,
-    repo: Path | None = None,
-) -> Study:
-```
-
-Creates and persists a self-contained study manifest (rubric copy plus panel and scope) and returns the `Study`.
-`src/claude_sql/evals/freeze.py:115`
-
-### replay
-
-```py
-def replay(manifest_sha: str) -> Study:
-```
-
-Loads a previously-frozen study by its manifest SHA.
-`src/claude_sql/evals/freeze.py:151`
-
-### resolve_commit_to_transcript
-
-```py
-def resolve_commit_to_transcript(
-    commit_sha: str,
-    *,
-    repo: Path | None = None,
-    all_sources: bool = False,
-) -> TranscriptBinding:
-```
-
-Resolves a commit SHA to its bound transcript via the RFC 0001 trailer-first, note-fallback precedence.
-`src/claude_sql/provenance/binding.py:674`
-
-### render_markdown
-
-```py
-def render_markdown(sheet: dict[str, Any], metadata: dict[str, Any]) -> str:
-```
-
-Renders a structured PR review-sheet dict into the canonical Markdown shape.
-`src/claude_sql/provenance/review_sheet_render.py:68`
-
-### generate_review_sheet
-
-```py
-def generate_review_sheet(
-    con: duckdb.DuckDBPyConnection | None,
-    settings: Settings,
-    *,
-    commit_sha: str,
-    transcript_uri_override: str | None = None,
-    dry_run: bool = True,
-    no_thinking: bool = False,
-) -> dict[str, Any]:
-```
-
-Produces a PR review sheet for a commit SHA by resolving its bound transcript and running an LLM pass.
-`src/claude_sql/provenance/review_sheet_worker.py:342`
+The DuckDB + Lance adapter implementing `SessionSearchPort`; the embedder and bound `message_embeddings` view are adapter state opened lazily on first use.
+`src/claude_sql/infrastructure/session_search.py:38`
 
 ## See also
 
-- [claude-sql · Contract map](../insights/contract-map.md) — 13 shared source files
-- [claude-sql · Module map](../architecture/module-map.md) — 13 shared source files
-- [claude-sql · Processes](../behavior/processes.md) — 13 shared source files
-- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 10 shared source files
-- [claude-sql · Tech debt](../insights/tech-debt.md) — 10 shared source files
+- [claude-sql · Contract map](../insights/contract-map.md) — 9 shared source citations
+- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 8 shared source citations
+- [claude-sql · Module map](../architecture/module-map.md) — 6 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 5 shared source citations
+- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 4 shared source citations

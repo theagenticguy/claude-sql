@@ -99,3 +99,9 @@ lessons before starting work.
 - 2026-05-08 — Stack-modernization session (session-638df1 → chore/stack-modernization): 3 new lessons on ty strict mode, hdbscan as the lone 3.14 blocker, and the lefthook first-push `@{push}` gotcha.
 - 2026-05-08 — DuckDB perf + LLM prompt-quality session (sessions session-f988cf → fix/llm-prompt-quality): 5 new lessons on Bedrock concurrency, tokenizer gotchas, CRIS resolution, XML prompting, and anyio patterns.
 - 2026-05-07 — Initial perf optimization: 4 lessons on DuckDB ATTACH, memory_limit, list_avg semantics, and sharded-cache migration strategy.
+
+## session-4fb0fd (2026-07-20) — v2 hexagonal reshape
+- [best-practices/alias-idiom-shim-for-monkeypatched-modules.md](solutions/best-practices/alias-idiom-shim-for-monkeypatched-modules.md) — sys.modules swap when tests patch module internals
+- [best-practices/hexagonal-reshape-wave-order.md](solutions/best-practices/hexagonal-reshape-wave-order.md) — wave order + string-coupled surface checklist for live-codebase reshapes
+- [api-patterns/returns-result-under-ty-strict.md](solutions/api-patterns/returns-result-under-ty-strict.md) — the plugin-free returns subset; ban .bind; no dishka in lazy CLIs
+- [api-patterns/duckdb-partdir-glob-union-by-insert.md](solutions/api-patterns/duckdb-partdir-glob-union-by-insert.md) — INSERT BY NAME for flat+part-dir glob union; no brace-globs

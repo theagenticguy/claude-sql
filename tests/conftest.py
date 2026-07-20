@@ -27,8 +27,8 @@ from unittest.mock import MagicMock
 import duckdb
 import pytest
 
-from claude_sql.core.config import Settings
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.settings import Settings
 
 # ---------------------------------------------------------------------------
 # JSONL fixture builders

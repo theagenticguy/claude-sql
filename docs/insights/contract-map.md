@@ -1,328 +1,130 @@
 # claude-sql · Contract map
 
-`claude-sql` is one package with five layer sub-packages (the `claude_sql.*` layers) laid out as a strict import DAG: `core` (L0) is depended on by the three independent siblings `analytics`, `evals`, `provenance` (L1), which are in turn depended on by `app` (L2). The DAG is enforced in CI by import-linter (`pyproject.toml:261-280`: a `layers` contract plus an `independence` contract over the three siblings).
+When one module hands something to another, this file records what the receiver
+is really expecting — beyond what the type signature alone says.
 
-A **contract** in this codebase is one of two things:
+**What counts as a contract here.** claude-sql is statically typed (`ty` strict)
+and organized as a strict hexagon (`interfaces > application > infrastructure >
+domain`, one import-linter layers contract). A "contract" is any declaration in
+one module that ≥ 1 other module depends on for its shape. In this codebase they
+come in five kinds, all first-class:
 
-1. A type, schema, or constant declared in `claude_sql.core` (the L0 producer) and imported by a downstream layer — the layered DAG funnels almost every cross-layer dependency through core.
-2. A runtime **wire format** that crosses a process or storage boundary: the Bedrock `invoke_model` request body, the on-disk parquet shard column schema, the LanceDB table schema, the git trailer / git-note binding (RFC 0001), and the CLI's stable exit codes. These are contracts even when one side is an LLM, a file, or a git subprocess rather than a Python import.
+1. **Port Protocols** — `@runtime_checkable` `Protocol` classes in
+   `application/ports.py` and `domain/ports.py`. These are the seams between a
+   use-case and the outside world; concrete adapters in `infrastructure`
+   implement them structurally and the composition root injects them.
+2. **Structured-output schemas** — pydantic v2 models in `domain/models.py` that
+   define the LLM classification wire shape and the parquet cache columns.
+3. **The Lance vector schema** — the fixed-size `Array(Float32, dim)` embeddings
+   table shape plus its `(model, dim)` identity stamp (the dimension contract).
+4. **SQLite DDL** — the `session_checkpoint` and `retry_queue` table shapes that
+   back the checkpoint and retry-queue ports.
+5. **The consumer collapse byte-parity contract** — `render_turn_text` in
+   `domain/transcript.py`, an *external* contract with downstream consumers,
+   pinned byte-for-byte by `tests/test_collapse_parity.py`; and the
+   **exit-code wire contract** (`EXIT_CODES`) that agents parse from the process.
 
-The most load-bearing and drift-prone contracts here are the ones where the same shape is asserted in three independent places — a pydantic model, a polars parquet schema, and a hand-maintained DuckDB column dict — and nothing but a CI test keeps them aligned. Those are called out under Drift risk.
+Contracts are ordered by consumer count descending. Twelve get a full H2; the
+rest are one-liners under `## Other contracts`.
 
-Contracts are ordered below by consumer count, descending. Overflow beyond the top 12 is in `## Other contracts`.
+## `PortResult[T]` — the uniform result type crossing every port boundary
 
-## Bedrock `output_config.format` request body
-
-The structured-output envelope every LLM worker sends to Bedrock `invoke_model`. The producer builds one body shape; five workers feed it a different `*_SCHEMA`.
-
-**Producer:** `src/claude_sql/core/llm_shared.py:441-448` (`_invoke_structured_output` builds the `body` dict).
+**Producer:** `src/claude_sql/application/ports.py:60`
 
 **Consumer(s):**
-- `src/claude_sql/analytics/classify_worker.py:109` — passes `SESSION_CLASSIFICATION_SCHEMA`.
-- `src/claude_sql/analytics/trajectory_worker.py:637` — passes `TRAJECTORY_ARRAY_SCHEMA`.
-- `src/claude_sql/analytics/conflicts_worker.py:191` — passes `SESSION_CONFLICTS_SCHEMA`.
-- `src/claude_sql/analytics/friction_worker.py:554` — passes `USER_FRICTION_SCHEMA`.
-- `src/claude_sql/provenance/review_sheet_worker.py:430` — passes `PR_REVIEW_SHEET_SCHEMA`.
+- `src/claude_sql/application/use_cases/__init__.py` — re-exports the port surface for every use-case.
+- `src/claude_sql/application/analyze.py` — the 10-stage pipeline threads results between stages.
+- `src/claude_sql/application/use_cases/embed.py`, `classify.py`, `trajectory.py`, `conflicts.py`, `friction.py`, `cluster.py`, `ingest.py` — every use-case that names a port return.
+- `src/claude_sql/domain/errors.py:37` — declares `DomainError`, the `E` half this type is parameterized over.
 
 **Shape:**
 ```python
-body: dict[str, Any] = {
-    "anthropic_version": "bedrock-2023-05-31",
-    "max_tokens": max_tokens,
-    "output_config": {
-        "format": {"type": "json_schema", "schema": schema},
-    },
-    "messages": [{"role": "user", "content": user_text}],
-}
+#: The uniform result type crossing a port boundary. A ``Success[T]`` carries
+#: the value; a ``Failure[DomainError]`` carries a domain error. See CLAUDE.md
+#: "returns discipline": use ``Success``/``Failure``, ``is_successful``,
+#: ``.unwrap``, ``.map``, ``.alt``, and ``match`` narrowing ONLY — never
+#: ``.bind()``, ``@safe``, ``flow``, ``pipe``, or HKT features (they require the
+#: mypy plugin and hard-error under ty).
+type PortResult[T] = Result[T, DomainError]
 ```
-The `schema` value must be a flattened JSON Schema Draft 2020-12 *subset*: no `$ref`/`$defs`, `additionalProperties: false` on every object, and no numeric/string/array range constraints (`_bedrock_schema` strips these, `src/claude_sql/core/schemas.py:39-96`).
 
 **Assumptions consumers make:**
-- The body uses `output_config.format`, never `tool_use`/`tool_choice`; tests assert `"tool_choice" not in body` (`tests/test_v2_analytics.py:123`).
-- `thinking` is added as a sibling key only when `thinking_mode == "adaptive"` (`src/claude_sql/core/llm_shared.py:470-471`); workers assume Bedrock accepts thinking combined with `output_config` and expose a `disabled` escape hatch (`src/claude_sql/core/config.py:212`).
-- The response is unwrapped by `_parse_structured_payload`, which assumes one of four observed envelope shapes and raises `RuntimeError` otherwise (`src/claude_sql/core/llm_shared.py:500-516`); a `stop_reason == "refusal"` is a terminal non-retryable outcome (`src/claude_sql/core/llm_shared.py:490-518`).
+- The error arm is always a `DomainError` subclass, never a raw `Exception` — so a `Failure` match can rely on the domain error hierarchy (`src/claude_sql/domain/errors.py:37-45`).
+- Only the `returns` constrained subset is used (`Success`/`Failure`/`is_successful`/`.unwrap`/`.map`/`.alt`/`match`); `.bind()`, `@safe`, `flow`, `pipe`, and HKT features are forbidden because they require the mypy plugin and hard-error under `ty` (`src/claude_sql/application/ports.py:54-60`).
 
-**Drift risk:** Bedrock's accepted JSON Schema subset is undocumented and has narrowed before (range constraints now rejected); a new pydantic `Field` constraint that `_bedrock_schema` does not strip would 400 at runtime for whichever worker owns that schema. Mitigation: extend the strip lists in `_flatten` (`schemas.py:82-92`) and keep the per-schema subset tests in `tests/test_schemas.py` / `tests/test_review_sheet_worker.py:49-61` green.
+**Drift risk:** If an adapter raises a transport-specific exception (boto3, duckdb) instead of wrapping it in a `DomainError`, the `Failure[DomainError]` guarantee silently breaks and callers matching on the error arm miss it. Mitigation: adapters catch their transport exceptions and re-raise as a `DomainError` subclass at the port boundary, as `errors.py:44` documents.
 
-## Sharded parquet I/O API (`parquet_shards`)
+## `EmbeddingProvider` — the pluggable text→vector port
 
-The append-by-part / read-the-union cache contract shared by every analytics worker that persists rows, and by the CLI's `cache` subcommands.
-
-**Producer:** `src/claude_sql/core/parquet_shards.py:87-242` (`write_part`, `read_all`, `iter_part_files`, `replace_sessions`, `count_rows`).
+**Producer:** `src/claude_sql/domain/ports.py:33`
 
 **Consumer(s):**
-- `src/claude_sql/analytics/classify_worker.py:35` — `read_all`, `write_part`.
-- `src/claude_sql/analytics/conflicts_worker.py:53` — `iter_part_files`, `read_all`, `write_part`.
-- `src/claude_sql/analytics/trajectory_worker.py:54` — `iter_part_files`, `replace_sessions`, `write_part`.
-- `src/claude_sql/analytics/ingest.py:53` — `iter_part_files`, `write_part`.
-- `src/claude_sql/core/sql_views.py:1805` — `iter_part_files` (the `_parquet_is_populated` gate).
-- `src/claude_sql/app/cli.py:83,598,1310` — `iter_part_files` (cache info/migrate subcommands).
+- `src/claude_sql/application/use_cases/embed.py:31` — the backfill use-case reads `model_id`/`dimension` to stamp rows and `embed_documents` to vectorize.
+- `src/claude_sql/infrastructure/session_search.py` — the search adapter calls `embed_query` on the hot path.
+- `src/claude_sql/infrastructure/embedding/cohere_bedrock.py`, `ollama.py`, `onnx_bge.py` — the three concrete adapters implementing it.
+- `src/claude_sql/composition.py:135` — `build_search` injects an `EmbeddingProvider`.
+- `src/claude_sql/infrastructure/embedding/__init__.py:26` — `build_embedder` factory plus the `ensure_store_matches` guard.
 
 **Shape:**
 ```python
-def write_part(target: Path, df: pl.DataFrame) -> Path: ...
-def read_all(target: Path, *, dtypes: dict[str, Any] | None = None) -> pl.DataFrame | None: ...
-def iter_part_files(target: Path) -> list[Path]: ...
-def replace_sessions(target: Path, *, key_column: str, session_ids: Iterable[str]) -> int: ...
-def count_rows(target: Path) -> int: ...
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    @property
+    def model_id(self) -> str: ...
+    @property
+    def provider(self) -> str: ...
+    @property
+    def dimension(self) -> int: ...
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_query(self, text: str) -> list[float]: ...
 ```
 
 **Assumptions consumers make:**
-- A `target` `Path` is overloaded: a directory (or a non-`.parquet` path that does not yet exist) is a sharded cache, an existing `*.parquet` file is the legacy single-file shape (`src/claude_sql/core/parquet_shards.py:54-69`). Workers pass `Settings.*_parquet_path` and never branch on which mode is live.
-- `read_all` returns `None` for an empty/missing cache; consumers null-check before reading columns (e.g. `src/claude_sql/analytics/conflicts_worker.py:146-148`).
-- `iter_part_files` is sorted, and the sort is chronological because part names are `part-<time.time_ns()>.parquet` (`src/claude_sql/core/parquet_shards.py:118`); the analytics views rely on this when applying the `classified_at DESC` QUALIFY dedup (`src/claude_sql/core/sql_views.py:1921-1928`).
-- `write_part` does not dedup; trajectory's at-least-once re-scoring depends on calling `replace_sessions(key_column="session_id", ...)` first to drop prior rows (`src/claude_sql/analytics/trajectory_worker.py:896-903`).
+- `model_id` is globally unique across providers, so it doubles as the provider discriminator in the store guard (`src/claude_sql/domain/ports.py:45-52`).
+- `dimension` is the single contract source for the Lance schema, the DuckDB `FLOAT[dim]` view cast, and the query-time cast — it replaced the free `Settings.output_dimension` (`src/claude_sql/domain/ports.py:59-64`).
+- `embed_documents` preserves input order, returns `[]` on empty input, and returns float vectors even when the backend stores quantized — the adapter owns batching, concurrency, retry, and float-widening (`src/claude_sql/domain/ports.py:66-70`).
+- `embed_query` is synchronous and returns a vector of length `== self.dimension` (`src/claude_sql/domain/ports.py:72-75`).
+- The document/query asymmetry is handled inside each adapter, not by a parameter — Cohere uses distinct input types, BGE prepends a query prefix, Ollama uses neither (`src/claude_sql/domain/ports.py:38-43`).
 
-**Drift risk:** A worker that writes a `Settings.*_parquet_path` ending in `.parquet` silently takes the legacy read-then-rewrite branch (O(file) per chunk) instead of the sharded append, reintroducing the IO cost the module was built to remove. Mitigation: keep new cache defaults directory-shaped in `config.py` and assert sharded layout in worker tests.
+**Drift risk:** A new adapter that returns a vector whose width differs from its own reported `dimension` corrupts the Lance fixed-size column at write and the `FLOAT[dim]` cast at read. Mitigation: `dimension` is read back and enforced by `ensure_store_matches` on every bind (see the Lance vector schema contract below).
 
-## CLI output format + exit-code contract
+## `LlmAnalyticsProvider` — the structured-output classification port
 
-The agent-facing surface: how every subcommand renders results and which integer it exits with. Agents pattern-match on these instead of parsing tracebacks.
-
-**Producer:** `src/claude_sql/core/output.py:26-57` (`OutputFormat`, `EXIT_CODES`) and `output.py:125-141` (`ClassifiedError`).
+**Producer:** `src/claude_sql/domain/ports.py:78`
 
 **Consumer(s):**
-- `src/claude_sql/app/cli.py:69-72` — imports `EXIT_CODES`, `ClassifiedError`, `OutputFormat`; used in every subcommand (e.g. `cli.py:692,1537,2877-2899`).
-- `src/claude_sql/core/output.py:228-254` — `run_or_die` maps `InputValidationError`/`duckdb.Error` to `EXIT_CODES` and `sys.exit`.
-- RFC 0001 reader semantics reuse these codes: exit 2 for "no binding", exit 70 for trailer/note disagreement (`docs/rfc/0001-transcript-pr-binding.md:425-429`), realized at `src/claude_sql/app/cli.py:2879-2899`.
+- `src/claude_sql/application/use_cases/trajectory.py:549` — calls `provider.classify_structured(...)` per chunk.
+- `src/claude_sql/infrastructure/llm_analytics/sonnet_bedrock.py` — the default Sonnet-on-Bedrock adapter.
+- `src/claude_sql/infrastructure/llm_analytics/strands_luna.py` — the opt-in Luna/Strands adapter.
+- `src/claude_sql/infrastructure/llm_analytics/__init__.py` — the `build_*` factory.
 
 **Shape:**
 ```python
-class OutputFormat(StrEnum):
-    AUTO = "auto"
-    TABLE = "table"
-    JSON = "json"
-    NDJSON = "ndjson"
-    CSV = "csv"
-
-EXIT_CODES: dict[str, int] = {
-    "ok": 0,
-    "no_embeddings": 2,
-    "invalid_input": 64,   # malformed user-supplied flags (e.g. --glob)
-    "parse_error": 64,     # malformed SQL
-    "catalog_error": 65,   # unknown view/macro/column
-    "runtime_error": 70,   # everything else from duckdb.Error
-    "duckdb_missing": 127, # system `duckdb` binary not on PATH
-}
+@runtime_checkable
+class LlmAnalyticsProvider(Protocol):
+    @property
+    def provider(self) -> str: ...
+    async def classify_structured(
+        self, *, system: str, prompt: str, schema: type[SchemaT]
+    ) -> SchemaT: ...
 ```
 
 **Assumptions consumers make:**
-- `OutputFormat.AUTO` resolves to `TABLE` on a TTY and `JSON` otherwise (`src/claude_sql/core/output.py:60-65`); subcommands assume piped/agent invocation gets machine-readable output with no flag.
-- Markdown is deliberately *not* in the enum; only `review-sheet` emits prose and owns a separate `RenderFormat` (`src/claude_sql/core/output.py:33-38`, `src/claude_sql/app/cli.py:2913-2933`).
-- `invalid_input` and `parse_error` share exit code 64 — a consumer cannot distinguish them by exit code alone and must read the `error.kind` field of the JSON payload (`src/claude_sql/core/output.py:134-141`).
+- The return value is a validated instance of the passed `schema` (bound to `BaseModel`), so the caller skips its own validation (`src/claude_sql/domain/ports.py:95-98`, `SchemaT` at `:30`).
+- `system` is byte-stable and cacheable (task framing); `prompt` is the per-call payload — the split lets the adapter drive prompt caching (`src/claude_sql/domain/ports.py:100-103`).
+- On failure the adapter raises the terminal signal: `BedrockRefusalError` for a Sonnet content-policy refusal, or `LlmAnalyticsUnavailable` for a Luna transport/structured-output failure — the caller treats these as terminal, not retryable (`src/claude_sql/domain/ports.py:103-106`).
 
-**Drift risk:** Adding a new format to `OutputFormat` lights it up on every subcommand's `--format` even if only one command can produce it; the docstring at `output.py:33-38` records this as the reason markdown stays out. Mitigation: keep one-off render modes in a command-local enum, not the shared one.
+**Drift risk:** If an adapter swallows a refusal and returns an empty/placeholder schema instance instead of raising, the trajectory worker's "stamp neutral placeholder + clear retry queue" path never fires and the unit cycles forever. Mitigation: the refusal/unavailable exceptions are part of the contract (`errors.py:48-106`); the worker matches on them.
 
-## `VIEW_SCHEMA` — static v1 view column catalog
+## The Lance embeddings vector schema and the dimension contract
 
-The hand-maintained source of truth for the 18 transcript-derived view schemas, traded against catalog introspection for a sub-50ms `schema` command.
-
-**Producer:** `src/claude_sql/core/sql_views.py:116-287` (`VIEW_SCHEMA`).
+**Producer:** `src/claude_sql/infrastructure/lance_store.py:65` (`lance_schema(dim)`), with the identity stamp read back at `:245` (`table_identity`).
 
 **Consumer(s):**
-- `src/claude_sql/app/cli.py:88-89,961,967` — the `schema` subcommand renders `VIEW_SCHEMA` for both JSON and table output.
-- `tests/test_turn_window.py:23,339` — drift test asserts `turn_window` is present with the right columns.
-- `tests/test_sql_views.py` (`test_view_schema_matches_describe_inline`, referenced at `sql_views.py:111-115`) — registers each v1 view over the fixture corpus, runs inline `DESCRIBE`, and asserts column-level equality with this dict.
-
-**Shape (excerpt — `sessions`; full dict covers 18 views):**
-```python
-VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
-    "sessions": (
-        ("session_id", "VARCHAR"),
-        ("cwd", "VARCHAR"),
-        ("git_branch", "VARCHAR"),
-        ("started_at", "TIMESTAMP"),
-        ("ended_at", "TIMESTAMP"),
-        ("assistant_messages", "BIGINT"),
-        ("record_count", "BIGINT"),
-        ("transcript_path", "VARCHAR"),
-    ),
-    # ... messages, content_blocks, messages_text, turn_window, tool_calls,
-    #     tool_results, todo_events, todo_state_current, subagent_spawns,
-    #     task_creations, task_updates, tasks_state_current, skill_invocations,
-    #     subagent_sessions, subagent_messages
-}
-```
-
-**Assumptions consumers make:**
-- Only v1 views appear; v2 analytics views are intentionally omitted because their schema lives in parquet metadata (`src/claude_sql/core/sql_views.py:105-109`). The `schema` command thus advertises v1 columns even on a system with no analytics parquets.
-- The dict order is the registration order in `register_views`; the table renderer at `cli.py:967` iterates it directly.
-- Every column listed must also appear in `_RAW_EVENT_COLUMNS` (the strict `read_json` projection at `sql_views.py:438-449`) or it silently NULLs — the projection filter is a second, coupled contract (`sql_views.py:401-414`).
-
-**Drift risk:** Editing a view's DDL without updating `VIEW_SCHEMA` makes the `schema` command lie to agents; a dropped top-level field in `_RAW_EVENT_COLUMNS` makes a column silently NULL. Both are caught by `test_view_schema_matches_describe_inline` as a hard CI failure (`sql_views.py:111-115`). No mitigation beyond keeping that test green.
-
-## `MACRO_SIGNATURES` — static macro parameter catalog
-
-Parameter names for all 21 macros, kept static because DuckDB returns NULL `parameters` for table macros and cannot be introspected at runtime.
-
-**Producer:** `src/claude_sql/core/sql_views.py:355-376` (`MACRO_SIGNATURES`).
-
-**Consumer(s):**
-- `src/claude_sql/app/cli.py:87,963,972` — `schema` subcommand emits `{"name": n, "params": list(p)}` per macro.
-- `src/claude_sql/core/sql_views.py:2182` — `list_macros` joins the live catalog against this dict to recover params.
-- `tests/test_sql_views.py` (`test_macro_signatures_match_ddl`, referenced at `sql_views.py:349-354`) — regex-parses the `CREATE OR REPLACE MACRO <name>(<args>)` strings out of `register_macros` and asserts equality.
-
-**Shape (excerpt; full dict has 21 entries):**
-```python
-MACRO_SIGNATURES: dict[str, tuple[str, ...]] = {
-    "ago": ("interval_text",),
-    "model_used": ("sid",),
-    "cost_estimate": ("sid",),
-    "tool_rank": ("last_n_days",),
-    "semantic_search": ("query_vec", "k"),
-    "sentiment_arc": ("sid",),
-    "friction_examples": ("label_name", "n"),
-    "canonical_uuid_resolve": (),
-    # ... 13 more
-}
-```
-
-**Assumptions consumers make:**
-- `list_macros` returns an empty params tuple for any macro absent from this dict (`src/claude_sql/core/sql_views.py:2157-2182`); a new macro registered without a `MACRO_SIGNATURES` entry shows blank params rather than erroring.
-- `MACRO_NAMES` (`sql_views.py:314-336`), `MACRO_SIGNATURES`, and `_ANALYTICS_MACRO_REQUIREMENTS` (`sql_views.py:1133-1149`) must list the same analytics-macro names; the docstring at `sql_views.py:1129-1132` notes adding a macro means touching all three.
-
-**Drift risk:** Renaming a macro arg in the DDL without updating `MACRO_SIGNATURES` makes the `schema` command misreport the call signature to agents. Mitigation: the regex drift test `test_macro_signatures_match_ddl` (`sql_views.py:349-354`) fails CI on mismatch.
-
-## `SessionClassification` — per-session classifier schema
-
-One row per session: autonomy tier, work category, success, goal, confidence.
-
-**Producer:** `src/claude_sql/core/schemas.py:99-167` (model) and `schemas.py:170` (`SESSION_CLASSIFICATION_SCHEMA`).
-
-**Consumer(s):**
-- `src/claude_sql/analytics/classify_worker.py:36,109` — sends the flattened schema to Bedrock and builds the parquet rows.
-- `src/claude_sql/core/sql_views.py:1894-1895` — the `session_classifications` analytics view adds `autonomy`/`success_outcome`/`category` aliases over these columns; `session_goals` (`sql_views.py:1996-1998`) and `work_mix`/`autonomy_trend`/`success_rate_by_work` macros (`sql_views.py:1399-1442`) bind to `autonomy_tier`/`work_category`/`success`/`goal`.
-
-**Shape:**
-```python
-class SessionClassification(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    autonomy_tier: Literal["manual", "assisted", "autonomous"] = Field(...)
-    work_category: Literal[
-        "sde", "admin", "strategy_business", "events",
-        "thought_leadership", "other",
-    ] = Field(...)
-    success: Literal["success", "partial", "failure", "unknown"] = Field(...)
-    goal: str = Field(..., min_length=1, max_length=280)
-    confidence: float = Field(..., ge=0.0, le=1.0)
-```
-
-**Assumptions consumers make:**
-- The classify worker materializes a parquet row with exactly `session_id, autonomy_tier, work_category, success, goal, confidence, classified_at` (`src/claude_sql/analytics/classify_worker.py:138-160`) — it adds `session_id` + `classified_at` and drops nothing; the DuckDB macros assume those column names verbatim.
-- The `work_mix` / `success_rate_by_work` macros assume the `Literal` label sets above are exhaustive (e.g. `WHERE success = 'failure'` at `sql_views.py:1434`); a new label appears in counts but no macro special-cases it.
-
-**Drift risk:** The pydantic model, the worker's parquet `schema=` dict, and the DuckDB macro column references are three separate assertions of one shape with no shared constant. Adding a field to the model without adding it to `classify_worker.py:152-160` drops it before it reaches parquet. Mitigation: change all three together; `tests/test_v2_analytics.py:122` pins the Bedrock schema half.
-
-## `TrajectoryArrayResult` / `TrajectoryWindow` — windowed sentiment schema
-
-Sonnet returns an array of per-window turn-pair classifications; the host verifies completeness by echoing `(prev_uuid, curr_uuid)`.
-
-**Producer:** `src/claude_sql/core/schemas.py:173-263` (`TrajectoryWindow`), `schemas.py:266-286` (`TrajectoryArrayResult`), `schemas.py:289` (`TRAJECTORY_ARRAY_SCHEMA`).
-
-**Consumer(s):**
-- `src/claude_sql/analytics/trajectory_worker.py:55,637` — sends the array schema, echoes `(prev_uuid, curr_uuid)` keys (`trajectory_worker.py:656`), retries on missing windows, stamps neutral placeholders on persistent misses.
-- `src/claude_sql/core/sql_views.py:1903` — `message_trajectory` view adds `sentiment`/`transition` aliases; `sentiment_arc` macro joins on `mt.curr_uuid` (`sql_views.py:1513`).
-
-**Shape:**
-```python
-class TrajectoryWindow(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    prev_uuid: str | None = Field(...)
-    curr_uuid: str = Field(..., min_length=1)
-    prev_sentiment: Literal["negative", "neutral", "positive"] | None = Field(...)
-    curr_sentiment: Literal["negative", "neutral", "positive"] = Field(...)
-    delta: float | None = Field(...)
-    is_transition: bool = Field(...)
-    transition_kind: Literal[
-        "frustration_spike", "resolution", "reset",
-        "drift", "clarification", "none",
-    ] = Field(...)
-    confidence: float = Field(..., ge=0.0, le=1.0)
-
-class TrajectoryArrayResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    windows: list[TrajectoryWindow] = Field(...)
-```
-
-**Assumptions consumers make:**
-- `curr_uuid` must match exactly one `curr_uuid` supplied in the request `<window>` payload; the worker keys returned windows on `(prev_uuid, curr_uuid)` to detect drops (`src/claude_sql/analytics/trajectory_worker.py:656`).
-- The parquet row is `session_id, prev_uuid, curr_uuid, prev_sentiment, curr_sentiment, delta, is_transition, transition_kind, confidence, classified_at` (`src/claude_sql/analytics/trajectory_worker.py:590-601`); the worker assumes `delta` widens from the model's integer-encoded `{-2..2}` into `pl.Float64`.
-- The `sentiment_arc` macro joins `messages.uuid` to `message_trajectory.curr_uuid` (the per-window anchor, not the old per-message `uuid`) — assumes the v1.0 windowed rewrite happened (`src/claude_sql/core/sql_views.py:1500-1516`).
-
-**Drift risk:** Read-side dedup keys on `(session_id, prev_uuid, curr_uuid)` with `classified_at DESC` (`sql_views.py:1921-1928`); if a future write path or legacy shard lands rows without `classified_at`, the QUALIFY is dropped and duplicate windows leak into `sentiment_arc`. Mitigation: keep the writer-side `replace_sessions` call and the read-side QUALIFY both in place.
-
-## `ConflictsResult` / `ConflictPair` — stance-conflict schema
-
-Zero or more pair-keyed stance conflicts per session; an empty list writes zero rows.
-
-**Producer:** `src/claude_sql/core/schemas.py:292-376` (`ConflictPair`), `schemas.py:379-400` (`ConflictsResult`), `schemas.py:403` (`SESSION_CONFLICTS_SCHEMA`).
-
-**Consumer(s):**
-- `src/claude_sql/analytics/conflicts_worker.py:54,191,225-249` — sends the schema, builds one parquet row per pair.
-- `src/claude_sql/core/sql_views.py:1910` — `session_conflicts` view (no projection aliases); `conflicts_summary` view counts rows per session (`sql_views.py:2015-2019`).
-
-**Shape:**
-```python
-class ConflictPair(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    turn_a_uuid: str = Field(..., min_length=1, max_length=64)
-    turn_b_uuid: str = Field(..., min_length=1, max_length=64)
-    conflict_kind: Literal["disagreement", "correction", "reversal", "impasse"] = Field(...)
-    severity: Literal["low", "medium", "high"] = Field(...)
-    agent_position: str = Field(..., min_length=1, max_length=280)
-    user_position: str = Field(..., min_length=1, max_length=280)
-    confidence: float = Field(..., ge=0.0, le=1.0)
-
-class ConflictsResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    conflicts: list[ConflictPair] = Field(default_factory=list)
-```
-
-**Assumptions consumers make:**
-- An empty `conflicts` list writes zero rows; the legacy `empty=True` sentinel is gone, so a session with no conflicts simply does not appear in `session_conflicts` or `conflicts_summary` (`src/claude_sql/core/schemas.py:379-400`, `sql_views.py:2005-2010`). Callers wanting every session must `LEFT JOIN conflicts_summary` and coalesce to 0.
-- The parquet row is `session_id, turn_a_uuid, turn_b_uuid, conflict_kind, severity, agent_position, user_position, confidence, detected_at` (`src/claude_sql/analytics/conflicts_worker.py:70-80`) — the timestamp column is `detected_at` here, not `classified_at` as in the other workers.
-- `turn_a_uuid`/`turn_b_uuid` are copied verbatim from `[uuid=...]` headers in the bound transcript and must differ (`schemas.py:303-323`).
-
-**Drift risk:** No current drift risk on the empty-list semantics — the v1.0 sentinel removal is settled and the timestamp-column name difference (`detected_at`) is intentional and stable per RFC 0002 §3.4.
-
-## `UserFrictionSignal` — per-message friction schema
-
-Classifies one short user message for friction; applied only below `friction_max_chars`.
-
-**Producer:** `src/claude_sql/core/schemas.py:406-471` (model), `schemas.py:474` (`USER_FRICTION_SCHEMA`).
-
-**Consumer(s):**
-- `src/claude_sql/analytics/friction_worker.py:62,554` — LLM path sends the schema; a regex fast-path also writes rows tagged `source='regex'` (`friction_worker.py:482-512`).
-- `src/claude_sql/core/sql_views.py` — `user_friction` view backs the `friction_counts`/`friction_rate`/`friction_examples` macros (`sql_views.py:1527-1599`), which filter on `label`, `source`, `confidence`, `text_snippet`.
-
-**Shape:**
-```python
-class UserFrictionSignal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    label: Literal[
-        "status_ping", "unmet_expectation", "confusion", "interruption",
-        "correction", "frustration", "none",
-    ] = Field(...)
-    rationale: str = Field(..., min_length=1, max_length=200)
-    confidence: float = Field(..., ge=0.0, le=1.0)
-```
-
-**Assumptions consumers make:**
-- The parquet row is `uuid, session_id, ts, text_snippet, label, rationale, source, confidence, classified_at` (`src/claude_sql/analytics/friction_worker.py:320-330`) — the model contributes only `label, rationale, confidence`; the worker adds `uuid, session_id, ts, text_snippet` (truncated to 200 chars) and a `source` in `{regex, llm, refused}`.
-- The macros assume `label != 'none'` is the interesting slice and exclude the `'none'` majority class (`sql_views.py:1536`); `friction_counts` further assumes `source` is exactly `'regex'` or `'llm'` for its `n_regex`/`n_llm` splits (`sql_views.py:1532-1533`).
-
-**Drift risk:** A new friction `label` appears in `friction_counts` but `friction_rate` has per-label hard-coded columns (`n_status`, `n_unmet`, ... at `sql_views.py:1554-1559`); a new label is silently absent from the rate breakdown. Mitigation: add the matching `count(*) FILTER` column to `friction_rate` whenever a `label` literal is added.
-
-## `lance_schema` — embeddings table schema
-
-The pyarrow schema for the single LanceDB embeddings table; the fixed-size vector column is what makes it indexable.
-
-**Producer:** `src/claude_sql/core/lance_store.py:60-75` (`lance_schema`), `lance_store.py:38` (`TABLE_NAME = "embeddings"`).
-
-**Consumer(s):**
-- `src/claude_sql/analytics/embed_worker.py:469-482` — builds the polars frame with `embedding: pl.Array(pl.Float32, dim)` matching the schema, then `add_chunk`.
-- `src/claude_sql/analytics/cluster_worker.py:42` — reads the table via `lance_store._has_table(db, lance_store.TABLE_NAME)`.
-- `src/claude_sql/core/sql_views.py:1716-1777` — `register_vss` ATTACHes the Lance dir and projects it as the `message_embeddings` DuckDB view, casting `embedding` to `FLOAT[dim]`; the `semantic_search` macro binds to it (`sql_views.py:1320-1327`).
+- `src/claude_sql/application/use_cases/embed.py:364-369` — the write side builds the polars frame with the exact matching schema.
+- `src/claude_sql/infrastructure/duckdb_views.py:1955-1969` — `register_vss` casts the embedding column to `FLOAT[dim]` and projects `message_embeddings`.
+- `src/claude_sql/domain/embedding_guard.py:22` — `ensure_store_matches` compares stored vs active `(model, dim)`.
+- `src/claude_sql/infrastructure/adapters.py`, `interfaces/cli/app.py`, `use_cases/cluster.py` — via `TABLE_NAME` / row-count probes.
 
 **Shape:**
 ```python
@@ -339,97 +141,277 @@ def lance_schema(dim: int) -> pa.Schema:
 ```
 
 **Assumptions consumers make:**
-- `embedding` must be a *fixed-size* list (`pa.list_(pa.float32(), dim)`); a variable-size `pl.List` is rejected by Lance for `create_index` and the docstring warns the polars side must be `pl.Array(pl.Float32, dim)` (`src/claude_sql/core/lance_store.py:102-109`).
-- `register_vss` casts `embedding` to `FLOAT[dim]` so the cosine/distance macros keep working unchanged (`src/claude_sql/core/sql_views.py:1766-1777`); `dim` must match `Settings.output_dimension` (default 1024, `sql_views.py:1675`).
-- The empty-dataset path creates an equivalent DuckDB-side `message_embeddings` table (uuid PK, model, dim, `embedding FLOAT[dim]`, embedded_at) so `semantic_search` still binds (`sql_views.py:1747-1758`).
+- `embedding` is a FIXED-SIZE list of float32 — a variable-size `pa.list_(pa.float32())` (or a polars `pl.List` instead of `pl.Array`) is rejected as a vector column by `create_index` (`src/claude_sql/infrastructure/lance_store.py:65-71`, write side `embed.py:368`).
+- Every row stamps the same `model` / `dim`, so reading the first row is sufficient to recover the store identity (`src/claude_sql/infrastructure/lance_store.py:245-264`).
+- The `dim` argument to the DuckDB `FLOAT[dim]` cast is overridden by the *stored* dim, so a store written at a different width binds correctly regardless of the caller's `dim` (`src/claude_sql/infrastructure/duckdb_views.py:1937-1948`).
+- An absent table reports `0` rows / `None` identity rather than raising — the empty-namespace gate probes `_has_table`, not the filesystem (`src/claude_sql/infrastructure/lance_store.py:53-62`, `duckdb_views.py:1911-1928`).
 
-**Drift risk:** The legacy parquet shards used `dim: pl.UInt16` while Lance wants `Int32`; migration recasts `dim` but deliberately lets embedding-column type drift (List vs Array) raise loudly at `tbl.add()` (`src/claude_sql/core/lance_store.py:193-204`). Mitigation: do not silently recast the embedding column — that masking hid drift bugs before.
+**Drift risk:** Two different models emitting the same width still live in incompatible vector spaces, so a silent provider switch produces numerically valid but semantically garbage cosine scores. Mitigation: `ensure_store_matches` fails loud on any `(model, dim)` mismatch before either write or bind (`src/claude_sql/domain/embedding_guard.py:47-61`), naming the `rm -rf` + re-embed recovery.
 
-## RFC 0001 transcript binding — git trailer + git-note wire format
+## Structured-output classification schemas (parquet + wire shape)
 
-The host-neutral pointer from a merged commit to the transcript that produced it: three commit trailers plus a JSON git note.
-
-**Producer:** spec `docs/rfc/0001-transcript-pr-binding.md:130-261`; reference impl `src/claude_sql/provenance/binding.py:61-197` (constants, `TranscriptBinding`, `to_note_payload`).
+**Producer:** `src/claude_sql/domain/models.py` — `SessionClassification:25`, `TrajectoryArrayResult:189` (wraps `TrajectoryWindow:96`), `ConflictsResult:299` (wraps `ConflictPair:212`), `UserFrictionSignal:323`.
 
 **Consumer(s):**
-- `src/claude_sql/app/cli.py:2877,2992` — `resolve` and `review-sheet` subcommands call `resolve_commit_to_transcript` and map `LookupError` to exit 2, `BindingMismatchError` to exit 70 (`cli.py:2879-2899`).
-- `src/claude_sql/provenance/binding.py:515-645` — `read_trailer` / `read_note` parse the two surfaces; `resolve_commit_to_transcript` (`binding.py:674-743`) enforces trailer-wins precedence.
-- `src/claude_sql/provenance/review_sheet_worker.py` / `review_sheet_render.py` — consume the resolved transcript to build the PR review sheet.
+- `src/claude_sql/infrastructure/bedrock/structured_output.py:117-120` — flattens each model into the four live `*_SCHEMA` dicts for the Bedrock `output_config.format` field.
+- `src/claude_sql/application/use_cases/classify.py:128`, `conflicts.py:261`, `friction.py:482` — pass the flattened schema to the classify call.
+- `src/claude_sql/application/use_cases/trajectory.py:549` — passes `TrajectoryArrayResult` as `schema=` to `classify_structured`.
+- `src/claude_sql/domain/trajectory.py` — pure trajectory math over the window shape.
 
-**Shape (trailers + note JSON):**
+**Shape:** (representative — `SessionClassification`)
+```python
+class SessionClassification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    autonomy_tier: Literal["manual", "assisted", "autonomous"]
+    work_category: Literal["sde", "admin", "strategy_business", "events",
+                           "thought_leadership", "other"]
+    success: Literal["success", "partial", "failure", "unknown"]
+    goal: str = Field(..., min_length=1, max_length=280)
+    confidence: float = Field(..., ge=0.0, le=1.0)
 ```
-Claude-Transcript-Digest: sha256:<64-hex-chars>
-Claude-Transcript-URI: <file://… | s3://… | git-notes://…>
-Claude-Agent-Runtime: <vendor/version>
+
+**Assumptions consumers make:**
+- `model_config = ConfigDict(extra="forbid")` on every model — the flattener injects `additionalProperties: false` and the Bedrock structured-output subset relies on it (`src/claude_sql/domain/models.py:32`, flatten at `structured_output.py:117`).
+- The `Literal` enums are the exact stored parquet values and the DuckDB views group on them verbatim — e.g. `transition_kind ∈ {frustration_spike, resolution, reset, drift, clarification, none}` (`src/claude_sql/domain/models.py:158-176`).
+- `ConflictsResult.conflicts` defaults to an empty list, and an empty list means ZERO rows written for that session (the legacy `empty=True` sentinel is gone) — callers wanting every session must LEFT JOIN and coalesce (`src/claude_sql/domain/models.py:299-320`).
+- `TrajectoryWindow.prev_uuid` is `None` on the session-first window and the host pipeline echoes `(prev_uuid, curr_uuid)` back to verify per-window completeness (`src/claude_sql/domain/models.py:111-127`).
+- `turn_a_uuid` / `turn_b_uuid` are copied verbatim from the `[uuid=...]` transcript headers, not paraphrased, and must differ (`src/claude_sql/domain/models.py:223-243`).
+
+**Drift risk:** Adding a `Literal` variant (a new `work_category`, a new `transition_kind`) that a DuckDB view or macro doesn't yet group on silently drops those rows from aggregates. Mitigation: extend the corresponding view/macro in `duckdb_views.py` in the same change; the enum is the single source and the flattener strips constraints the validator rejects (`structured_output.py`).
+
+## `render_turn_text` — consumer collapse byte-parity (external contract)
+
+**Producer:** `src/claude_sql/domain/transcript.py:287` (`render_turn_text`), over `TranscriptRow:197`.
+
+**Consumer(s):**
+- `src/claude_sql/infrastructure/transcript_reader.py` — `DuckDbTranscriptReader.read_turn_text` projects `read_json` rows into `TranscriptRow` and calls this.
+- `src/claude_sql/composition.py:83` — the `ClaudeSql` facade exposes the reader as the importable surface downstream consumers use.
+- `tests/test_collapse_parity.py:136,160` — the byte-parity pin (ports the consumer's fixture and expected string verbatim).
+- `tests/property/test_transcript_properties.py`, `tests/test_transcript_domain.py` — property + unit coverage.
+
+**Shape:**
+```python
+def render_turn_text(
+    rows: Iterable[TranscriptRow],
+    *,
+    per_turn_chars: int = 8_000,
+    total_chars: int = 200_000,
+    truncation_notice: bool = False,
+) -> str: ...
+
+@dataclass(slots=True)
+class TranscriptRow:
+    uuid: str | None
+    type: str | None
+    timestamp: str | None
+    message: Any  # dict | JSON-text str | None
 ```
-```json
-{
-  "uri": "file:///…/2026-05-09T03-48-12.jsonl",
-  "digest": "sha256:9d4c0…",
-  "agent_runtime": "claude-code/0.42.1",
-  "transcript_id": "01HXYZ-…-session-id",
-  "captured_at": "2026-05-09T03:51:08+00:00"
+
+**Assumptions consumers make:**
+- ONE line per message, shape `[{role} {ts}] {body}`; `role` prefers inner `message.role` and falls back to envelope `type` (so `system` is reachable, tool_result carriers keep their `user` role) (`src/claude_sql/domain/transcript.py:296-309`, `_collapse_role_of:227`).
+- `ts` is the RAW timestamp string verbatim (incl. `.000`/`Z`), with no TIMESTAMP round-trip (`src/claude_sql/domain/transcript.py:302-303`).
+- Ordering is `(ts, kind_rank, uuid)` with envelope-type rank `user < assistant < tool < system` (`_COLLAPSE_KIND_RANK:49`) — distinct from `assemble`'s block-level `_KIND_RANK` (`:41`).
+- `tool_use`/`tool_result` blocks fold INLINE as `[tool_use:{name}]` / `[tool_result]` markers; rows whose collapsed body is empty are dropped (`src/claude_sql/domain/transcript.py:264-284, 307-309`).
+- Per-turn cap appends a leading-space `` …`` marker; the whole transcript is hard-sliced at `total_chars` with NO trailing notice unless `truncation_notice=True` — the leading space and the notice-suppression are load-bearing for parity (`src/claude_sql/domain/transcript.py:282-283, 310-312, 330-336`).
+- The single-level `part-*.jsonl` glob must never admit `subagents/*` sidecars (`tests/test_collapse_parity.py:148-157`).
+
+**Drift risk:** Any change to spacing, the `role` fallback order, the sort key, or the truncation marker breaks byte-parity with every downstream consumer of the drop-in reader. Mitigation: `tests/test_collapse_parity.py` asserts `text == "\n".join(_COLLAPSE_EXPECTED_LINES)` against the consumer's verbatim fixture; it is wired into `mise run check`.
+
+## `EXIT_CODES` — the CLI exit-code wire contract
+
+**Producer:** `src/claude_sql/domain/errors.py:26`
+
+**Consumer(s):**
+- `src/claude_sql/infrastructure/duckdb_errors.py:15,28-42` — `classify_duckdb_error` maps duckdb exceptions to `parse_error` / `catalog_error` / `runtime_error`.
+- `src/claude_sql/interfaces/cli/output.py:28,177` — `run_or_die` / `emit_error` exit with the classified code.
+- `src/claude_sql/interfaces/cli/app.py:45,234,505` — top-level handlers exit with `invalid_input` and `duckdb_missing`.
+
+**Shape:**
+```python
+EXIT_CODES: dict[str, int] = {
+    "ok": 0,
+    "no_embeddings": 2,
+    "invalid_input": 64,  # malformed user-supplied flags (e.g. --glob)
+    "parse_error": 64,  # malformed SQL
+    "catalog_error": 65,  # unknown view/macro/column
+    "runtime_error": 70,  # everything else from duckdb.Error
+    "duckdb_missing": 127,  # system `duckdb` binary not on PATH
 }
 ```
 
 **Assumptions consumers make:**
-- Resolution precedence is trailer-first, note-fallback, loud failure on `digest` disagreement (`docs/rfc/0001-transcript-pr-binding.md:312-331`); `read_trailer` returns the binding only when all three trailers are present and leaves `transcript_id`/`captured_at` empty since those are note-only (`src/claude_sql/provenance/binding.py:560-572`).
-- Readers tolerate duplicate trailers (rebase/fixup squash) by taking the first occurrence per key (`src/claude_sql/provenance/binding.py:498-512`).
-- Unknown trailers and unknown JSON keys are ignored for forward compatibility; only `digest`/`uri`/`agent_runtime` are required in the note (`src/claude_sql/provenance/binding.py:575-596`).
-- `git notes show` exiting non-zero with "no note found" is the absence signal, not an error (`src/claude_sql/provenance/binding.py:628-635`).
-- The digest is over raw file bytes with a `sha256:` prefix, recomputable in one line; canonicalization is explicitly rejected (`docs/rfc/0001-transcript-pr-binding.md:541-567`, `binding.py:232-246`).
+- The integer codes are STABLE — agents calling via subprocess branch on them, so they must not renumber (`src/claude_sql/domain/errors.py:24-25`).
+- `parse_error` and `invalid_input` deliberately share `64`; catalog is `65`, runtime is `70` — the classifier picks the key, `errors.py` owns the number (`src/claude_sql/infrastructure/duckdb_errors.py:28-42`).
+- On non-TTY stderr the error is emitted as `{"error": {"kind", "message", "hint"}}` via `ClassifiedError.to_payload` alongside the exit (`src/claude_sql/domain/errors.py:109-125`, `output.py:142-177`).
 
-**Drift risk:** Removing or renaming any of the three trailer keys or the five note fields is a breaking change requiring RFC supersession (`docs/rfc/0001-transcript-pr-binding.md:520-523`); adding fields is forward-compatible by construction. Mitigation: only add, never rename, and keep the ten `tests/test_binding.py` round-trip tests green.
+**Drift risk:** A new `duckdb.Error` subclass that `classify_duckdb_error` doesn't recognize falls through to `runtime_error` (70) — acceptable, but a genuinely new *catalog* condition mislabeled as runtime would confuse an agent's retry logic. Mitigation: keep `classify_duckdb_error` in sync when new DuckDB exception subclasses land (CLAUDE.md agent-CLI note).
 
-## Layered import DAG (import-linter contracts)
+## `SessionTextCorpus.assemble` — the byte-stable internal transcript
 
-The architectural contract every import is checked against: core is depended on by all, the three L1 siblings never import each other, and only app sits above them.
-
-**Producer:** `pyproject.toml:261-280` (`[tool.importlinter]` root package + two contracts).
+**Producer:** `src/claude_sql/domain/transcript.py:126`
 
 **Consumer(s):**
-- Enforced in CI by `import-linter` (declared as a dev dependency, `pyproject.toml:97`); every module's import statements are the implicit consumer.
-- `src/claude_sql/core/sql_views.py:1716` defers `from claude_sql.core import lance_store` to a function body — an in-layer import that keeps module-load-time clean; the DAG is the reason cross-layer imports always point down a layer.
+- `src/claude_sql/infrastructure/session_text_loader.py` — materializes the corpus from the `read_json` glob and calls `assemble` per session (via the `TranscriptReaderPort` adapter).
+- The four LLM pipelines through the use-cases: `classify.py`, `trajectory.py`, `conflicts.py`, `friction.py` — they checkpoint on this output.
 
 **Shape:**
-```toml
-[[tool.importlinter.contracts]]
-name = "claude-sql layered architecture"
-type = "layers"
-layers = [
-    "claude_sql.app",
-    "claude_sql.analytics | claude_sql.evals | claude_sql.provenance",
-    "claude_sql.core",
-]
-
-[[tool.importlinter.contracts]]
-name = "analytics / evals / provenance are independent siblings"
-type = "independence"
-modules = [
-    "claude_sql.analytics",
-    "claude_sql.evals",
-    "claude_sql.provenance",
-]
+```python
+def assemble(
+    self, session_id: str, *, settings: TranscriptCaps, include_uuids: bool = False
+) -> str:
+    # line shapes:
+    #   [uuid=<id> <role> <ts>] <body>   (include_uuids=True, text turns)
+    #   [<role> <ts>] <body>             (default, text turns)
+    #   [tool_use:<name> <ts>] <input-preview>
+    #   [tool_result <tu_id> <ts>] <result-preview>
+    #   …(session truncated at <cap> chars, <N> events total)
 ```
 
 **Assumptions consumers make:**
-- Shared logic that two siblings both need must live in `core`; it cannot be imported sibling-to-sibling because the independence contract forbids it. This is why `schemas.py`, `llm_shared.py`, `parquet_shards.py`, `lance_store.py`, and `output.py` all live in core.
-- `app` is the only layer allowed to import from the L1 siblings (e.g. `cli.py` imports binding, the workers, and the render module).
+- Output is byte-stable: the string literals and the tie-break order (`_timeline_sort_key`, block-level `_KIND_RANK` = text < tool_use < tool_result) must not drift because the pipelines checkpoint on it (`src/claude_sql/domain/transcript.py:11-24, 41, 53-63`).
+- `settings` is a pure `TranscriptCaps` two-int value-object (`session_text_tool_result_max_chars`, `session_text_total_max_chars`), NOT the god-`Settings`; the keyword name stays `settings` for call-site/test stability (`src/claude_sql/domain/transcript.py:126-145`).
+- `include_uuids=True` switches only the text-turn header to `[uuid=<id> role ts]`; the default keeps `[role ts]` so classify/trajectory/friction prompts stay byte-identical (only conflicts needs the uuids — issue #109) (`src/claude_sql/domain/transcript.py:159-161`).
 
-**Drift risk:** A convenience import added sibling-to-sibling (e.g. `provenance` importing an `analytics` helper) compiles and runs locally but fails the `independence` contract in CI. Mitigation: hoist the shared code into `core` rather than crossing siblings; import-linter fails the build on violation.
+**Drift risk:** This is *not* the collapse-parity contract — it fans a message into per-block rows and uses a different kind-rank. Changing either collapse to "unify" them would break one of the two byte-stable contracts. Mitigation: the two renderers live side by side by design; the module docstring names the split (`src/claude_sql/domain/transcript.py:11-24`).
+
+## `SearchHit` — the semantic-retrieval result value-object
+
+**Producer:** `src/claude_sql/domain/retrieval.py:24`
+
+**Consumer(s):**
+- `src/claude_sql/infrastructure/session_search.py` — `DuckDbSessionSearch.search` constructs `SearchHit` rows from the DuckDB+Lance kNN result.
+- `src/claude_sql/application/ports.py:43` — re-exported so callers name the whole port surface (ports + row type) from one module; `SessionSearchPort.search` returns `list[SearchHit]` (`:123`).
+
+**Shape:**
+```python
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+    uuid: str
+    session_id: str
+    ts: datetime | None
+    role: str
+    snippet: str
+    cosine_sim: float
+```
+
+**Assumptions consumers make:**
+- It lives in `domain`, not `application.ports`, so the infrastructure adapter can build it without importing UP into the application layer (`src/claude_sql/domain/retrieval.py:8-12`).
+- `ts` is nullable — a hit may lack a resolvable timestamp; callers must handle `None` (`src/claude_sql/domain/retrieval.py:32`).
+- `cosine_sim` is a cosine similarity (higher = closer), matching the `array_cosine_similarity` macro, not a distance (`src/claude_sql/domain/retrieval.py:24-30`).
+
+**Drift risk:** No current drift risk — the shape mirrors columns the `search` path has projected since v1; it is a frozen dataclass with a single producer.
+
+## `ReaderPort` — the DuckDB query seam with an explicit rebind lifecycle
+
+**Producer:** `src/claude_sql/application/ports.py:248`
+
+**Consumer(s):**
+- `src/claude_sql/application/analyze.py` — the 10-stage pipeline; stages that write parquet/Lance mid-run (`embed`, `cluster`) must rebind before the next read.
+- `src/claude_sql/application/use_cases/cluster.py`, and the `community` / `terms` use-cases — read `message_embeddings` after an upstream write.
+
+**Shape:**
+```python
+@runtime_checkable
+class ReaderPort(Protocol):
+    def connection(self) -> duckdb.DuckDBPyConnection: ...
+    def query(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame: ...
+    def refresh_analytics_views(self) -> None: ...
+    def rebind_vss(self, stage: str) -> None: ...
+```
+
+**Assumptions consumers make:**
+- The DuckDB connection is stateful, long-lived, and shared across `analyze` stages — NOT a stateless executor. `register_all` binds views against parquet path lists FROZEN at registration time (`src/claude_sql/application/ports.py:250-259`).
+- A stage that writes new shards or populates LanceDB does not see its own writes until the views are re-bound; the write→rebind cycle is explicit and must not be folded into `query` (`src/claude_sql/application/ports.py:259-268`).
+- Skipping `rebind_vss` after an embed write reintroduces the RFC §9.6 stale-connection bug — `community` reads `message_embeddings` and gets 0 rows (`src/claude_sql/application/ports.py:260-266`).
+
+**Drift risk:** A future refactor that hides the connection behind a "pure" `query(sql)` and drops `rebind_vss` silently reintroduces the 0-row analyze bug. Mitigation: the Protocol deliberately exposes `connection`, `refresh_analytics_views`, and `rebind_vss` as first-class methods; the docstring documents why (`ports.py:248-290`).
+
+## `CheckpointPort` + `session_checkpoint` DDL — the processing watermark
+
+**Producer:** Port `src/claude_sql/application/ports.py:166`; backing DDL `src/claude_sql/infrastructure/sqlite_state/checkpointer.py:44`.
+
+**Consumer(s):**
+- `src/claude_sql/application/use_cases/classify.py`, `trajectory.py`, `conflicts.py`, `friction.py` — each pipeline loads its watermark map and marks completed sessions.
+- `src/claude_sql/infrastructure/adapters.py` — `build_checkpoint` wires the SQLite adapter to the port.
+
+**Shape:**
+```sql
+CREATE TABLE IF NOT EXISTS session_checkpoint (
+    session_id            TEXT NOT NULL,
+    pipeline              TEXT NOT NULL,
+    last_ts_processed     TEXT,
+    last_mtime_processed  TEXT,
+    completed_at          TEXT NOT NULL,
+    PRIMARY KEY (session_id, pipeline)
+);
+```
+```python
+def load_as_map(self, pipeline: str) -> dict[str, tuple[datetime | None, datetime | None]]: ...
+def mark_completed(self, *, pipeline: str,
+                   rows: Iterable[tuple[str, datetime | None, datetime | None]]) -> int: ...
+def count_rows(self) -> int: ...
+```
+
+**Assumptions consumers make:**
+- One row per `(session_id, pipeline)`; the upsert is `INSERT ... ON CONFLICT DO UPDATE` (SQLite 3.24+) (`src/claude_sql/infrastructure/sqlite_state/checkpointer.py:4-6, 44-52`).
+- All timestamps are stored as ISO-8601 UTC strings that sort lexicographically (`src/claude_sql/infrastructure/sqlite_state/checkpointer.py:19`).
+- `pipeline` is one of `PIPELINE_NAMES = ("classify", "trajectory", "conflicts", "user_friction")` (`src/claude_sql/infrastructure/sqlite_state/checkpointer.py:42`).
+- The staleness math (`filter_unchanged` / `_stale_or_equal`) is domain and stays out of the port — the port only loads and marks (`src/claude_sql/application/ports.py:170-173`).
+
+**Drift risk:** Reusing a `pipeline` name for a differently-keyed unit (message uuid vs session id) mixes incompatible watermarks in one table. Mitigation: `unit_id` semantics are documented per pipeline; `retry_queue.py:9-11` records that `trajectory` keys on uuid while the others key on session id.
+
+## `RetryQueuePort` + `retry_queue` DDL — the durable failed-unit queue
+
+**Producer:** Port `src/claude_sql/application/ports.py:193`; backing DDL `src/claude_sql/infrastructure/sqlite_state/retry_queue.py:41`.
+
+**Consumer(s):**
+- `src/claude_sql/application/use_cases/trajectory.py`, `classify.py`, `conflicts.py`, `friction.py` — enqueue failures, drain due units, mark done.
+- `src/claude_sql/infrastructure/adapters.py` — `build_retry_queue` wires the SQLite adapter.
+
+**Shape:**
+```sql
+CREATE TABLE IF NOT EXISTS retry_queue (
+    pipeline        TEXT    NOT NULL,
+    unit_id         TEXT    NOT NULL,
+    error           TEXT    NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    completed_at    TEXT,
+    PRIMARY KEY (pipeline, unit_id)
+);
+```
+```python
+def enqueue(self, *, pipeline: str, unit_id: str, error: str) -> int: ...
+def drain(self, *, pipeline: str, max_attempts: int = 5, limit: int | None = None) -> list[str]: ...
+def mark_done(self, *, pipeline: str, unit_ids: Iterable[str]) -> int: ...
+def pending_count(self, *, pipeline: str) -> int: ...
+```
+
+**Assumptions consumers make:**
+- One row per `(pipeline, unit_id)`; `unit_id` is `session_id` for classify/conflicts/user_friction and the message `uuid` for trajectory (`src/claude_sql/infrastructure/sqlite_state/retry_queue.py:9-11`).
+- Upsert-with-attempt-counter semantics: first failure → attempts=1, next_attempt_at = now + 2 min; retry → attempts += 1, delay = 2^attempts min capped at 60; success → `completed_at` stamped, row kept as audit trail (`src/claude_sql/infrastructure/sqlite_state/retry_queue.py:12-16, 38-39`).
+- `drain` returns only units that are not done, under `max_attempts`, and due (`next_attempt_at <= now`) (`src/claude_sql/application/ports.py:205-207`).
+- The exponential-backoff math (`_backoff_delta`) is domain; the port surface stays declarative (`src/claude_sql/application/ports.py:198-199`).
+- Shares the same `~/.claude/state.db` file and schema-bootstrap lock as the checkpointer (`src/claude_sql/infrastructure/sqlite_state/retry_queue.py:17-19, 28-36`).
+
+**Drift risk:** A `BedrockRefusalError` is terminal and must NOT be re-enqueued or it cycles forever; the workers clear the queue for refused units. Mitigation: the refusal path stamps a neutral placeholder and calls `mark_done` rather than `enqueue` (CLAUDE.md; `errors.py:48-60`).
 
 ## Other contracts
 
-- **`Settings.*_parquet_path` config fields** — `src/claude_sql/core/config.py` declares the per-cache paths and pricing; consumed by every worker and by `register_analytics` / `_ANALYTICS_MACRO_REQUIREMENTS` (`sql_views.py:1133-1149,1856-1886`). One producer, many consumers, but it is configuration plumbing rather than a shape contract.
-- **`Correction` (nested in `PRReviewSheet`)** — `src/claude_sql/core/schemas.py:477-506`; only consumed transitively via `PRReviewSheet` by the review-sheet worker, so it rides that contract rather than standing alone.
-- **`PRReviewSheet`** — `src/claude_sql/core/schemas.py:509-577`, `PR_REVIEW_SHEET_SCHEMA` at `schemas.py:580`; single consumer `src/claude_sql/provenance/review_sheet_worker.py:430` plus the renderer `review_sheet_render.py:75`. Six-field schema budgeted for a ~1K-token Markdown render; structurally a public boundary (the `review-sheet` CLI surface) but only one worker produces it.
-- **`ANALYTICS_VIEW_NAMES` / `VIEW_NAMES`** — `src/claude_sql/core/sql_views.py:62-93,294-307`; consumed by `cli.py:483` as the analytics-view name guard and by smoke tests; a naming subset of the view contracts above.
-- **`ClassifiedError.to_payload` JSON error shape** — `src/claude_sql/core/output.py:134-141`; the `{"error": {"kind", "message", "hint"}}` envelope agents read on stderr; consumed by `emit_error` and every `run_or_die` failure path.
+- **`Clock` port** (`src/claude_sql/application/ports.py:63`) — a one-method `now() -> datetime` seam over `datetime.now(UTC)` so checkpoint watermarks, retry backoff, and `classified_at` stamps are deterministic under test.
+- **`TranscriptReaderPort`** (`src/claude_sql/application/ports.py:77`) — `session_messages` / `read_turn_text` / `session_bounds` / `session_ids`; the DuckDB connection and `read_json` glob are adapter state. `read_turn_text` honors the consumer collapse contract.
+- **`SessionSearchPort`** (`src/claude_sql/application/ports.py:115`) — `search(...) -> list[SearchHit]` + `embed_query`; embedder and the Lance-backed view are adapter state.
+- **`VectorStorePort`** (`src/claude_sql/application/ports.py:132`) — `add_chunk` / `ensure_index` / `optimize` / `count_rows` / `table_identity` / `get_embedded_uuids`; keeps the empty-namespace gate (absent table → `0` rows / `None` identity).
+- **`CachePort`** (`src/claude_sql/application/ports.py:218`) — `write_part` / `read_all` / `count_rows` / `iter_part_files` / `replace_sessions` over the sharded-parquet artifact store; the parquet-existence gate (views register only caches that exist) is preserved by the adapter.
+- **`ensure_store_matches`** (`src/claude_sql/domain/embedding_guard.py:22`) — the pure fail-loud guard signature `(*, stored_model, stored_dim, expected_model, expected_dim) -> None`; `None` on either stored value is a no-op (fresh install); raises `EmbeddingProviderMismatch` otherwise.
+- **`ClassifiedError`** (`src/claude_sql/domain/errors.py:109`) — the frozen `(kind, exit_code, message, hint)` dataclass with `to_payload()`; the structured shape of a CLI error the non-TTY stderr JSON envelope carries.
+- **`ClaudeSql` facade** (`src/claude_sql/composition.py:36`) — the importable entry point (`reader()` / `search()` / `query()`) plus the `build_*` factories; the surface downstream consumers import.
 
 ## See also
 
-- [claude-sql · Processes](../behavior/processes.md) — 13 shared source files
-- [claude-sql · Public API](../reference/public-api.md) — 13 shared source files
-- [claude-sql · Debugging guide](debugging-guide.md) — 12 shared source files
-- [claude-sql · Module map](../architecture/module-map.md) — 12 shared source files
-- [claude-sql · Tech debt](tech-debt.md) — 10 shared source files
+- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 17 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 9 shared source citations
+- [claude-sql · Public API](../reference/public-api.md) — 9 shared source citations
+- [claude-sql · Module map](../architecture/module-map.md) — 8 shared source citations
+- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 8 shared source citations

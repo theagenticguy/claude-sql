@@ -1,55 +1,88 @@
 # claude-sql · System overview
 
-`claude-sql` turns Claude Code session transcripts into a queryable, self-improving record of work. The JSONL files Claude Code writes under `~/.claude/projects/` are read in place — zero copy, no export pipeline — and exposed as DuckDB views, so a user can ask "which Opus sessions cost more than $5 this month?" or "group my sessions by theme" and get an answer in under a second (`README.md:11`, `README.md:61`). The audience is any Claude Code user who wants to remember past work, see where time and money go, and notice patterns in how they collaborate with the agent. It ships as a single `claude-sql` CLI binary declared at `pyproject.toml:53` (`claude-sql = "claude_sql.app.cli:main"`), installable as an isolated uv tool (`README.md:97`).
+`claude-sql` is a standalone Python CLI that makes a developer's own Claude Code
+transcripts — the JSONL files under `~/.claude/projects/**` plus subagent
+sidecars — queryable in place with zero copy (`pyproject.toml:4`). It stacks
+four analytics layers over those files: SQL views and macros through DuckDB,
+semantic search over message embeddings, LLM-driven session classification, and
+structural clustering into topics and communities. The intended reader is the
+transcript owner, or an agent acting on their behalf: every subcommand emits
+machine-readable output, so a calling LLM can do progressive disclosure into the
+corpus before reading raw transcripts. The single console script is
+`claude-sql`, bound to `claude_sql.interfaces.cli.app:main` (`pyproject.toml:53`,
+`interfaces/cli/app.py:2115`).
 
-Beyond raw SQL, the tool layers in semantic search over Cohere Embed v4 embeddings, Sonnet 4.6 LLM classification (session autonomy, work category, success, friction), clustering, and Leiden community detection — each materialized to cached, sharded parquet that rebuilds only on explicit re-run (`README.md:88`). It also binds transcripts to pull requests via git commit trailers and notes (`src/claude_sql/provenance/`).
+The codebase is a strict hexagon. The import-linter contract declares one layered
+DAG — `interfaces` > `application` > `infrastructure` > `domain`
+(`pyproject.toml:298-303`) — and grep confirms it holds: `domain` imports no
+other layer, while `infrastructure` reaches down into `domain` across 13 files
+and `application` reaches into both `infrastructure` (11 files) and `domain`
+(9 files). **`domain/`** is the pure core (17 files, 2429 LOC): the pydantic
+models (`domain/models.py:1`, 398 LOC), the error taxonomy
+(`domain/errors.py:1`), the transcript-assembly and turn-rendering logic
+(`domain/transcript.py:1`, 343 LOC), the dedup, trajectory, friction, and cost
+math, and the heavy-compute `structure/` package (cluster, community, terms). It
+also holds the two provider ports as `@runtime_checkable` Protocols —
+`EmbeddingProvider` and `LlmAnalyticsProvider` (`domain/ports.py:34`,
+`domain/ports.py:79`).
 
-The codebase is a single `claude-sql` package with five layer sub-packages under `src/claude_sql/` (PEP 420 namespace), whose shared runtime dependencies are declared in one block in the root `pyproject.toml` (`pyproject.toml:27`). The modules form a strict layered DAG enforced by import-linter: `core` (L0) below the three siblings (L1) below `app` (L2), with the siblings declared mutually independent (`pyproject.toml:265`, `pyproject.toml:274`).
+**`application/`** (17 files, 5516 LOC) holds the port Protocols the
+infrastructure adapters satisfy — 8 of them, including `TranscriptReaderPort`,
+`SessionSearchPort`, and `VectorStorePort` (`application/ports.py:64-249`) — plus
+one use-case module per subcommand (embed, classify, trajectory, conflicts,
+friction, ingest, cluster, terms, community, skills, peek) and the multi-stage
+`run_analyze` pipeline that chains them with a VSS-then-analytics rebind
+(`application/analyze.py:99`). **`infrastructure/`** (28 files, 7927 LOC) is the
+adapter layer: the DuckDB engine and all view/macro DDL — 25 views and 26 macros
+registered by `register_all` (`infrastructure/duckdb_views.py:2285`) — the
+LanceDB vector store, the Bedrock and pluggable embedding clients, the SQLite
+checkpoint/retry state, parquet caches, and the env-driven `Settings`
+(`infrastructure/settings.py:1`, 544 LOC). **`interfaces/cli/`** (5 files) is the
+thin cyclopts CLI plus output formatting (`interfaces/cli/app.py:1`, 2121 LOC).
 
-`core` is the kernel and the largest module (13 files, 6434 LOC): settings, DuckDB view registration, Bedrock LLM primitives, logging, output formatting, parquet shard helpers, and Pydantic schemas (`src/claude_sql/core/`). Its `sql_views.py` (2182 LOC) registers every business view and macro (`src/claude_sql/core/sql_views.py:1`); `llm_shared.py` (1341 LOC) holds the shared Bedrock structured-output path (`src/claude_sql/core/llm_shared.py:1`).
+Two modules stand outside the four-layer stack. `composition.py` is the
+importable composition root — the `ClaudeSql` facade and `build_*` factories that
+wire adapters lazily for sibling projects (`composition.py:36`). And `proofs/` is
+a Lean 4 layer that machine-checks pure domain invariants (backoff, Hamming,
+turn-sort), wired into the quality gate as `mise run proofs` (`mise.toml:126`).
 
-`analytics` (11 files, 4756 LOC) is the heaviest L1 sibling — embed, classify, trajectory, conflicts, friction, cluster, terms, community, and ingest workers (`src/claude_sql/analytics/`). Its `trajectory_worker.py` runs 1005 LOC (`src/claude_sql/analytics/trajectory_worker.py:1`). `evals` (7 files, 1493 LOC) is the eval gym: cross-lineage Bedrock judge panels with pre-registered manifests and a kappa floor (`src/claude_sql/evals/`). `provenance` (4 files, 1376 LOC) handles transcript-to-PR binding and single-shot PR review sheets (`src/claude_sql/provenance/`).
-
-`app` (3 files, 3158 LOC) is the top layer: a single cyclopts CLI whose `cli.py` is the largest file in the repository at 3079 LOC and imports from all four lower modules (`src/claude_sql/app/cli.py:45`). The three L1 siblings are mutually independent — each imports only `core` — and `app` composes them into subcommands such as `query`, `embed`, `search`, `classify`, `cluster`, `community`, and `analyze` (`README.md:216`).
+A typical read flow: the CLI opens an in-memory DuckDB connection, calls
+`register_all` to bind every view, macro, and the Lance-backed VSS index, then
+runs the user's SQL and formats the result. Expensive outputs — embeddings,
+classifications, clusters — are cached as parquet under `~/.claude/`, so reruns
+on untouched sessions are free. To orient in the code, open
+`interfaces/cli/app.py` for the command surface, `application/analyze.py` for the
+pipeline, and `infrastructure/duckdb_views.py` for the SQL schema.
 
 ## Stack
 
 | Layer | Technology | Source |
-| --- | --- | --- |
+|---|---|---|
 | Language | Python `>=3.13` | `pyproject.toml:8` |
-| Query engine | DuckDB `>=1.5.2,<2` | `pyproject.toml:32` |
-| Vector store | LanceDB `>=0.30,<0.31` | `pyproject.toml:35` |
-| Dataframes | Polars `>=1.40.0` | `pyproject.toml:40` |
-| LLM / embeddings | boto3 (Bedrock) + anthropic | `pyproject.toml:30` |
 | CLI framework | cyclopts `>=4.10.2` | `pyproject.toml:31` |
-| Clustering | umap-learn, hdbscan, leidenalg | `pyproject.toml:49` |
-| Build / packaging | single package + `uv_build` | `pyproject.toml:61` |
-| Lint / typecheck | ruff + ty | `pyproject.toml:65` |
-| Test | pytest via mise task | `mise.toml:127` |
+| Query engine | DuckDB `>=1.5.2,<2` | `pyproject.toml:32` |
+| Vector store | LanceDB `>=0.30,<0.35` | `pyproject.toml:35` |
+| Data frames | polars `>=1.40.0` | `pyproject.toml:40` |
+| Clustering | umap-learn + hdbscan + leidenalg | `pyproject.toml:49` |
+| Models/config | pydantic + pydantic-settings | `pyproject.toml:42` |
+| Build backend | uv_build `>=0.11.14,<0.12` | `pyproject.toml:73` |
 
 ## Module map
 
 ```mermaid
 flowchart LR
-    app["app (CLI)"]
-    analytics["analytics"]
-    evals["evals"]
-    provenance["provenance"]
-    core["core (kernel)"]
-
-    app --> analytics
-    app --> evals
-    app --> provenance
-    app --> core
-    analytics --> core
-    evals --> core
-    provenance --> core
+    interfaces["interfaces/cli"] --> application
+    interfaces --> infrastructure
+    interfaces --> domain
+    composition["composition"] --> application
+    composition --> infrastructure
+    application --> infrastructure
+    application --> domain
+    infrastructure --> domain
+    proofs["proofs (Lean 4)"] -.-> domain
 ```
 
 ## See also
 
-- [claude-sql · Tech debt](../insights/tech-debt.md) — 6 shared source files
-- [claude-sql · Contract map](../insights/contract-map.md) — 5 shared source files
-- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 5 shared source files
-- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 4 shared source files
-- [claude-sql · Module map](module-map.md) — 4 shared source files
+- [claude-sql · Business logic](../insights/business-logic.md) — 6 shared source citations
+- [claude-sql · Tech debt](../insights/tech-debt.md) — 3 shared source citations

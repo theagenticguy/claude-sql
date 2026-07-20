@@ -14,7 +14,7 @@ from pathlib import Path
 
 import duckdb
 
-from claude_sql.app.cli import _capture_profile, _profile_path_for
+from claude_sql.interfaces.cli.app import _capture_profile, _profile_path_for
 
 
 def test_profile_path_lands_under_claude_sql_home_profiling(tmp_path: Path, monkeypatch) -> None:

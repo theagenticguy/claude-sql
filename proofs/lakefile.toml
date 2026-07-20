@@ -1,0 +1,15 @@
+# claude-sql proof layer — Track A (Lean 4, core only, NO mathlib).
+#
+# Machine-checked proofs of the repo's pure/algebraic domain invariants. Each
+# module under ClaudeSql/ cites the exact Python surface (path:line) it models,
+# verified against source. The gate is `lake build` clean and sorry-free
+# (wired into `mise run check` via the `proofs` task).
+#
+# No `require` stanza: everything below is expressible over core Lean's own
+# Nat / List / Bool / Ord, so pulling mathlib would add a multi-minute build
+# for zero payoff.
+name = "ClaudeSql"
+defaultTargets = ["ClaudeSql"]
+
+[[lean_lib]]
+name = "ClaudeSql"

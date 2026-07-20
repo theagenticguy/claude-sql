@@ -34,18 +34,18 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.analytics import (
-    classify_worker,
-    conflicts_worker,
-    trajectory_worker,
+from claude_sql.application.use_cases import (
+    classify as classify_worker,
+    conflicts as conflicts_worker,
+    trajectory as trajectory_worker,
 )
-from claude_sql.core import (
-    llm_shared,
-    retry_queue,
-)
-from claude_sql.core.config import Settings
-from claude_sql.core.parquet_shards import iter_part_files
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.application.use_cases._shared import _count_pending_sessions
+from claude_sql.domain.costs import estimate_cost as _estimate_cost
+from claude_sql.infrastructure.bedrock import client as llm_shared
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.parquet_cache import iter_part_files
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.infrastructure.sqlite_state import retry_queue
 from conftest import (
     _seed_subagent_stub,
     make_user_msg,
@@ -135,7 +135,7 @@ def test_count_pending_sessions_empty_already(
     basic_con: duckdb.DuckDBPyConnection, tmp_corpus: dict[str, Any]
 ) -> None:
     """Empty ``already`` set → count of distinct sessions in ``messages_text``."""
-    n = llm_shared._count_pending_sessions(basic_con, already=set(), since_days=None, limit=None)
+    n = _count_pending_sessions(basic_con, already=set(), since_days=None, limit=None)
     # The conftest corpus has two sessions, both with text messages clearing
     # the 32-char filter.
     assert n == 2
@@ -148,13 +148,9 @@ def test_count_pending_sessions_already_subtracts(
     basic_con: duckdb.DuckDBPyConnection, tmp_corpus: dict[str, Any]
 ) -> None:
     """``already`` containing one session → count is reduced by 1."""
-    baseline = llm_shared._count_pending_sessions(
-        basic_con, already=set(), since_days=None, limit=None
-    )
+    baseline = _count_pending_sessions(basic_con, already=set(), since_days=None, limit=None)
     one_done = {tmp_corpus["session_ids"][0]}
-    reduced = llm_shared._count_pending_sessions(
-        basic_con, already=one_done, since_days=None, limit=None
-    )
+    reduced = _count_pending_sessions(basic_con, already=one_done, since_days=None, limit=None)
     assert reduced == baseline - 1
 
 
@@ -162,7 +158,7 @@ def test_count_pending_sessions_limit_cap(
     basic_con: duckdb.DuckDBPyConnection,
 ) -> None:
     """``limit`` caps the returned count regardless of corpus size."""
-    capped = llm_shared._count_pending_sessions(basic_con, already=set(), since_days=None, limit=1)
+    capped = _count_pending_sessions(basic_con, already=set(), since_days=None, limit=1)
     assert capped == 1
 
 
@@ -210,8 +206,8 @@ def test_count_pending_sessions_since_days_filter(
     )
     register_views(con)
 
-    all_n = llm_shared._count_pending_sessions(con, already=set(), since_days=None, limit=None)
-    recent_n = llm_shared._count_pending_sessions(con, already=set(), since_days=1, limit=None)
+    all_n = _count_pending_sessions(con, already=set(), since_days=None, limit=None)
+    recent_n = _count_pending_sessions(con, already=set(), since_days=1, limit=None)
     assert all_n == 2
     assert recent_n == 1
     con.close()
@@ -500,7 +496,7 @@ def test_build_bedrock_client_cache_identity(
         counter["n"] += 1
         return object()
 
-    monkeypatch.setattr("claude_sql.core.llm_shared.boto3.client", _fake_boto_client)
+    monkeypatch.setattr("claude_sql.infrastructure.bedrock.client.boto3.client", _fake_boto_client)
 
     a = llm_shared._build_bedrock_client(tmp_settings)
     b = llm_shared._build_bedrock_client(tmp_settings)
@@ -521,7 +517,10 @@ def test_build_bedrock_client_cache_identity(
 
 def test_maybe_log_bedrock_call_noop_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     """No trace path → function is a no-op."""
-    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", None)
+    # T-2-1: the trace-path global lives on the Bedrock transport module that
+    # ``maybe_log_bedrock_call`` reads; patch it there (the ``llm_shared`` shim
+    # only forwards reads, so rebinding the shim name would not take effect).
+    monkeypatch.setattr("claude_sql.infrastructure.bedrock.client._BEDROCK_TRACE_PATH", None)
     # Should not raise even with bogus payload structure.
     llm_shared.maybe_log_bedrock_call("classify", "m-id", {"usage": {}}, 12.5)
 
@@ -531,7 +530,8 @@ def test_maybe_log_bedrock_call_appends_jsonl_line(
 ) -> None:
     """Trace path set → exactly one JSONL row appended per call."""
     trace = tmp_path / "trace.jsonl"
-    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", str(trace))
+    # T-2-1: patch the transport module's global (see companion no-op test).
+    monkeypatch.setattr("claude_sql.infrastructure.bedrock.client._BEDROCK_TRACE_PATH", str(trace))
     payload = {
         "usage": {
             "input_tokens": 1200,
@@ -582,5 +582,5 @@ def test_estimate_cost_arithmetic(
     pricing: tuple[float, float],
     expected: float,
 ) -> None:
-    actual = llm_shared._estimate_cost(n, in_tok, out_tok, pricing)
+    actual = _estimate_cost(n, in_tok, out_tok, pricing)
     assert actual == pytest.approx(expected)

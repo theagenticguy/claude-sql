@@ -1,17 +1,22 @@
-## OpenCodeHub MCP Tools
+## CodeGraph: code intelligence
 
-This repository has been indexed by OpenCodeHub. When you are working in this
-codebase, prefer the following MCP tools over raw file search — they return
-graph-aware results grouped by execution flow and include blast-radius risk
-tiers.
+This repository is indexed by CodeGraph (a `.codegraph/` directory exists at
+the repo root). When working in this codebase, reach for CodeGraph BEFORE
+grep/find or reading whole files to understand or locate code. It returns the
+relevant symbols' verbatim source plus the call paths between them, including
+dynamic-dispatch hops that text search cannot follow.
 
-- `list_repos` — enumerate repos currently indexed on this machine.
-- `query` — hybrid BM25 + vector search over symbols, grouped by process.
-- `context` — inbound/outbound refs and participating flows for one symbol.
-- `impact` — dependents of a target up to a configurable depth, with a risk tier.
-- `detect_changes` — map an uncommitted or committed diff to affected symbols.
-- `list_findings` — browse SARIF findings from the latest scan by severity and rule.
-- `sql` — read-only SQL against the local temporal store (cochanges + symbol_summaries), 5 s timeout; the node/edge graph is queried via the typed tools or Cypher via the MCP `sql` tool.
+- **MCP tool:** `codegraph_explore` answers most code questions in one call.
+  Name a file or symbol in the query to read its current line-numbered source.
+  `codegraph_node` returns one symbol's source plus its caller/callee trail.
+- **Shell (always works):**
+  - `codegraph explore "<symbols or question>"`: same output as the MCP tool.
+  - `codegraph query "<term>"`: search for symbols.
+  - `codegraph node <name>`: one symbol's source plus its caller/callee trail.
+  - `codegraph callers <symbol>` / `codegraph callees <symbol>`: call graph.
+  - `codegraph impact <symbol>`: what a change to a symbol affects.
+  - `codegraph affected <files...>`: test files affected by changed sources.
+  - `codegraph files`: project file structure from the index.
 
-Run `codehub analyze` after pulling new commits so the index stays aligned
-with the working tree. `codehub status` reports staleness.
+Run `codegraph sync` after pulling new commits so the index stays aligned with
+the working tree. `codegraph status` reports index staleness.

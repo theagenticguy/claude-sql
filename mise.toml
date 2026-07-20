@@ -13,7 +13,7 @@
 min_version = "2025.1.0"
 
 [tools]
-python = "3.13"
+python = "3.14"
 uv = "latest"
 
 # Security scanners installed via mise so contributors don't need brew/dnf.
@@ -123,9 +123,22 @@ description = "Run the full pytest suite"
 sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run pytest --no-header -q"
 
+[tasks.proofs]
+description = "Lean 4 proof layer: `lake build` under proofs/ (core Lean, no mathlib, sorry-free)"
+# Track A of the two-track proof discipline (hexagonal-arch-stack.md §7).
+# Each ClaudeSql/*.lean module machine-checks one pure domain invariant against
+# its cited Python surface. The gate is a clean, sorry-free `lake build`.
+# elan/lake are installed out-of-band (~/.elan/bin); `elan` on PATH resolves the
+# proofs/lean-toolchain pin (leanprover/lean4:v4.32.0) automatically. We prepend
+# ~/.elan/bin so the task works whether or not the caller's shell has elan
+# activated.
+sources = ["proofs/**/*.lean", "proofs/lakefile.toml", "proofs/lean-toolchain"]
+dir = "proofs"
+run = 'PATH="$HOME/.elan/bin:$PATH" lake build'
+
 [tasks.check]
-description = "All quality gates: lint + fmt + typecheck + import-linter + test"
-depends = ["lint", "fmt", "typecheck", "lint:imports", "test"]
+description = "All quality gates: lint + fmt + typecheck + import-linter + test + proofs"
+depends = ["lint", "fmt", "typecheck", "lint:imports", "test", "proofs"]
 
 # ---------------------------------------------------------------------------
 # Security gates — defense-in-depth SAST/SCA + secrets sweep.  Each emits

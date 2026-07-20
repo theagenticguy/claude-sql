@@ -1,105 +1,101 @@
 # claude-sql · Data flow
 
-`claude-sql` is a single-process Cyclopts CLI: every flow starts when the user invokes a subcommand from a shell and ends when the binary exits (`src/claude_sql/app/cli.py:3073`). There are no HTTP routes, queues, or scheduled jobs, so the three flows below are CLI subcommands chosen for load-bearing coverage: the read path (`query`), the async Bedrock write path (`embed`), and the canonical Sonnet LLM analytics pipeline (`classify`) whose shape the `trajectory`, `conflicts`, and `friction` workers replicate.
+`claude-sql` is a CLI, not a service: every process is a cyclopts subcommand
+dispatched through `src/claude_sql/interfaces/cli/app.py`. The three flows below
+are the load-bearing ones — the read-only SQL path (`query`), the semantic
+search path (`search`), and the composite `analyze` pipeline that chains every
+analytics stage through one shared, re-bound DuckDB connection. Participant
+labels use the POST-reshape hexagonal layer names (`CLI` = interfaces, `AppLayer`
+= application, `Infra` = infrastructure) since the module-map is mid-rewrite.
 
-## Flow 1: claude-sql query <sql>
+## Flow 1: query (read-only SQL over the catalog)
 
-Read-only DuckDB execution against the registered view and macro catalog over the user's JSONL transcripts. No Bedrock, no LLM, no parquet writes.
-
-1. User invokes `claude-sql query "<sql>"`; Cyclopts dispatches to the `query` command body (`src/claude_sql/app/cli.py:728`).
-2. `query` picks the connection mode: `_open_connection_full` when the SQL touches the catalog, `_open_connection_introspect` otherwise (`src/claude_sql/app/cli.py:789`).
-3. `_open_connection_full` opens an in-memory DuckDB, applies tuning PRAGMAs, and calls `register_all` (`src/claude_sql/app/cli.py:360`).
-4. `register_all` wires the catalog in dependency order: `register_raw` then `register_views` then `register_vss` then `register_analytics` then `register_macros` (`src/claude_sql/core/sql_views.py:2078`).
-5. `query` runs the user's SQL via `run_or_die(lambda: con.execute(sql).pl(), fmt=fmt)`, returning a Polars frame (`src/claude_sql/app/cli.py:798`).
-6. `run_or_die` returns the frame on success or routes a `duckdb.Error` through `classify_duckdb_error` to a parse/catalog/runtime exit code (`src/claude_sql/core/output.py:228`).
-7. On success, `emit_dataframe` renders the frame: a table on a TTY, JSON/NDJSON/CSV otherwise (`src/claude_sql/app/cli.py:799`).
-8. `query` closes the connection in its `finally` block and the process exits (`src/claude_sql/app/cli.py:802`).
+1. `query` receives one SQL string and configures logging + settings + output format `src/claude_sql/interfaces/cli/app.py:541`.
+2. It routes the connection: `_sql_uses_catalog` substring-matches view/macro names to decide full vs. introspect-only registration `src/claude_sql/interfaces/cli/app.py:602`.
+3. On the catalog path it opens an in-memory connection, migrating legacy caches, applying PRAGMAs, and gating VSS by `sql_uses_vss` `src/claude_sql/infrastructure/duckdb_connection.py:149`.
+4. `register_all` wires raw views, derived views, optional VSS, analytics views, and macros in dependency order `src/claude_sql/infrastructure/duckdb_views.py:2285`.
+5. `register_raw` binds `read_json` over the JSONL glob so DuckDB reads `~/.claude/**/*.jsonl` in place, zero-copy `src/claude_sql/infrastructure/duckdb_views.py:2332`.
+6. The statement executes against the registered catalog and materializes to a polars DataFrame `src/claude_sql/interfaces/cli/app.py:611`.
+7. `emit_dataframe` renders a table on TTY or JSON on pipe, then the connection closes in the `finally` `src/claude_sql/interfaces/cli/app.py:612`.
 
 ```mermaid
 sequenceDiagram
-    participant User
     participant CLI
-    participant Catalog
+    participant Infra
     participant DuckDB
-    User->>CLI: claude-sql query "<sql>"
-    CLI->>CLI: _open_connection_full
-    CLI->>Catalog: register_all
-    Catalog->>DuckDB: CREATE VIEWs + MACROs
-    DuckDB-->>Catalog: views ready
-    Catalog-->>CLI: connection wired
-    CLI->>DuckDB: con.execute(sql).pl()
-    DuckDB-->>CLI: Polars DataFrame
-    CLI-->>User: emit_dataframe (table / json)
+    participant JSONL
+    CLI->>Infra: _open_connection_full(settings, sql)
+    Infra->>DuckDB: connect + apply PRAGMAs
+    Infra->>DuckDB: register_all (raw/views/analytics/macros)
+    DuckDB->>JSONL: read_json over ~/.claude glob
+    JSONL-->>DuckDB: rows
+    CLI->>DuckDB: execute(sql).pl()
+    DuckDB-->>CLI: DataFrame
+    CLI->>CLI: emit_dataframe(df, fmt)
 ```
 
-## Flow 2: claude-sql embed
+## Flow 2: search (semantic top-k via HNSW)
 
-Async fan-out over Cohere Embed v4 on Bedrock. Discovers unembedded messages by anti-joining LanceDB, embeds them in batches under a concurrency-limiting semaphore, writes vectors back to LanceDB, and ensures the HNSW index.
-
-1. User invokes `claude-sql embed`; Cyclopts dispatches to the `embed` command body (`src/claude_sql/app/cli.py:1559`).
-2. `embed` opens a bare DuckDB connection and binds only `register_raw` and `register_views`, skipping VSS and analytics (`src/claude_sql/app/cli.py:1609`).
-3. `embed` calls `asyncio.run(run_backfill(...))` to drive the pipeline (`src/claude_sql/app/cli.py:1616`).
-4. `run_backfill` calls `discover_unembedded` to find the `(uuid, text)` pairs lacking an embedding (`src/claude_sql/analytics/embed_worker.py:395`).
-5. `discover_unembedded` reads embedded UUIDs via `lance_store.get_embedded_uuids` and anti-joins them against `messages_text` (`src/claude_sql/analytics/embed_worker.py:144`).
-6. `run_backfill` slices the pending list into chunks and calls `embed_documents_async`, which fans batches out under `asyncio.Semaphore(embed_concurrency)` (`src/claude_sql/analytics/embed_worker.py:457`).
-7. Each batch is dispatched via `_embed_one_batch` to `asyncio.to_thread(_invoke_bedrock_sync)`, which calls boto3 `invoke_model` against the Embed v4 profile (`src/claude_sql/analytics/embed_worker.py:253`).
-8. `run_backfill` writes each chunk into LanceDB via `lance_store.add_chunk`, then runs `optimize_if_needed` and `ensure_index` so later `search` calls hit a current index (`src/claude_sql/analytics/embed_worker.py:485`).
+1. `search` treats `query_text` as a natural-language query and applies any `--embedding-provider` override `src/claude_sql/interfaces/cli/app.py:1389`.
+2. It builds a `_CliSearch` subclass of `DuckDbSessionSearch` whose `embed_query` routes through the embed use case for monkeypatch parity `src/claude_sql/interfaces/cli/app.py:1464`.
+3. `DuckDbSessionSearch.search` opens a minimally-registered connection and guards on `SELECT count(*) FROM message_embeddings` — empty store returns no hits `src/claude_sql/infrastructure/session_search.py:129`.
+4. `embed_query` calls the injected `EmbeddingProvider` (Cohere Embed v4 on Bedrock by default) to embed the query text `src/claude_sql/infrastructure/session_search.py:142`.
+5. The cosine-kNN SQL joins `message_embeddings` to `messages_text`, ranking by `array_cosine_distance` ASC to trigger the HNSW index scan `src/claude_sql/infrastructure/session_search.py:160`.
+6. Rows become typed `SearchHit` objects carrying uuid, session_id, role, snippet, and cosine similarity `src/claude_sql/infrastructure/session_search.py:175`.
+7. The command projects hits into a DataFrame and emits it; an empty result exits with code 2 and a re-embed hint `src/claude_sql/interfaces/cli/app.py:1477`.
 
 ```mermaid
 sequenceDiagram
-    participant User
     participant CLI
-    participant EmbedWorker
-    participant DuckDB
-    participant LanceDB
+    participant Search
     participant Bedrock
-    User->>CLI: claude-sql embed
-    CLI->>EmbedWorker: run_backfill
-    EmbedWorker->>LanceDB: get_embedded_uuids
-    LanceDB-->>EmbedWorker: embedded set
-    EmbedWorker->>DuckDB: messages_text anti-join
-    DuckDB-->>EmbedWorker: pending (uuid, text)
-    EmbedWorker->>Bedrock: invoke_model (Embed v4)
-    Bedrock-->>EmbedWorker: vectors
-    EmbedWorker->>LanceDB: add_chunk + ensure_index
+    participant DuckDB
+    participant LanceStore
+    CLI->>Search: _CliSearch(settings).search(query, k)
+    Search->>DuckDB: count(*) message_embeddings
+    DuckDB-->>Search: n rows
+    Search->>Bedrock: embed_query(text)
+    Bedrock-->>Search: query vector
+    Search->>DuckDB: cosine-kNN join messages_text
+    DuckDB->>LanceStore: HNSW index scan
+    LanceStore-->>DuckDB: neighbors
+    DuckDB-->>CLI: SearchHit list
 ```
 
-## Flow 3: claude-sql classify
+## Flow 3: analyze (composite pipeline with register-write-rebind)
 
-Sonnet 4.6 structured-output classification of full session transcripts. Anti-joins finished sessions against the parquet, skips unchanged sessions via the checkpoint, dispatches calls under an `anyio.CapacityLimiter`, parses the structured payload, writes a parquet shard per chunk, and stamps the checkpoint.
-
-1. User invokes `claude-sql classify --no-dry-run`; Cyclopts dispatches to the `classify` command body (`src/claude_sql/app/cli.py:1730`).
-2. `classify` opens a full catalog connection and calls `classify_sessions` (`src/claude_sql/app/cli.py:1782`).
-3. `classify_sessions` enters the `pipeline_cache_stats("classify")` context and calls `asyncio.run(_classify_sessions_async)` (`src/claude_sql/analytics/classify_worker.py:245`).
-4. `_classify_sessions_async` reads existing shards via `read_all`, then computes the skip set via `session_bounds` and `checkpointer.filter_unchanged` (`src/claude_sql/analytics/classify_worker.py:60`).
-5. For each pending `(session_id, text)` from `iter_session_texts`, the worker schedules a `classify_one` coroutine under `anyio.CapacityLimiter(llm_concurrency)` (`src/claude_sql/analytics/classify_worker.py:106`).
-6. `classify_one` hands the blocking call to `anyio.to_thread.run_sync(_invoke_classifier_sync)`, which calls Bedrock `invoke_model` with `output_config.format` and parses the structured payload (`src/claude_sql/core/llm_shared.py:585`).
-7. After each chunk, ok rows are written via `write_part` to a fresh `<cache>/part-<ts_ns>.parquet` shard (`src/claude_sql/analytics/classify_worker.py:162`).
-8. The worker stamps `checkpointer.mark_completed` for the written sessions so the next run skips them unless the JSONL mtime moves (`src/claude_sql/analytics/classify_worker.py:169`).
+1. `analyze` applies embedding + LLM-analytics provider overrides, then delegates to the application layer with the CLI's own lifecycle seams for monkeypatch parity `src/claude_sql/interfaces/cli/app.py:2077`.
+2. `run_analyze` syncs the skills catalog, opens ONE shared connection, and wraps it in a `DuckDbReader` that exposes the rebind lifecycle `src/claude_sql/application/analyze.py:187`.
+3. The ingest stage stamps tiktoken counts + blake2b SimHash and resolves canonicals, refreshing analytics views around the resolve `src/claude_sql/application/analyze.py:195`.
+4. `run_backfill` embeds new messages into LanceDB, after which `rebind_vss("embed")` re-binds `message_embeddings` against the mutated Lance namespace `src/claude_sql/application/analyze.py:223`.
+5. `run_clustering` (UMAP+HDBSCAN) rewrites `clusters.parquet` and `run_terms` derives c-TF-IDF labels; analytics views refresh so cluster IDs become visible `src/claude_sql/application/analyze.py:228`.
+6. Before community detection, VSS re-binds and analytics refresh again — RFC §9.6's named stale-connection fix — then `run_communities` runs Leiden+CPM `src/claude_sql/application/analyze.py:251`.
+7. The four LLM stages (`classify_sessions`, `trajectory_messages`, `detect_conflicts`, `detect_user_friction`) run in order, each refreshing views afterward `src/claude_sql/application/analyze.py:262`.
+8. The shared connection closes in the `finally` and a per-stage summary dict returns `src/claude_sql/application/analyze.py:314`.
 
 ```mermaid
 sequenceDiagram
-    participant User
     participant CLI
-    participant Classifier
-    participant Checkpoint
-    participant LLMShared
+    participant AppLayer
+    participant DuckDB
+    participant LanceStore
     participant Bedrock
-    User->>CLI: claude-sql classify --no-dry-run
-    CLI->>Classifier: classify_sessions
-    Classifier->>Checkpoint: read_all + filter_unchanged
-    Checkpoint-->>Classifier: pending session ids
-    Classifier->>LLMShared: classify_one (per session)
-    LLMShared->>Bedrock: invoke_model (Sonnet 4.6)
-    Bedrock-->>LLMShared: structured JSON
-    LLMShared-->>Classifier: parsed dict
-    Classifier->>Checkpoint: write_part + mark_completed
+    CLI->>AppLayer: run_analyze(settings, ...)
+    AppLayer->>DuckDB: open shared connection (DuckDbReader)
+    AppLayer->>Bedrock: run_backfill (embed)
+    Bedrock-->>LanceStore: new vectors
+    AppLayer->>DuckDB: rebind_vss + refresh views
+    AppLayer->>AppLayer: run_clustering + run_terms
+    AppLayer->>DuckDB: rebind_vss + run_communities
+    AppLayer->>Bedrock: classify/trajectory/conflicts/friction
+    Bedrock-->>AppLayer: structured outputs
+    AppLayer-->>CLI: per-stage summary
 ```
 
 ## See also
 
-- [claude-sql · Contract map](../insights/contract-map.md) — 6 shared source files
-- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 5 shared source files
-- [claude-sql · Public API](../reference/public-api.md) — 5 shared source files
-- [claude-sql · Module map](module-map.md) — 4 shared source files
-- [claude-sql · Processes](../behavior/processes.md) — 4 shared source files
+- [claude-sql · Processes](../behavior/processes.md) — 5 shared source citations
+- [claude-sql · Sequences](../diagrams/behavioral/sequences.md) — 4 shared source citations
+- [claude-sql · Module map](../architecture/module-map.md) — 3 shared source citations
+- [claude-sql · Debugging guide](../insights/debugging-guide.md) — 3 shared source citations
+- [claude-sql · Impact analysis](../insights/impact-analysis.md) — 3 shared source citations

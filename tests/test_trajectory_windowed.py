@@ -17,8 +17,9 @@ Covers:
   promised by RFC §3.4; system prompt clears the Sonnet 2048-token cache
   floor.
 
-Bedrock is fully mocked. Bedrock client construction is monkeypatched
-to a sentinel ``object()`` so no boto3 wiring runs.
+Bedrock is fully mocked. Each test monkeypatches ``_classify_chunk`` so no
+provider / boto3 wiring runs; the default ``sonnet-bedrock`` provider is
+built lazily and never reaches a live client.
 """
 
 from __future__ import annotations
@@ -34,12 +35,13 @@ import polars as pl
 import pytest
 from loguru import logger
 
-from claude_sql.analytics import trajectory_worker
-from claude_sql.core import llm_shared
-from claude_sql.core.config import Settings
-from claude_sql.core.parquet_shards import iter_part_files, read_all
-from claude_sql.core.schemas import TRAJECTORY_ARRAY_SCHEMA, TrajectoryArrayResult, TrajectoryWindow
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.application.use_cases import trajectory as trajectory_worker
+from claude_sql.domain.models import TrajectoryArrayResult, TrajectoryWindow
+from claude_sql.infrastructure.bedrock import client as llm_shared
+from claude_sql.infrastructure.bedrock.structured_output import TRAJECTORY_ARRAY_SCHEMA
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.parquet_cache import iter_part_files, read_all
+from claude_sql.infrastructure.settings import Settings
 from conftest import _seed_subagent_stub, make_user_msg, write_session_jsonl
 
 # ---------------------------------------------------------------------------
@@ -181,7 +183,7 @@ def test_session_with_n_text_messages_produces_n_windows(
 
     # Monkeypatch ``_classify_chunk`` directly so the test controls the
     # indexed-by-(prev_uuid, curr_uuid) return shape — no boto3 round-trip.
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         captured_windows.append([(r[1], r[2]) for r in chunk])
         return {
             (prev, curr): {
@@ -198,7 +200,6 @@ def test_session_with_n_text_messages_produces_n_windows(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert isinstance(written, int)
@@ -233,7 +234,7 @@ def test_session_first_window_has_null_prev_uuid_and_neutral_synthetic(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return {
             (prev, curr): {
                 "prev_uuid": prev,
@@ -249,7 +250,6 @@ def test_session_first_window_has_null_prev_uuid_and_neutral_synthetic(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     df = read_all(tmp_settings.trajectory_parquet_path)
@@ -283,7 +283,7 @@ def test_session_with_more_than_16_text_messages_splits_into_chunks(
 
     captured_chunks: list[list[tuple[str | None, str]]] = []
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         keys = [(r[1], r[2]) for r in chunk]
         captured_chunks.append(keys)
         return {
@@ -301,7 +301,6 @@ def test_session_with_more_than_16_text_messages_splits_into_chunks(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 20
@@ -339,7 +338,7 @@ def test_array_response_with_missing_windows_triggers_retry(
 
     call_count = {"n": 0}
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         call_count["n"] += 1
         keys = [(r[1], r[2]) for r in chunk]
         # First call: drop the last 2 windows. Retry call (which sees only
@@ -361,7 +360,6 @@ def test_array_response_with_missing_windows_triggers_retry(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 16
@@ -394,7 +392,7 @@ def test_array_response_with_persistent_misses_stamps_neutral_placeholders(
     ]
     con = _build_corpus(tmp_path, [(sid, msgs)])
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         # Always drop the last 2 keys regardless of which call we're on.
         keys = [(r[1], r[2]) for r in chunk][:-2] if len(chunk) >= 2 else []
         return {
@@ -412,7 +410,6 @@ def test_array_response_with_persistent_misses_stamps_neutral_placeholders(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     written = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert written == 16
@@ -479,7 +476,7 @@ def test_old_per_message_parquet_shard_is_deleted_on_first_run(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return {
             (r[1], r[2]): {
                 "prev_uuid": r[1],
@@ -495,7 +492,6 @@ def test_old_per_message_parquet_shard_is_deleted_on_first_run(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     # The stale shard must be gone.
@@ -547,7 +543,7 @@ def test_rerun_with_advancing_bounds_replaces_prior_session_shards(
     register_raw(con, glob=glob, subagent_glob=sa_glob, subagent_meta_glob=sa_meta)
     register_views(con)
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return {
             (r[1], r[2]): {
                 "prev_uuid": r[1],
@@ -563,7 +559,6 @@ def test_rerun_with_advancing_bounds_replaces_prior_session_shards(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     first = trajectory_worker.trajectory_messages(con, tmp_settings, dry_run=False)
     assert first == 3
@@ -632,7 +627,7 @@ def test_pipeline_cache_stats_emits_summary(
         ],
     )
 
-    async def fake_chunk(client, settings, sem, *, chunk, thinking_mode):  # type: ignore[no-untyped-def]
+    async def fake_chunk(provider, *, chunk):  # type: ignore[no-untyped-def]
         return {
             (r[1], r[2]): {
                 "prev_uuid": r[1],
@@ -648,7 +643,6 @@ def test_pipeline_cache_stats_emits_summary(
         }
 
     monkeypatch.setattr(trajectory_worker, "_classify_chunk", fake_chunk)
-    monkeypatch.setattr(trajectory_worker, "_build_bedrock_client", lambda _settings: object())
 
     captured: list[str] = []
 

@@ -13,7 +13,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from claude_sql.analytics.community_worker import (
+from claude_sql.application.use_cases.community import (
     NOISE_COMMUNITY_ID,
     _build_igraph,
     _build_mutual_knn,
@@ -22,9 +22,9 @@ from claude_sql.analytics.community_worker import (
     neighbors_of,
     run_communities,
 )
-from claude_sql.core import lance_store
-from claude_sql.core.config import Settings
-from claude_sql.core.sql_views import register_raw, register_views, register_vss
+from claude_sql.infrastructure import lance_store
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views, register_vss
+from claude_sql.infrastructure.settings import Settings
 
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -227,7 +227,7 @@ def test_load_session_centroids_matches_numpy_reference(
     DuckDB ``unnest+groupby+list`` rewrite without freezing a binary
     baseline parquet on disk.
     """
-    from claude_sql.analytics.community_worker import _load_session_centroids
+    from claude_sql.application.use_cases.community import _load_session_centroids
 
     con, settings = connected_settings
     sids, centroids = _load_session_centroids(con, settings.lance_uri)
@@ -422,6 +422,6 @@ def test_resolution_profile_changepoints_monotonic(
 def _compute_centroids_helper(
     con: duckdb.DuckDBPyConnection, settings: Settings
 ) -> tuple[list[str], np.ndarray]:
-    from claude_sql.analytics.community_worker import _load_session_centroids
+    from claude_sql.application.use_cases.community import _load_session_centroids
 
     return _load_session_centroids(con, settings.embeddings_parquet_path)

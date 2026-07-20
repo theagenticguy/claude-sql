@@ -26,8 +26,7 @@ from unittest.mock import MagicMock
 
 from loguru import logger as loguru_logger
 
-from claude_sql.core import llm_shared
-from claude_sql.core.llm_shared import (
+from claude_sql.infrastructure.bedrock.client import (
     _accumulate_cache_stats,
     _invoke_classifier_sync,
     cacheable_text_block,
@@ -308,7 +307,8 @@ def test_pipeline_cache_stats_no_op_when_inactive() -> None:
 def test_maybe_log_bedrock_call_feeds_accumulator(monkeypatch) -> None:
     """``maybe_log_bedrock_call`` is the integration point — verify it
     feeds the accumulator even when ``CLAUDE_SQL_BEDROCK_TRACE`` is unset."""
-    monkeypatch.setattr(llm_shared, "_BEDROCK_TRACE_PATH", None)
+    # T-2-1: the trace-path global now lives on the Bedrock transport module.
+    monkeypatch.setattr("claude_sql.infrastructure.bedrock.client._BEDROCK_TRACE_PATH", None)
     buf, sink_id = _capture_loguru("INFO")
     try:
         with pipeline_cache_stats("integration"):

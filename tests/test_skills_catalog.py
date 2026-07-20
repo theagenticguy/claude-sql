@@ -7,8 +7,10 @@ from pathlib import Path
 
 import polars as pl
 
-from claude_sql.analytics import skills_catalog
-from claude_sql.core.config import Settings
+from claude_sql.application.use_cases import skills as skills_catalog
+from claude_sql.domain.skills import BUILTIN_SLASH_COMMANDS
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.infrastructure.skills_fs import _parse_frontmatter
 
 
 def _write_skill(dir_: Path, name: str, description: str) -> None:
@@ -72,7 +74,7 @@ def test_sync_dry_run_counts(tmp_path: Path) -> None:
     stats = skills_catalog.sync(settings, dry_run=True)
     # 1 user skill + (erpaval x2 + browser-automation x2 + ralph-loop x2)
     # + 15 builtins.  Dry run writes nothing.
-    assert stats["builtins"] == len(skills_catalog.BUILTIN_SLASH_COMMANDS)
+    assert stats["builtins"] == len(BUILTIN_SLASH_COMMANDS)
     assert stats["skills"] == 1 + 2 + 2  # user-skill + 2x plugin-skill pairs
     assert stats["commands"] == 2  # bare + namespaced plugin-command rows
     assert not (tmp_path / "skills_catalog.parquet").exists()
@@ -125,7 +127,7 @@ def test_sync_missing_roots_are_skipped(tmp_path: Path) -> None:
     stats = skills_catalog.sync(settings, dry_run=False)
     assert stats["skills"] == 0
     assert stats["commands"] == 0
-    assert stats["builtins"] == len(skills_catalog.BUILTIN_SLASH_COMMANDS)
+    assert stats["builtins"] == len(BUILTIN_SLASH_COMMANDS)
     df = pl.read_parquet(tmp_path / "skills_catalog.parquet")
     assert set(df["source_kind"].unique().to_list()) == {"builtin"}
 
@@ -137,5 +139,5 @@ def test_parse_frontmatter_tolerates_broken_yaml(tmp_path: Path) -> None:
     broken.write_text("---\nname: oops\n: this is invalid yaml\n---\n")
     # Direct call — the public sync path would just skip with a warning; this
     # pins the helper's contract directly.
-    meta = skills_catalog._parse_frontmatter(broken)
+    meta = _parse_frontmatter(broken)
     assert meta == {}

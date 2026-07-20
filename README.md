@@ -13,6 +13,21 @@
 > searchable, explorable, self-improving record of your work — in place,
 > with zero copy.
 
+> **v2 in progress.** A hexagonal rewrite is underway: `domain` /
+> `application` (ports) / `infrastructure` (adapters) / `interfaces`. The
+> `evals/` plane (judge panel, kappa, freeze/replay, blind-handover,
+> ungrounded) and the `provenance/` plane (transcript-to-PR binding,
+> review-sheet) move to a separate eval project and are being dropped.
+> Embeddings become pluggable behind an `EmbeddingProvider` port: Cohere
+> Embed v4 on Bedrock stays the default, and Ollama plus a local ONNX BGE
+> (BAAI `bge`) adapter arrive behind optional `[ollama]` and `[onnx]`
+> extras. The retrieval and clustering plane stays, which keeps the
+> package on Python 3.13 (`hdbscan` has no cp314 wheel yet). This README
+> documents what ships today in **v1.2.1**; every command tagged
+> **(dropping in v2)** still works now. Design and migration live in
+> [`docs/v2/DESIGN.md`](docs/v2/DESIGN.md) and
+> [`docs/v2/MIGRATION.md`](docs/v2/MIGRATION.md).
+
 ## What you get out of it
 
 **Remember what you worked on.**
@@ -138,7 +153,7 @@ git clone https://github.com/theagenticguy/claude-sql.git
 cd claude-sql
 mise install              # fetch pinned Python + uv
 mise run install          # uv sync --all-extras + install lefthook git hooks
-mise run check            # ruff + fmt + ty + pytest
+mise run check            # 5 gates: lint + fmt + typecheck + lint:imports + test
 ```
 
 `mise` auto-activates `.venv` on `cd`. Every command below is also
@@ -159,6 +174,11 @@ The IAM policy needs `bedrock:InvokeModel` on:
 
 - `inference-profile/global.cohere.embed-v4:0`
 - `inference-profile/global.anthropic.claude-sonnet-4-6`
+
+In v2 the embedding provider becomes pluggable: Cohere Embed v4 on Bedrock
+stays one of three options alongside a local Ollama server and a local ONNX
+BGE model, so the Cohere inference profile is required only when Bedrock is
+the active embedding provider. Sonnet classification stays on Bedrock.
 
 ### Reading transcripts from S3
 
@@ -208,6 +228,7 @@ claude-sql explain "SELECT * FROM messages WHERE session_id = '<uuid>' LIMIT 1"
 claude-sql shell
 
 # Backfill embeddings (Cohere Embed v4 via global CRIS).
+# v2 makes the provider pluggable; Cohere-on-Bedrock becomes one of three.
 claude-sql embed --since-days 30
 
 # Semantic search.
@@ -234,10 +255,12 @@ claude-sql query "SELECT * FROM unused_skills(30) LIMIT 20"
 claude-sql analyze --since-days 30 --no-dry-run
 
 # Provenance: resolve a merged commit back to the transcript that wrote it.
+# (dropping in v2: provenance plane moves to a separate eval project)
 claude-sql resolve "$(git rev-parse HEAD)"
 claude-sql review-sheet "$(git rev-parse HEAD)" --no-dry-run
 
 # Eval gym: pre-register a study, run the judge panel, gate on agreement.
+# (dropping in v2: eval plane moves to a separate eval project)
 claude-sql judges
 claude-sql freeze rubric.yaml --panel kimi-k2.5,deepseek-v3.2,glm-5
 claude-sql judge <manifest_sha> --sessions-parquet sessions.parquet \
@@ -276,7 +299,7 @@ respectively), so they have no dry-run gate.
 
 | Command | Purpose |
 |---|---|
-| `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock (spends by default) |
+| `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock (spends by default; v2 makes the provider pluggable across Cohere/Ollama/ONNX-bge) |
 | `search <text>` | IVF_HNSW_SQ cosine semantic search over the LanceDB store |
 | `ingest` | Stamp messages with `approx_tokens` / `simhash64` / canonical UUID (CPU only) |
 | `cluster` | UMAP → HDBSCAN over message embeddings (CPU only; `--force` to rebuild) |
@@ -302,7 +325,10 @@ respectively), so they have no dry-run gate.
 | `cache compact` | Consolidate a sharded `<cache>/part-*.parquet` directory into one file |
 | `cache migrate` | Move a legacy single-file cache into the sharded directory layout |
 
-**Eval gym (cross-provider judge panels + agreement gates)**
+**Eval gym (cross-provider judge panels + agreement gates), dropping in v2**
+
+These commands work today in v1.2.1. The eval plane moves to a separate
+eval project in v2.
 
 | Command | Purpose |
 |---|---|
@@ -314,7 +340,10 @@ respectively), so they have no dry-run gate.
 | `ungrounded-claim <manifest_sha>` | Run the ungrounded-claim detector over a turns parquet |
 | `kappa <scores_parquet>` | Cohen's + Fleiss' kappa with bootstrapped 95% CI; exit 66 below the floor |
 
-**Transcript ↔ PR provenance (RFC 0001)**
+**Transcript ↔ PR provenance (RFC 0001), dropping in v2**
+
+These commands work today in v1.2.1. The provenance plane moves to a
+separate eval project in v2.
 
 | Command | Purpose |
 |---|---|
@@ -419,8 +448,9 @@ prefix convention — see `config.py` for the full set.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_SQL_DEFAULT_GLOB` | `~/.claude/projects/*/*.jsonl` | Main transcript glob |
-| `CLAUDE_SQL_SUBAGENT_GLOB` | `~/.claude/projects/*/*/subagents/agent-*.jsonl` | Subagent transcripts |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's own config-dir root (**not** `CLAUDE_SQL_`-prefixed). When set, the transcript globs, `USER_SKILLS_DIR`, and `PLUGINS_CACHE_DIR` derive from it instead of `~/.claude`. Read at call time; an explicit `CLAUDE_SQL_*` glob and `CLAUDE_SQL_TEAM_CORPUS_ROOT` both still win |
+| `CLAUDE_SQL_DEFAULT_GLOB` | `$CLAUDE_CONFIG_DIR/projects/*/*.jsonl` | Main transcript glob |
+| `CLAUDE_SQL_SUBAGENT_GLOB` | `$CLAUDE_CONFIG_DIR/projects/*/*/subagents/agent-*.jsonl` | Subagent transcripts |
 | `CLAUDE_SQL_TEAM_CORPUS_ROOT` | `None` | Team-corpus root; when set, derives all three globs from `<root>/<author>/projects/*` (replaces the personal corpus) |
 | `CLAUDE_SQL_S3_ENDPOINT` | `None` | Custom S3 endpoint `host[:port]` for non-AWS stores (MinIO) or a local mock; unset uses default AWS S3. Only consulted when a glob is an `s3://` URI |
 | `CLAUDE_SQL_S3_URL_STYLE` | `vhost` | S3 addressing style (`vhost` or `path`); set `path` for MinIO / moto |
@@ -442,8 +472,8 @@ prefix convention — see `config.py` for the full set.
 | `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | DuckDB memory ceiling (percentage or absolute size) |
 | `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | DuckDB spill directory (avoids `/tmp` tmpfs thrash) |
 | `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `~/.claude/skills_catalog.parquet` | Skills catalog parquet |
-| `CLAUDE_SQL_USER_SKILLS_DIR` | `~/.claude/skills` | Root scanned for user-installed skills |
-| `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `~/.claude/plugins/cache` | Root scanned for plugin skills + commands |
+| `CLAUDE_SQL_USER_SKILLS_DIR` | `$CLAUDE_CONFIG_DIR/skills` | Root scanned for user-installed skills |
+| `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `$CLAUDE_CONFIG_DIR/plugins/cache` | Root scanned for plugin skills + commands |
 | `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Leiden determinism |
 | `CLAUDE_SQL_LEIDEN_KNN_K` | `15` | Mutual-kNN k for the session-centroid graph |
 | `CLAUDE_SQL_LEIDEN_EDGE_FLOOR` | `0.3` | Cosine floor below which edges are dropped |
@@ -457,7 +487,7 @@ prefix convention — see `config.py` for the full set.
 ## Development
 
 ```bash
-mise run check           # lint + fmt-check + typecheck + tests
+mise run check           # lint + fmt-check + typecheck + lint:imports + tests
 mise run fmt:write       # auto-apply ruff formatting
 mise run upgrade         # uv lock --upgrade && uv sync
 mise run build           # uv build → dist/*.whl + *.tar.gz
@@ -509,7 +539,7 @@ atomically.
 
 ### Quality gates
 
-Local `mise run check` (`lint + fmt + typecheck + test`) and GitHub
+Local `mise run check` (`lint + fmt + typecheck + lint:imports + test`) and GitHub
 Actions run the same commands against the same pinned tool versions (via
 `jdx/mise-action`), so contributors who pass the hooks locally can trust
 CI agrees. On top of the local gate, CI layers in:
@@ -560,7 +590,13 @@ See `docs/adr/0015-stack-modernization.md` and
   resilient to new block types (`thinking`, MCP shapes, etc.).
 - **Global CRIS for Cohere.** The `global.cohere.embed-v4:0` profile
   sustains the highest throughput with no throttling in testing; direct
-  and US CRIS both saturate at low TPM.
+  and US CRIS both saturate at low TPM. v2 moves this behind an
+  `EmbeddingProvider` port with Cohere-on-Bedrock, Ollama, and local ONNX
+  BGE adapters. Switching providers changes the vector dimension (Cohere
+  1024, bge-small 384, bge-base and nomic 768), and even at matching dims
+  the vector spaces are incompatible, so a provider switch requires a full
+  re-embed. v2 keys the store by (provider, model, dim). See
+  [`docs/v2/MIGRATION.md`](docs/v2/MIGRATION.md).
 - **LanceDB embeddings store.** Vectors and the cosine-metric
   `IVF_HNSW_SQ` (scalar-quantized HNSW) index live together in one
   versioned LanceDB dataset at `~/.claude/embeddings_lance/`; DuckDB
@@ -603,8 +639,8 @@ See `docs/adr/0015-stack-modernization.md` and
   the agent missed a proactive step) — falls through to Sonnet 4.6
   structured output. Scoped to user-role messages under 300 characters
   by default; longer turns are almost always genuine task instructions.
-- **Pre-registered eval gym.** The `judges` / `freeze` / `judge` /
-  `kappa` family grades transcripts with a cross-provider Bedrock judge
+- **Pre-registered eval gym (dropping in v2).** The `judges` / `freeze` /
+  `judge` / `kappa` family grades transcripts with a cross-provider Bedrock judge
   panel (8 non-Anthropic/non-Amazon primaries + a within-family
   Anthropic holdout to measure self-preference bias), then scores
   inter-rater agreement with Cohen's + Fleiss' kappa and bootstrapped
@@ -614,7 +650,8 @@ See `docs/adr/0015-stack-modernization.md` and
   exits `66` below the agreement floor. No DuckDB views or `list-cache`
   parquets — output goes to caller-named parquets stamped with the
   freeze SHA.
-- **Transcript ↔ PR provenance.** `bind` writes a host-neutral binding
+- **Transcript ↔ PR provenance (dropping in v2).** `bind` writes a
+  host-neutral binding
   between a merged commit and the transcript that produced it, encoded
   as three `git-interpret-trailers` trailers plus a JSON note under
   `refs/notes/transcripts`. `resolve` reads it back (trailer-first,

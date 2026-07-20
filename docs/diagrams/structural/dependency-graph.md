@@ -1,72 +1,68 @@
 # claude-sql · Dependency graph
 
+Internal nodes are the four hexagonal layers plus the `composition` facade, ordered by the single `import-linter` layers contract at `pyproject.toml:295-303` (`interfaces > application > infrastructure > domain`). External nodes are the direct runtime dependencies from `pyproject.toml:28-50`, ranked by how many source files import them and anchored to the layer that imports them most. Deps that fell outside the 20-node budget are in the Legend below.
+
 ```mermaid
 flowchart LR
-    classDef external stroke-dasharray: 3 3
+    ui[interfaces/cli]
+    app[application]
+    infra[infrastructure]
+    domain[domain]
+    comp[composition]
 
-    app[app]
-    core[core]
-    analytics[analytics]
-    evals[evals]
-    provenance[provenance]
+    ui --> app
+    ui --> infra
+    ui --> domain
+    app --> infra
+    app --> domain
+    infra --> domain
+    comp --> app
+    comp --> infra
 
-    loguru[(loguru)]:::external
+    cyclopts[(cyclopts)]:::external
     polars[(polars)]:::external
     duckdb[(duckdb)]:::external
-    bedrock[(AWS Bedrock)]:::external
-    pydantic[(pydantic)]:::external
-    lancedb[(lancedb)]:::external
-    pyarrow[(pyarrow)]:::external
-    tenacity[(tenacity)]:::external
     anyio[(anyio)]:::external
+    loguru[(loguru)]:::external
+    pyarrow[(pyarrow)]:::external
+    pydantic[(pydantic)]:::external
+    tenacity[(tenacity)]:::external
+    boto3[(boto3)]:::external
+    lancedb[(lancedb)]:::external
     numpy[(numpy)]:::external
-    cyclopts[(cyclopts)]:::external
     hdbscan[(hdbscan)]:::external
     umap[(umap-learn)]:::external
+    sklearn[(scikit-learn)]:::external
     leidenalg[(leidenalg)]:::external
-    tiktoken[(tiktoken)]:::external
 
-    app --> core
-    app --> analytics
-    app --> evals
-    app --> provenance
-    analytics --> core
-    evals --> core
-    provenance --> core
+    ui --> cyclopts
+    app --> polars
+    app --> duckdb
+    app --> anyio
+    infra --> loguru
+    infra --> pyarrow
+    infra --> pydantic
+    infra --> tenacity
+    infra --> boto3
+    infra --> lancedb
+    domain --> numpy
+    domain --> hdbscan
+    domain --> umap
+    domain --> sklearn
+    domain --> leidenalg
 
-    app --> cyclopts
-
-    core --> loguru
-    core --> polars
-    core --> duckdb
-    core --> bedrock
-    core --> pydantic
-    core --> lancedb
-    core --> pyarrow
-    core --> tenacity
-
-    analytics --> anyio
-    analytics --> numpy
-    analytics --> tiktoken
-    analytics --> hdbscan
-    analytics --> umap
-    analytics --> leidenalg
+    classDef external stroke-dasharray: 3 3
 ```
 
 ## Legend (overflow)
 
-Elided external nodes (declared in `pyproject.toml` but dropped to fit the 20-node budget), with the count of source files that import each:
+Direct dependencies (`pyproject.toml:28-50`) elided from the diagram to hold the 20-node budget. Edge count = number of source files importing the dep.
 
-| Node | Owning package | Importing files | Note |
-|---|---|---|---|
-| scikit-learn | analytics | 1 | `terms_worker.py:65` c-TF-IDF CountVectorizer |
-| igraph | analytics | 1 (2 sites) | `community_worker.py:70` mutual-kNN graph |
-| pydantic-settings | core | 1 | `config.py` settings root |
-| scipy | analytics | declared only | `pyproject.toml:46` |
-| pyyaml | core | 1 | `config.py` YAML knobs |
-| packaging | app | 1 | version parsing |
-| anthropic | core | declared only | `pyproject.toml:28`, no source import |
-
-## See also
-
-- [claude-sql · System overview](../../architecture/system-overview.md) — 2 shared source files
+| Dep | Anchor layer | Edges | Source |
+| --- | --- | --- | --- |
+| igraph | domain | 1 | `src/claude_sql/domain/structure/community.py` |
+| returns | application | 1 | `src/claude_sql/application/ports.py` |
+| tiktoken | domain | 1 | `src/claude_sql/domain/dedup.py` |
+| pydantic-settings | infrastructure | 1 | `src/claude_sql/infrastructure/settings.py` |
+| pyyaml | infrastructure | 1 | `src/claude_sql/infrastructure/skills_fs.py` |
+| packaging | domain | 1 | `src/claude_sql/domain/skills.py` |

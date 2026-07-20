@@ -20,16 +20,15 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.analytics.ingest import (
-    NEAR_DUP_HAMMING_THRESHOLD,
+from claude_sql.application.use_cases.ingest import (
     count_pending,
     resolve_canonicals,
-    simhash64,
     stamp_messages,
 )
-from claude_sql.core.config import Settings
-from claude_sql.core.parquet_shards import iter_part_files
-from claude_sql.core.sql_views import register_raw, register_views
+from claude_sql.domain.dedup import NEAR_DUP_HAMMING_THRESHOLD, simhash64
+from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.parquet_cache import iter_part_files
+from claude_sql.infrastructure.settings import Settings
 
 # ---------------------------------------------------------------------------
 # Fixture builders (local — we want full control over text contents)
@@ -299,7 +298,7 @@ def test_simhash_threshold_constant_matches_macro() -> None:
     """
     import inspect
 
-    from claude_sql.core.sql_views import register_macros  # local import
+    from claude_sql.infrastructure.duckdb_views import register_macros  # local import
 
     src = inspect.getsource(register_macros)
     assert f"<= {NEAR_DUP_HAMMING_THRESHOLD}" in src, (
@@ -339,7 +338,7 @@ def test_ingest_subcommand_dry_run_default(corpus: dict[str, Any], tmp_path: Pat
         "HOME": __import__("os").environ.get("HOME", ""),
     }
     proc = subprocess.run(
-        [sys.executable, "-m", "claude_sql.app.cli", "ingest", "--format", "json"],
+        [sys.executable, "-m", "claude_sql.interfaces.cli.app", "ingest", "--format", "json"],
         env=env,
         capture_output=True,
         check=False,

@@ -11,7 +11,7 @@ from typing import Any
 import duckdb
 import pytest
 
-from claude_sql.core.sql_views import (
+from claude_sql.infrastructure.duckdb_views import (
     MACRO_NAMES,
     MACRO_SIGNATURES,
     VIEW_SCHEMA,

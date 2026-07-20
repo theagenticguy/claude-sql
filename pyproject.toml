@@ -14,6 +14,7 @@ keywords = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
@@ -25,12 +26,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "anthropic>=0.40",
     "anyio>=4.13.0",
     "boto3>=1.42.91",
     "cyclopts>=4.10.2",
     "duckdb>=1.5.2,<2",
-    "hdbscan>=0.8.40",
+    "hdbscan>=0.8.44",
     "igraph>=1.0.0,<2.0",
     "lancedb>=0.30,<0.35",
     "leidenalg>=0.11.0,<0.13",
@@ -42,15 +42,15 @@ dependencies = [
     "pydantic>=2.13.2",
     "pydantic-settings>=2.13.1",
     "pyyaml>=6.0.3",
+    "returns>=0.28.0",
     "scikit-learn>=1.5",
-    "scipy>=1.13",
     "tenacity>=9.1.4",
     "tiktoken>=0.12.0",
     "umap-learn>=0.5.12",
 ]
 
 [project.scripts]
-claude-sql = "claude_sql.app.cli:main"
+claude-sql = "claude_sql.interfaces.cli.app:main"
 
 [project.urls]
 Homepage = "https://github.com/theagenticguy/claude-sql"
@@ -58,12 +58,24 @@ Repository = "https://github.com/theagenticguy/claude-sql"
 Issues = "https://github.com/theagenticguy/claude-sql/issues"
 Changelog = "https://github.com/theagenticguy/claude-sql/blob/main/CHANGELOG.md"
 
+[project.optional-dependencies]
+ollama = [
+    "httpx>=0.28",
+]
+onnx = [
+    "fastembed>=0.8",
+]
+llm-analytics = [
+    "strands-agents[openai]>=1.46,<2",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12"]
 build-backend = "uv_build"
 
-# Single package, one namespace root with five layer sub-packages
-# (core / analytics / evals / provenance / app) under src/claude_sql/.
+# Single package, one namespace root with the hexagonal layer sub-packages
+# (domain / application / infrastructure / interfaces, plus the transitional
+# `core`) under src/claude_sql/.
 # `namespace = true` lets uv_build pick up every sub-package under the
 # claude_sql.* namespace without enumerating each. `claude-sql` builds as
 # ONE self-contained wheel — `uv build` Just Works, no bundle step.
@@ -94,6 +106,7 @@ explicit = true
 dev = [
     "bandit[sarif]>=1.9.4",
     "commitizen>=4.13.10",
+    "hypothesis>=6.157.0",
     "import-linter>=2.3",
     "lefthook>=2.1.6",
     "moto[s3,server]>=5.2.0",
@@ -140,9 +153,10 @@ ignore = [
 ]
 "**/__init__.py" = ["F401", "E402"]
 # Glob-style keys so the ignores travel with the file regardless of where
-# it lands in the tree. ``cli.py`` and ``output.py`` legitimately call
-# print() at the CLI boundary; T20 must not fire there.
-"**/cli.py" = ["T20"]
+# it lands in the tree. The cyclopts CLI (``interfaces/cli/app.py``) and
+# ``interfaces/cli/output.py`` legitimately call print() at the CLI boundary;
+# T20 must not fire there.
+"**/interfaces/cli/app.py" = ["T20"]
 "**/output.py" = ["T20"]
 # Build/release helper scripts print progress to stdout by design.
 "scripts/**/*" = ["T20", "S101", "ANN"]
@@ -158,7 +172,7 @@ ban-relative-imports = "all"
 # Forbid stdlib `logging` everywhere in claude-sql. The whole package logs
 # via loguru. See best-practices/loguru-only-no-stdlib-logging.md.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"logging".msg = "Use loguru via `from loguru import logger`. For tenacity retry callbacks use `claude_sql.core.logging_setup.loguru_before_sleep('LEVEL')`."
+"logging".msg = "Use loguru via `from loguru import logger`. For tenacity retry callbacks use `claude_sql.infrastructure.logging_setup.loguru_before_sleep('LEVEL')`."
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
@@ -189,7 +203,7 @@ docstring-code-line-length = "dynamic"
 # ty — single src/ tree.
 # ---------------------------------------------------------------------------
 [tool.ty.environment]
-python-version = "3.13"
+python-version = "3.14"
 python-platform = "linux"
 python = ".venv"
 root = ["./src", "./tests"]
@@ -253,28 +267,37 @@ pre_bump_hooks = ["uv lock"]
 post_bump_hooks = ["uv sync"]
 
 # ---------------------------------------------------------------------------
-# import-linter — layered DAG enforcement, now intra-package.
-# core (L0) < {analytics, evals, provenance} (L1 siblings) < app (L2).
-# The layers live under one distribution but the architectural boundary
-# is still enforced so the modules can't quietly entangle.
+# import-linter — hexagonal DAG enforcement, intra-package.
+#
+# The hexagon: interfaces > application > infrastructure > domain.
+#   interfaces (driving adapters / composition root) is highest; domain (pure,
+#   no boto3/duckdb/lancedb) is lowest. Adapters implement ports, so any pure
+#   value-object or port Protocol an ``infrastructure`` adapter returns or is
+#   typed against (e.g. ``SearchHit``, ``EmbeddingProvider``,
+#   ``LlmAnalyticsProvider``) lives in ``domain`` and is re-exported by
+#   ``application.ports`` — that keeps the adapter from importing UP into
+#   ``application``.
+#
+# The transitional ``core`` package is gone (dissolved in T-8-2): its four
+#   deferrals were rehomed into the clean hexagon — ``core.schemas`` -> the
+#   pydantic models in ``domain.models`` (with the Bedrock schema constants in
+#   ``infrastructure.bedrock.structured_output``); ``core.config`` -> the
+#   env-driven ``infrastructure.settings``; the two provider-port Protocols ->
+#   ``domain.ports`` (factories + adapters -> ``infrastructure.{embedding,
+#   llm_analytics}``, terminal errors -> ``domain.errors``, dimension guard ->
+#   ``domain.embedding_guard``). One layers contract now covers everything;
+#   ``claude_sql.composition`` is the composition-root module and, like
+#   ``interfaces``, wires the layers together (it imports infrastructure lazily).
 # ---------------------------------------------------------------------------
 [tool.importlinter]
 root_packages = ["claude_sql"]
 
 [[tool.importlinter.contracts]]
-name = "claude-sql layered architecture"
+name = "claude-sql hexagonal architecture"
 type = "layers"
 layers = [
-    "claude_sql.app",
-    "claude_sql.analytics | claude_sql.evals | claude_sql.provenance",
-    "claude_sql.core",
-]
-
-[[tool.importlinter.contracts]]
-name = "analytics / evals / provenance are independent siblings"
-type = "independence"
-modules = [
-    "claude_sql.analytics",
-    "claude_sql.evals",
-    "claude_sql.provenance",
+    "claude_sql.interfaces",
+    "claude_sql.application",
+    "claude_sql.infrastructure",
+    "claude_sql.domain",
 ]

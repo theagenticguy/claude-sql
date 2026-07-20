@@ -20,7 +20,7 @@ from typing import Any
 import duckdb
 import pytest
 
-from claude_sql.core.sql_views import VIEW_SCHEMA, register_raw, register_views
+from claude_sql.infrastructure.duckdb_views import VIEW_SCHEMA, register_raw, register_views
 
 # ---------------------------------------------------------------------------
 # Fixture builder — local to this test module so we control every field

@@ -19,18 +19,19 @@ import numpy as np
 import polars as pl
 import pytest
 
-from claude_sql.analytics.community_worker import (
+from claude_sql.application.use_cases.community import (
     NOISE_COMMUNITY_ID,
     _build_mutual_knn,
     _compute_medoid_and_coherence,
     _pick_zoom,
+    count_candidate_sessions,
     neighbors_of,
     run_communities,
 )
-from claude_sql.app import cli
-from claude_sql.app.cli import Common
-from claude_sql.core.config import Settings
-from claude_sql.core.output import OutputFormat
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.interfaces.cli import app as cli
+from claude_sql.interfaces.cli.app import Common
+from claude_sql.interfaces.cli.output import OutputFormat
 
 # ---------------------------------------------------------------------------
 # _build_mutual_knn: n < 2 short-circuit
@@ -171,8 +172,8 @@ def test_run_communities_empty_join_raises(tmp_path: Path) -> None:
     """Embeddings exist but no uuid matches messages -> RuntimeError."""
     from datetime import UTC, datetime as _dt
 
-    from claude_sql.core import lance_store
-    from claude_sql.core.sql_views import register_vss
+    from claude_sql.infrastructure import lance_store
+    from claude_sql.infrastructure.duckdb_views import register_vss
 
     lance_uri = tmp_path / "embeddings_lance"
     df = pl.DataFrame(
@@ -247,7 +248,7 @@ def test_compute_resolution_profile_emits_last_partition_plateau(
     connected_settings_module: tuple[duckdb.DuckDBPyConnection, Settings],
 ) -> None:
     """The final partition in the profile uses range_hi as its right edge."""
-    from claude_sql.analytics.community_worker import (
+    from claude_sql.application.use_cases.community import (
         _build_igraph,
         _compute_resolution_profile,
     )
@@ -255,7 +256,10 @@ def test_compute_resolution_profile_emits_last_partition_plateau(
     con, settings = connected_settings_module
     # Reuse the loader to build a real graph then run the profile end-to-end
     # so the last-partition `next_gamma = range_hi` branch executes.
-    from claude_sql.analytics.community_worker import _build_mutual_knn, _load_session_centroids
+    from claude_sql.application.use_cases.community import (
+        _build_mutual_knn,
+        _load_session_centroids,
+    )
 
     sids, centroids = _load_session_centroids(con, settings.embeddings_parquet_path)
     sim = centroids @ centroids.T
@@ -301,6 +305,21 @@ def test_neighbors_of_warns_when_communities_parquet_missing(
 # ---------------------------------------------------------------------------
 # CLI community subcommand: --dry-run, --neighbors-of, mutual-exclusion
 # ---------------------------------------------------------------------------
+
+
+def test_count_candidate_sessions_matches_dry_run_plan(
+    connected_corpus: tuple[duckdb.DuckDBPyConnection, Settings, Common],
+) -> None:
+    """The extracted use-case counter returns the same distinct-session count."""
+    con, _settings, _common = connected_corpus
+    n = count_candidate_sessions(con)
+    assert n >= 1
+    # Equals the raw COUNT(DISTINCT ...) it replaced.
+    row = con.execute(
+        "SELECT COUNT(DISTINCT m.session_id) FROM message_embeddings e "
+        "JOIN messages m ON CAST(m.uuid AS VARCHAR) = e.uuid"
+    ).fetchone()
+    assert n == int(row[0])
 
 
 def test_community_dry_run_emits_plan(
@@ -414,8 +433,8 @@ def connected_settings_module(
     """Mirror of the smoke test fixture; 4 sessions, 2 orthogonal centroid groups."""
     from datetime import UTC, datetime as _dt
 
-    from claude_sql.core import lance_store
-    from claude_sql.core.sql_views import register_raw, register_views, register_vss
+    from claude_sql.infrastructure import lance_store
+    from claude_sql.infrastructure.duckdb_views import register_raw, register_views, register_vss
 
     proj = tmp_path / "projects" / "-home-x-proj"
     proj.mkdir(parents=True)

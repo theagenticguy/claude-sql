@@ -10,10 +10,12 @@ A standalone Python CLI that makes the user's own Claude Code transcripts —
 everything under `~/.claude/projects/**/*.jsonl` plus subagent sidecar files —
 queryable in place. Four analytics layers stack on top of those JSONLs:
 
-1. **SQL** — DuckDB reads the JSONLs with zero copy; 18 views + 14 macros
+1. **SQL** — DuckDB reads the JSONLs with zero copy; 29 views + 21 macros
    normalize messages, tool calls, todos, subagents, costs.
 2. **Semantic search** — Cohere Embed v4 (Bedrock, global CRIS) embeds every
-   message; DuckDB VSS HNSW cosine index serves top-k in milliseconds.
+   message; a LanceDB `IVF_HNSW_SQ` cosine index, read back through DuckDB's
+   `lance` extension, serves top-k in milliseconds. (v2: the embedder becomes
+   pluggable behind an `EmbeddingProvider` port; see the v2 direction section.)
 3. **LLM analytics** — Sonnet 4.6 (global CRIS, `output_config.format`
    structured output) classifies sessions (autonomy tier, work category,
    success, goal), scores per-message sentiment, detects stance conflicts,
@@ -31,6 +33,122 @@ Every expensive output (embeddings, classifications, clusters, communities,
 friction) is cached in parquet under `~/.claude/`. Views register only the
 parquets that exist — missing ones warn and no-op, never crash.
 
+## Current structure (v2 hexagonal, on `feat/v2-hexagonal`)
+
+One distribution, one namespace root `src/claude_sql/`, reshaped into the
+hexagonal layers. The `import-linter` contract in `pyproject.toml`
+(`[tool.importlinter]`, checked by the `lint:imports` gate) is now **one
+contract** — the transitional `core` fence is gone (dissolved in T-8-2):
+
+1. **Layers (the hexagon):** `interfaces` > `application` > `infrastructure` >
+   `domain` — `interfaces` highest (driving adapters / composition root),
+   `domain` lowest (pure: no boto3/duckdb/lancedb).
+
+- **`domain/`**: pure logic + value-objects — classification/window math
+  (`trajectory`, `structure/{cluster,community,terms}`), `dedup`, `friction`
+  regex bank, `transcript` collapse/format, `costs`, the pydantic classification
+  *models* (`models.py`), the provider-port Protocols (`ports.py`:
+  `EmbeddingProvider` / `LlmAnalyticsProvider` / `SchemaT`), `errors`
+  (`DomainError` / `BedrockRefusalError` / `EmbeddingProviderMismatch` /
+  `LlmAnalyticsUnavailable`), the embedding dimension guard
+  (`embedding_guard.ensure_store_matches`), `retrieval.SearchHit`, and the
+  per-pipeline config value-objects (`domain/config.py`). No third-party
+  adapters.
+- **`application/`**: use-cases (`use_cases/{embed,classify,trajectory,
+  conflicts,friction,cluster,community,terms,ingest,skills}`), the `analyze`
+  chain, the port surface (`ports.py` — re-exports the domain Protocols +
+  `SearchHit`, defines the storage ports), task-framing `prompts`, and the
+  shared DuckDB dry-run counter (`use_cases/_shared.py`). Depends on
+  `domain` + `infrastructure` (adapters) only.
+- **`infrastructure/`**: the ONLY place with boto3/duckdb/lancedb/onnx —
+  `settings` (the env-driven `Settings`, ← `core/config.py`),
+  `duckdb_views` (the 29-view + 21-macro engine, ← `sql_views`),
+  `duckdb_connection`, `duckdb_s3` (← `s3_source`), `duckdb_errors`,
+  `lance_store`, `parquet_cache` (← `parquet_shards`),
+  `sqlite_state/{checkpointer,retry_queue}`, `bedrock/{client,structured_output}`
+  (← `llm_shared` transport + schema flattening; `structured_output` holds the
+  `*_SCHEMA` constants + `_bedrock_schema`), the provider factories + adapters
+  `embedding/{__init__(build_embedder),cohere_bedrock,ollama,onnx_bge}` and
+  `llm_analytics/{__init__(build_llm_analytics_provider),sonnet_bedrock,strands_luna}`,
+  `session_text_loader`, `session_search`, `transcript_reader`, `skills_fs`,
+  `home`, `logging_setup`.
+- **`interfaces/`**: `cli/{app,output,install_source}` — the cyclopts CLI
+  (← `app/cli.py`), the driving adapter + composition root. `main` +
+  `python -m claude_sql.interfaces.cli.app` live here.
+
+`composition.py` (`ClaudeSql` facade) and the top-level `__init__` re-export
+sit at the root; `composition` wires the layers and imports infrastructure
+lazily. The provider-port Protocols live in `domain.ports` (not
+`application.ports`) so the concrete infra adapters can be typed against them
+without importing UP into `application` — `import-linter` counts `TYPE_CHECKING`
+imports as real edges, so an `application`-home would break the layers contract;
+the `SearchHit` re-export pattern is the same idiom. The `evals/` and
+`provenance/` planes were dropped in an earlier v2 commit. Build is `uv_build`
+namespace package to one self-contained wheel. The `mise run check` pytest gate
+covers **758** collected tests.
+
+## v2 direction (in progress, not shipped)
+
+The owner has decided a v2 that reshapes this repo. The code below still
+describes v1.2.1 truthfully; this section states the trajectory so an agent
+working here today knows where things head. **`docs/v2/DESIGN.md` and
+`docs/v2/MIGRATION.md` are the authoritative specs** (being written in
+parallel); the grounded understanding pass lives in
+`docs/v2/understanding/01-architecture.md` through `07-tests-ci-build-docs.md`.
+This section is a pointer, not a substitute.
+
+1. **Strict hexagonal layering.** DONE on this branch — the tree is now
+   `domain / application (ports) / infrastructure (adapters) / interfaces`,
+   enforced by the single layers import-linter contract described in "Current
+   structure" above. All back-compat shims are deleted and the transitional
+   `core` package is fully dissolved (T-8-2): its four deferrals moved to
+   `domain.models` (pydantic models) + `infrastructure.bedrock.structured_output`
+   (schema constants), `infrastructure.settings` (`Settings`), `domain.ports`
+   (provider Protocols) + `infrastructure.{embedding,llm_analytics}` (factories +
+   adapters) + `domain.errors`/`domain.embedding_guard`. See DESIGN.md for the
+   target tree.
+2. **Drop `evals/` and `provenance/`.** Both are cleanly severable: `app/cli.py`
+   is the only importer of either, nothing in `core`/`analytics` depends on
+   them, and the import-linter independence contract holds on the call graph.
+   The drop deletes seven eval CLI commands (`judges`, `freeze`, `replay`,
+   `blind-handover`, `judge`, `ungrounded-claim`, `kappa`) and three provenance
+   commands (`bind`, `resolve`, `review-sheet`), plus their tests. **The
+   import-linter contracts at `pyproject.toml:293-313` MUST be edited in the
+   same PR as the deletion**. Remove the `evals`/`provenance` terms from both
+   the layers list and the independence `modules` list, or `mise run check`
+   hard-fails on the `lint:imports` gate the moment those modules are gone.
+   The `PRReviewSheet`/`Correction`/`PR_REVIEW_SHEET_SCHEMA` surface was pruned
+   from the classification schemas (provenance-only, done — those models now
+   live in `domain/models.py`). Still to do: drop the dead direct pins
+   `anthropic` and `scipy` via `uv remove`.
+3. **Pluggable embeddings behind an `EmbeddingProvider` port.**
+   Cohere-on-Bedrock (current) plus Ollama and local ONNX BGE, the latter two
+   under optional extras `[ollama]` / `[onnx]` so the base wheel stays lean.
+   The hazard is the **dimension contract**: `output_dimension` threads
+   unvalidated into the Lance fixed-size vector schema (frozen on the first
+   write to a fresh dir), the DuckDB `FLOAT[dim]` view cast, and the query-time
+   cast. Switching providers requires a full re-embed (`rm -rf
+   ~/.claude/embeddings_lance/` then `embed`), and even same-dim vectors from
+   different models live in incompatible spaces. The `model` column already
+   exists on every Lance row but is **write-only today**; v2 must promote it to
+   a read-and-enforce, fail-loud guard on provider/dim mismatch.
+4. **Keep retrieval + clustering.** This plane is the differentiator and stays.
+   Keeping UMAP+HDBSCAN keeps Python pinned to **3.13**: `hdbscan` is the sole
+   `cp314` blocker (the other clustering deps ship cp314 wheels but travel with
+   hdbscan). `docs/adr/0015-stack-modernization.md` records this. Relaxation
+   path: put `cluster`/`community`/`terms` behind an optional extra so a future
+   base package (SQL + semantic search + LLM analytics, all cp314-ready) could
+   target 3.14 while only the clustering extra stays on 3.13.
+
+### `returns` discipline (v2 port surface)
+
+`returns` is used for `Result[T, DomainError]` only — the uniform value that
+crosses a port boundary (`application/ports.py:PortResult`). Do NOT use
+`.bind()`, `@safe`, `flow`, `pipe`, or any HKT feature: they require the
+`returns` mypy plugin and hard-error under `ty` (which we run in strict mode).
+Use only `Success` / `Failure`, `is_successful` (from `returns.pipeline`, not
+`returns.result`), `.unwrap()`, `.map()`, `.alt()`, and `match` narrowing.
+
 ## How to work on it
 
 - **Package manager:** `uv` only. Never hand-edit `[dependencies]` in
@@ -38,9 +156,14 @@ parquets that exist — missing ones warn and no-op, never crash.
 - **Task runner:** `mise`. Every developer command is a mise task. Run
   `mise tasks` to see the full list. Do not invent bare `uv run` / `ruff`
   invocations for things that already have a task.
-- **Quality gate:** `mise run check` must pass before any commit —
-  that's `lint + fmt + typecheck + test` in parallel. Treat every
-  non-zero exit as a blocker, not a "pre-existing" issue to skip past.
+- **Quality gate:** `mise run check` must pass before any commit. That is
+  **five** gates: `lint + fmt + typecheck + lint:imports + test`
+  (`mise.toml` `[tasks.check].depends`). `lint:imports` runs `lint-imports`
+  against the `pyproject.toml` hexagonal contract (the single layers DAG; the
+  `core`-forbidden fence was removed when `core` dissolved); the pytest gate
+  covers **758** collected tests (down from 826 after the evals/provenance
+  drop). Treat every non-zero exit as a blocker to fix now, even if it looks
+  pre-existing.
 - **Security gate:** `mise run security` runs all four SAST/SCA/secrets
   scanners in parallel — `bandit + semgrep + osv + leaks` — and writes
   SARIF under `.sarif/` (gitignored). Mirrors what CI uploads to GitHub
@@ -49,9 +172,11 @@ parquets that exist — missing ones warn and no-op, never crash.
   gating happens in code scanning UI, not the scanner exit code. Run
   before opening a PR if you've touched anything load-bearing
   (binding/ingestion/CLI surface).
-- **Python floor:** `3.13` (`.python-version` + `pyproject.toml`
-  `requires-python` + `mise.toml [tools].python` all agree). 3.14 is
-  deferred pending `hdbscan` cp314 wheels — see
+- **Python: 3.14 toolchain, `>=3.13` floor.** The dev toolchain runs 3.14
+  (`.python-version` = `3.14`, `mise.toml [tools].python` = `3.14`), while
+  `pyproject.toml requires-python` stays `>=3.13` so the wheel still installs
+  on 3.13. `hdbscan` is the sole cp314 blocker for the clustering extra; the
+  base planes (SQL + semantic search + LLM analytics) are cp314-ready. See
   `docs/adr/0015-stack-modernization.md`.
 - **Formatting:** `mise run fmt:write` applies ruff formatting. Line length
   is 100. Ruff runs a 32-family strict selector set (E, W, F, I, N, UP, B,
@@ -358,6 +483,9 @@ for the lesson capturing this; the cyclonedx-py flag-shape fix is in
   **global** CRIS profiles — `global.cohere.embed-v4:0` and
   `global.anthropic.claude-sonnet-4-6`. Direct model IDs and US-only CRIS
   throttle under load; global is the only path that sustains throughput.
+  (v2: the embedding path becomes pluggable behind `EmbeddingProvider`;
+  Bedrock Cohere stays the default, Ollama and ONNX BGE join as local options
+  under optional extras. Sonnet classification stays Bedrock-only.)
 - **IAM:** `bedrock:InvokeModel` on both inference profiles above.
 - **Credentials:** `AWS_PROFILE=<your-profile>` in the environment. The CLI
   reads it via boto3's standard chain.
@@ -546,7 +674,10 @@ math (per-class TF, IDF, L1 norm, ngram (1,2), min_df=2). Do not pull in
   disabled so tenacity owns the policy.
 - Embeddings parquet: write with explicit `pl.Array(pl.Float32,
   output_dimension)` schema, otherwise polars infers `Object` and the
-  roundtrip breaks.
+  roundtrip breaks. (v2: `output_dimension` becomes an adapter-reported
+  `provider.dimension` rather than a free `Settings` field, and the `model`/`dim`
+  columns get read back to fail loud on a provider switch instead of silently
+  corrupting the index.)
 - Model-ID cost lookup: strip the dated suffix via
   `re.sub(r'-\d{8}$', '', model_id)` before looking it up, so
   `claude-sonnet-4-6-20260315` matches the same entry as
@@ -684,20 +815,25 @@ for the full table. The common overrides:
   the *Release flow under branch-protection* section above for the full
   branch → PR → squash-merge → re-tag → push-tag → cut-release sequence.
 
-## OpenCodeHub MCP Tools
+## CodeGraph: code intelligence
 
-This repository has been indexed by OpenCodeHub. When you are working in this
-codebase, prefer the following MCP tools over raw file search — they return
-graph-aware results grouped by execution flow and include blast-radius risk
-tiers.
+This repository is indexed by CodeGraph (a `.codegraph/` directory exists at
+the repo root). When working in this codebase, reach for CodeGraph BEFORE
+grep/find or reading whole files to understand or locate code. It returns the
+relevant symbols' verbatim source plus the call paths between them, including
+dynamic-dispatch hops that text search cannot follow.
 
-- `list_repos` — enumerate repos currently indexed on this machine.
-- `query` — hybrid BM25 + vector search over symbols, grouped by process.
-- `context` — inbound/outbound refs and participating flows for one symbol.
-- `impact` — dependents of a target up to a configurable depth, with a risk tier.
-- `detect_changes` — map an uncommitted or committed diff to affected symbols.
-- `list_findings` — browse SARIF findings from the latest scan by severity and rule.
-- `sql` — read-only SQL against the local temporal store (cochanges + symbol_summaries), 5 s timeout; the node/edge graph is queried via the typed tools or Cypher via the MCP `sql` tool.
+- **MCP tool:** `codegraph_explore` answers most code questions in one call.
+  Name a file or symbol in the query to read its current line-numbered source.
+  `codegraph_node` returns one symbol's source plus its caller/callee trail.
+- **Shell (always works):**
+  - `codegraph explore "<symbols or question>"`: same output as the MCP tool.
+  - `codegraph query "<term>"`: search for symbols.
+  - `codegraph node <name>`: one symbol's source plus its caller/callee trail.
+  - `codegraph callers <symbol>` / `codegraph callees <symbol>`: call graph.
+  - `codegraph impact <symbol>`: what a change to a symbol affects.
+  - `codegraph affected <files...>`: test files affected by changed sources.
+  - `codegraph files`: project file structure from the index.
 
-Run `codehub analyze` after pulling new commits so the index stays aligned
-with the working tree. `codehub status` reports staleness.
+Run `codegraph sync` after pulling new commits so the index stays aligned with
+the working tree. `codegraph status` reports index staleness.

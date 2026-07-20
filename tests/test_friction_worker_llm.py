@@ -24,11 +24,11 @@ import duckdb
 import polars as pl
 import pytest
 
-from claude_sql.analytics import friction_worker
-from claude_sql.core import checkpointer, retry_queue
-from claude_sql.core.config import Settings
-from claude_sql.core.llm_shared import BedrockRefusalError
-from claude_sql.core.parquet_shards import read_all
+from claude_sql.application.use_cases import friction as friction_worker
+from claude_sql.domain.errors import BedrockRefusalError
+from claude_sql.infrastructure.parquet_cache import read_all
+from claude_sql.infrastructure.settings import Settings
+from claude_sql.infrastructure.sqlite_state import checkpointer, retry_queue
 
 # ---------------------------------------------------------------------------
 # Local helpers — keep each test under <1 s and isolated from the real cache.

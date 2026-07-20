@@ -1,9 +1,11 @@
 {
   "mcpServers": {
-    "codehub": {
-      "command": "codehub",
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
       "args": [
-        "mcp"
+        "serve",
+        "--mcp"
       ]
     }
   }
