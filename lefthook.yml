@@ -59,8 +59,7 @@ pre-commit:
       fail_text: "ty typecheck failed — run `mise run typecheck` locally to reproduce."
 
     # Hexagonal DAG enforcement: interfaces > application > infrastructure >
-    # domain, plus a forbidden contract fencing the transitional `core` package
-    # out of the driving layers. Pre-commit catches accidental cross-layer
+    # domain. Pre-commit catches accidental cross-layer
     # imports the moment they're staged. Fast — pure import-graph walk.
     - name: lint-imports
       run: "{uv} lint-imports"

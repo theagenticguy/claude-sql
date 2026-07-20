@@ -74,8 +74,7 @@ requires = ["uv_build>=0.11.14,<0.12"]
 build-backend = "uv_build"
 
 # Single package, one namespace root with the hexagonal layer sub-packages
-# (domain / application / infrastructure / interfaces, plus the transitional
-# `core`) under src/claude_sql/.
+# (domain / application / infrastructure / interfaces) under src/claude_sql/.
 # `namespace = true` lets uv_build pick up every sub-package under the
 # claude_sql.* namespace without enumerating each. `claude-sql` builds as
 # ONE self-contained wheel — `uv build` Just Works, no bundle step.

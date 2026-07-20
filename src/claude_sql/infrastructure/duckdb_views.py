@@ -299,25 +299,6 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
-# Analytics-only view names -- the subset of :data:`VIEW_NAMES` backed by v2
-# parquet outputs.  Exported so callers (``claude-sql`` subcommands, smoke
-# tests) can enumerate analytics views without needing to filter out the
-# transcript-derived views.
-ANALYTICS_VIEW_NAMES: tuple[str, ...] = (
-    "session_classifications",
-    "session_goals",
-    "message_trajectory",
-    "session_conflicts",
-    "conflicts_summary",
-    "message_clusters",
-    "cluster_terms",
-    "session_communities",
-    "community_profile",
-    "user_friction",
-    "skills_catalog",
-    "ingest_stamps",
-)
-
 # Macro names registered by :func:`register_macros`.  ``ago`` is the
 # always-on temporal helper.  The next seven are v1 macros that ship
 # unconditionally; the remaining ten are v2 analytics macros, each

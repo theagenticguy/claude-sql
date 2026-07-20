@@ -114,7 +114,7 @@ sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run ty check"
 
 [tasks."lint:imports"]
-description = "Enforce the layered DAG (core < {analytics,evals,provenance} < app)"
+description = "Enforce the hexagonal layers DAG (domain < infrastructure < application < interfaces)"
 sources = ["src/**/*.py", "pyproject.toml"]
 run = "uv run lint-imports"
 

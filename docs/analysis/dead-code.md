@@ -11,17 +11,14 @@ survives.
 
 ## Unreferenced exports
 
-| Symbol | Path | Last modified |
-| --- | --- | --- |
-| `ANALYTICS_VIEW_NAMES` | `src/claude_sql/infrastructure/duckdb_views.py:306` | 2026-07-20 |
+_none_
 
-`ANALYTICS_VIEW_NAMES` is an exported tuple whose docstring
-(`src/claude_sql/infrastructure/duckdb_views.py:302`) promises callers
-("`claude-sql` subcommands, smoke tests") that never materialized. It has zero
-references across `src/` and `tests/`, no `__all__` re-export (the module
-declares none), and is not enumerated by
-`src/claude_sql/infrastructure/duckdb_connection.py`, which uses the sibling
-`VIEW_NAMES` instead (`src/claude_sql/infrastructure/duckdb_connection.py:42`).
+The single genuine finding from the 2026-07-20 pass — `ANALYTICS_VIEW_NAMES`,
+an exported tuple in `src/claude_sql/infrastructure/duckdb_views.py` whose
+docstring promised callers ("`claude-sql` subcommands, smoke tests") that
+never materialized — was **removed on 2026-07-20** (zero references across
+`src/` and `tests/`, no `__all__` re-export; `duckdb_connection.py` uses the
+sibling `VIEW_NAMES` instead).
 The provenance-only schema leftovers flagged by the pre-reshape pass
 (`PRReviewSheet`, `Correction`, `PR_REVIEW_SHEET_SCHEMA`) were removed by the
 hexagonal reshape — `core/schemas.py` no longer exists and
