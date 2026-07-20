@@ -13,18 +13,14 @@
 > searchable, explorable, self-improving record of your work — in place,
 > with zero copy.
 
-> **v2 in progress.** A hexagonal rewrite is underway: `domain` /
-> `application` (ports) / `infrastructure` (adapters) / `interfaces`. The
-> `evals/` plane (judge panel, kappa, freeze/replay, blind-handover,
-> ungrounded) and the `provenance/` plane (transcript-to-PR binding,
-> review-sheet) move to a separate eval project and are being dropped.
-> Embeddings become pluggable behind an `EmbeddingProvider` port: Cohere
-> Embed v4 on Bedrock stays the default, and Ollama plus a local ONNX BGE
-> (BAAI `bge`) adapter arrive behind optional `[ollama]` and `[onnx]`
-> extras. The retrieval and clustering plane stays, which keeps the
-> package on Python 3.13 (`hdbscan` has no cp314 wheel yet). This README
-> documents what ships today in **v1.2.1**; every command tagged
-> **(dropping in v2)** still works now. Design and migration live in
+> **v2.0.0.** The codebase is a strict hexagonal architecture — `domain` /
+> `application` (ports) / `infrastructure` (adapters) / `interfaces` —
+> enforced by an import-linter contract. Embeddings are pluggable behind
+> an `EmbeddingProvider` port: Cohere Embed v4 on Bedrock is the default,
+> with Ollama and a local ONNX BGE (BAAI `bge`) adapter behind optional
+> `[ollama]` / `[onnx]` extras. The v1 `evals/` and `provenance/` planes
+> (judge panel, kappa, freeze/replay, transcript↔PR binding) were dropped
+> and move to a separate eval project. Design and migration notes live in
 > [`docs/v2/DESIGN.md`](docs/v2/DESIGN.md) and
 > [`docs/v2/MIGRATION.md`](docs/v2/MIGRATION.md).
 
@@ -84,7 +80,7 @@ flowchart LR
     J2["subagents/<br/>agent-*.jsonl"] -->|read_json| R
     R --> V[business views]
     V --> Q[["claude-sql query<br/>claude-sql explain<br/>claude-sql schema"]]
-    V --> E["claude-sql embed<br/>(Cohere Embed v4 on Bedrock)"]
+    V --> E["claude-sql embed<br/>(Cohere Embed v4 on Bedrock,<br/>or Ollama / ONNX BGE)"]
     E --> P["LanceDB store<br/>(~/.claude/embeddings_lance/<br/>FLOAT[1024] + IVF_HNSW_SQ index)"]
     P --> S[["claude-sql search"]]
     V --> L["claude-sql classify / trajectory /<br/>conflicts / friction (Sonnet 4.6 +<br/>output_config.format)"]
@@ -153,7 +149,7 @@ git clone https://github.com/theagenticguy/claude-sql.git
 cd claude-sql
 mise install              # fetch pinned Python + uv
 mise run install          # uv sync --all-extras + install lefthook git hooks
-mise run check            # 5 gates: lint + fmt + typecheck + lint:imports + test
+mise run check            # 6 gates: lint + fmt + typecheck + lint:imports + test + proofs
 ```
 
 `mise` auto-activates `.venv` on `cd`. Every command below is also
@@ -164,7 +160,8 @@ available as a mise task — run `mise tasks` for the full list.
 
 ### AWS credentials
 
-Semantic search and Sonnet classification require Bedrock access.
+Semantic search (with the default `cohere-bedrock` embedding provider) and
+Sonnet classification require Bedrock access.
 
 ```bash
 export AWS_PROFILE=your-profile
@@ -175,10 +172,12 @@ The IAM policy needs `bedrock:InvokeModel` on:
 - `inference-profile/global.cohere.embed-v4:0`
 - `inference-profile/global.anthropic.claude-sonnet-4-6`
 
-In v2 the embedding provider becomes pluggable: Cohere Embed v4 on Bedrock
-stays one of three options alongside a local Ollama server and a local ONNX
-BGE model, so the Cohere inference profile is required only when Bedrock is
-the active embedding provider. Sonnet classification stays on Bedrock.
+The embedding provider is pluggable: Cohere Embed v4 on Bedrock is the
+default, alongside a local Ollama server (`[ollama]` extra) and a local ONNX
+BGE model (`[onnx]` extra), so the Cohere inference profile is required only
+when Bedrock is the active embedding provider
+(`CLAUDE_SQL_EMBEDDING_PROVIDER=cohere-bedrock`, the default). Sonnet
+classification stays on Bedrock.
 
 ### Reading transcripts from S3
 
@@ -227,8 +226,8 @@ claude-sql explain "SELECT * FROM messages WHERE session_id = '<uuid>' LIMIT 1"
 # Drop into the DuckDB REPL with everything pre-registered.
 claude-sql shell
 
-# Backfill embeddings (Cohere Embed v4 via global CRIS).
-# v2 makes the provider pluggable; Cohere-on-Bedrock becomes one of three.
+# Backfill embeddings (Cohere Embed v4 via global CRIS by default;
+# --embedding-provider {cohere-bedrock,ollama,onnx-bge} to switch).
 claude-sql embed --since-days 30
 
 # Semantic search.
@@ -253,19 +252,6 @@ claude-sql query "SELECT * FROM unused_skills(30) LIMIT 20"
 
 # Full analytics pipeline (includes a zero-cost `skills sync` at step 0).
 claude-sql analyze --since-days 30 --no-dry-run
-
-# Provenance: resolve a merged commit back to the transcript that wrote it.
-# (dropping in v2: provenance plane moves to a separate eval project)
-claude-sql resolve "$(git rev-parse HEAD)"
-claude-sql review-sheet "$(git rev-parse HEAD)" --no-dry-run
-
-# Eval gym: pre-register a study, run the judge panel, gate on agreement.
-# (dropping in v2: eval plane moves to a separate eval project)
-claude-sql judges
-claude-sql freeze rubric.yaml --panel kimi-k2.5,deepseek-v3.2,glm-5
-claude-sql judge <manifest_sha> --sessions-parquet sessions.parquet \
-  --output-parquet scores.parquet --no-dry-run
-claude-sql kappa scores.parquet --floor 0.6
 ```
 
 More recipes in [`docs/cookbook.md`](docs/cookbook.md) (v1: sessions,
@@ -278,7 +264,7 @@ communities, classifications, trajectory, conflicts, friction).
 Every subcommand shares the top-level flags: `--verbose` / `--quiet`,
 `--glob`, `--subagent-glob`, and `--format {auto,table,json,ndjson,csv}`.
 The LLM-classification commands (`classify`, `trajectory`, `conflicts`,
-`friction`, `analyze`, `judge`, `review-sheet`) and the cache-rewriting
+`friction`, `analyze`) and the cache-rewriting
 ones (`cache compact`, `cache migrate`, `ingest`) default to `--dry-run`.
 `embed` and `search` are the exceptions — they spend Bedrock the moment
 you call them (an `embed` backfill and a single query-vector call,
@@ -299,7 +285,7 @@ respectively), so they have no dry-run gate.
 
 | Command | Purpose |
 |---|---|
-| `embed` | Backfill embeddings via Cohere Embed v4 on Bedrock (spends by default; v2 makes the provider pluggable across Cohere/Ollama/ONNX-bge) |
+| `embed` | Backfill embeddings via the active provider — `--embedding-provider {cohere-bedrock,ollama,onnx-bge}` (spends by default) |
 | `search <text>` | IVF_HNSW_SQ cosine semantic search over the LanceDB store |
 | `ingest` | Stamp messages with `approx_tokens` / `simhash64` / canonical UUID (CPU only) |
 | `cluster` | UMAP → HDBSCAN over message embeddings (CPU only; `--force` to rebuild) |
@@ -311,7 +297,7 @@ respectively), so they have no dry-run gate.
 | Command | Purpose |
 |---|---|
 | `classify` | Session autonomy + work category + success + goal |
-| `trajectory` | Per-window sentiment + transition kind |
+| `trajectory` | Per-window sentiment + transition kind (`--llm-analytics-provider {sonnet-bedrock,strands-luna}`; the latter needs the `[llm-analytics]` extra) |
 | `conflicts` | Per-session stance-conflict detection |
 | `friction` | Regex + Sonnet 4.6 → status pings, unmet expectations, confusion, etc. |
 | `analyze` | Run the whole pipeline in dependency order (skills → ingest → embed → cluster → terms → community → classify → trajectory → conflicts → friction) |
@@ -325,31 +311,11 @@ respectively), so they have no dry-run gate.
 | `cache compact` | Consolidate a sharded `<cache>/part-*.parquet` directory into one file |
 | `cache migrate` | Move a legacy single-file cache into the sharded directory layout |
 
-**Eval gym (cross-provider judge panels + agreement gates), dropping in v2**
-
-These commands work today in v1.2.1. The eval plane moves to a separate
-eval project in v2.
-
-| Command | Purpose |
-|---|---|
-| `judges` | List the cross-provider Bedrock judge catalog |
-| `freeze <rubric>` | Pre-register a study — write an immutable manifest under `~/.claude/studies/<sha>/` |
-| `replay <manifest_sha>` | Load + echo a frozen study manifest by SHA |
-| `blind-handover <in> <out>` | Strip identity markers from a sessions parquet for grader-safe handover |
-| `judge <manifest_sha>` | Dispatch a frozen study's judge panel over a sessions parquet |
-| `ungrounded-claim <manifest_sha>` | Run the ungrounded-claim detector over a turns parquet |
-| `kappa <scores_parquet>` | Cohen's + Fleiss' kappa with bootstrapped 95% CI; exit 66 below the floor |
-
-**Transcript ↔ PR provenance (RFC 0001), dropping in v2**
-
-These commands work today in v1.2.1. The provenance plane moves to a
-separate eval project in v2.
-
-| Command | Purpose |
-|---|---|
-| `bind` | Attach a transcript↔commit binding (trailers + git-notes) to a commit |
-| `resolve <commit_sha>` | Resolve a commit's bound transcript (trailer → note precedence) |
-| `review-sheet <commit_sha>` | Render a compressed PR review sheet (Sonnet 4.6) |
+> The v1 eval-gym commands (`judges`, `freeze`, `replay`, `blind-handover`,
+> `judge`, `ungrounded-claim`, `kappa`) and provenance commands (`bind`,
+> `resolve`, `review-sheet`) were removed in v2.0.0; they move to a separate
+> eval project. The last release carrying them is
+> [v1.2.1](https://github.com/theagenticguy/claude-sql/releases/tag/v1.2.1).
 
 ### Agent-friendly defaults
 
@@ -359,10 +325,8 @@ separate eval project in v2.
 - **Classified exit codes** for DuckDB errors — `64` for invalid input
   (malformed flags **or** unparseable SQL), `65` for unknown view /
   column / macro, `70` for other runtime errors, and `2` when `search`
-  is called before `embed` has run (also reused when `resolve` /
-  `review-sheet` find no binding). Two command-specific codes: `kappa`
-  exits `66` when an agreement floor or delta-gate is tripped, and
-  `shell` exits `127` when the system `duckdb` binary isn't on `PATH`.
+  is called before `embed` has run. One command-specific code: `shell`
+  exits `127` when the system `duckdb` binary isn't on `PATH`.
   On non-TTY stdout the error also comes back as
   `{"error": {"kind", "message", "hint"}}` on stderr, so agents don't
   have to scrape tracebacks.
@@ -429,6 +393,7 @@ separate eval project in v2.
 | `cluster_top_terms(cid, n)` | table | Top-N terms for a cluster |
 | `community_top_topics(cid, n)` | table | Dominant clusters within a community |
 | `sentiment_arc(sid)` | table | Per-window sentiment timeline for one session |
+| `conflicts_over_time(since_days)` | table | Conflict rows joined to conversation timestamps over a window |
 | `friction_counts(since_days)` | table | Count + session breadth per friction label |
 | `friction_rate(since_days)` | table | Per-session friction pressure vs. user message count |
 | `friction_examples(label_name, n)` | table | Top-N example messages for a friction label |
@@ -439,12 +404,13 @@ separate eval project in v2.
 
 ## Environment variables
 
-Every setting in `config.py` is overridable via a `CLAUDE_SQL_*` env var
-(prefix + the upper-cased field name) or a `.env` in the working
-directory. The common knobs are below; the per-stage tuning fields
-(`CLAUDE_SQL_UMAP_*`, `CLAUDE_SQL_HDBSCAN_*`, `CLAUDE_SQL_TFIDF_*`, the
-`*_THINKING` modes, and each analytics parquet path) follow the same
-prefix convention — see `config.py` for the full set.
+Every setting in `infrastructure/settings.py` is overridable via a
+`CLAUDE_SQL_*` env var (prefix + the upper-cased field name) or a `.env`
+in the working directory. The common knobs are below; the per-stage
+tuning fields (`CLAUDE_SQL_UMAP_*`, `CLAUDE_SQL_HDBSCAN_*`,
+`CLAUDE_SQL_TFIDF_*`, the `*_THINKING` modes, and each analytics parquet
+path) follow the same prefix convention — see
+`src/claude_sql/infrastructure/settings.py` for the full set.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -456,8 +422,13 @@ prefix convention — see `config.py` for the full set.
 | `CLAUDE_SQL_S3_URL_STYLE` | `vhost` | S3 addressing style (`vhost` or `path`); set `path` for MinIO / moto |
 | `CLAUDE_SQL_S3_USE_SSL` | `true` | Toggle TLS for the S3 endpoint; set `false` for a local mock |
 | `CLAUDE_SQL_REGION` | `us-east-1` | Bedrock region **and** the S3 secret region |
-| `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Embedding model |
+| `CLAUDE_SQL_EMBEDDING_PROVIDER` | `cohere-bedrock` | Embedding backend (`cohere-bedrock` / `ollama` / `onnx-bge`); the local two need the `[ollama]` / `[onnx]` extras |
+| `CLAUDE_SQL_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server (when `embedding_provider=ollama`) |
+| `CLAUDE_SQL_OLLAMA_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `CLAUDE_SQL_ONNX_MODEL` | `BAAI/bge-small-en-v1.5` | Local ONNX embedding model (when `embedding_provider=onnx-bge`) |
+| `CLAUDE_SQL_MODEL_ID` | `global.cohere.embed-v4:0` | Bedrock embedding model (cohere-bedrock provider) |
 | `CLAUDE_SQL_SONNET_MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | Classification model |
+| `CLAUDE_SQL_LLM_ANALYTICS_PROVIDER` | `sonnet-bedrock` | LLM-analytics backend (`sonnet-bedrock` / `strands-luna`); the latter needs the `[llm-analytics]` extra |
 | `CLAUDE_SQL_OUTPUT_DIMENSION` | `1024` | Matryoshka embedding dimension (`256` / `512` / `1024` / `1536`) |
 | `CLAUDE_SQL_EMBEDDING_TYPE` | `int8` | Cohere output type (`int8` / `float` / `uint8` / `binary` / `ubinary`) |
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Parallel Cohere Embed v4 calls (global CRIS) |
@@ -487,8 +458,9 @@ prefix convention — see `config.py` for the full set.
 ## Development
 
 ```bash
-mise run check           # lint + fmt-check + typecheck + lint:imports + tests
+mise run check           # lint + fmt-check + typecheck + lint:imports + tests + proofs
 mise run fmt:write       # auto-apply ruff formatting
+mise run proofs          # Lean 4 proof layer: lake build under proofs/
 mise run upgrade         # uv lock --upgrade && uv sync
 mise run build           # uv build → dist/*.whl + *.tar.gz
 mise run tool:install    # install claude-sql as a uv tool (global)
@@ -501,9 +473,9 @@ mise tasks               # list every mise task
 `mise run install` installs **lefthook** git hooks:
 
 - **pre-commit** — parallel `ruff check --fix` + `ruff format` on staged
-  Python files (auto-staged), `ty check src/ tests/` across the whole tree
-  (strict mode), and `uv lock --check` when `pyproject.toml` or `uv.lock`
-  is staged.
+  Python files (auto-staged), `ty check` across the whole tree (strict
+  mode), `lint-imports` (the hexagonal layers contract), and
+  `uv lock --check` when `pyproject.toml` or `uv.lock` is staged.
 - **commit-msg** — validates the message via `cz check --allow-abort`
   against the conventional-commits schema.
 - **pre-push** — runs the full pytest suite before the push lands.
@@ -530,8 +502,10 @@ decides MAJOR / MINOR / PATCH from the conventional-commits types:
 ```bash
 mise run bump:dry-run    # preview next version + tag
 mise run bump            # bump + changelog + annotated tag (vX.Y.Z)
-mise run changelog       # regenerate CHANGELOG.md without bumping
 ```
+
+`CHANGELOG.md` is write-only via `cz bump` — never hand-edit it. Between
+releases, query commit history directly (`git log --oneline vX.Y.Z..HEAD`).
 
 `[tool.commitizen]` is wired to `version_provider = "uv"`, so every bump
 keeps `pyproject.toml[project.version]` and `uv.lock` in sync
@@ -539,7 +513,8 @@ atomically.
 
 ### Quality gates
 
-Local `mise run check` (`lint + fmt + typecheck + lint:imports + test`) and GitHub
+Local `mise run check` (`lint + fmt + typecheck + lint:imports + test +
+proofs`) and GitHub
 Actions run the same commands against the same pinned tool versions (via
 `jdx/mise-action`), so contributors who pass the hooks locally can trust
 CI agrees. On top of the local gate, CI layers in:
@@ -588,15 +563,17 @@ See `docs/adr/0015-stack-modernization.md` and
 - **Lazy content blocks.** Nested `message.content[]` stays as JSON and
   flattens via `UNNEST + json_extract_string`, not eagerly shredded —
   resilient to new block types (`thinking`, MCP shapes, etc.).
-- **Global CRIS for Cohere.** The `global.cohere.embed-v4:0` profile
-  sustains the highest throughput with no throttling in testing; direct
-  and US CRIS both saturate at low TPM. v2 moves this behind an
-  `EmbeddingProvider` port with Cohere-on-Bedrock, Ollama, and local ONNX
-  BGE adapters. Switching providers changes the vector dimension (Cohere
-  1024, bge-small 384, bge-base and nomic 768), and even at matching dims
-  the vector spaces are incompatible, so a provider switch requires a full
-  re-embed. v2 keys the store by (provider, model, dim). See
-  [`docs/v2/MIGRATION.md`](docs/v2/MIGRATION.md).
+- **Pluggable embeddings, global CRIS default.** Embedding calls go
+  through the `EmbeddingProvider` port (`domain/ports.py`) with three
+  adapters: Cohere-on-Bedrock (default), Ollama, and local ONNX BGE. The
+  default `global.cohere.embed-v4:0` profile sustains the highest
+  throughput with no throttling in testing; direct and US CRIS both
+  saturate at low TPM. Switching providers changes the vector dimension
+  (Cohere 1024, bge-small 384, bge-base and nomic 768), and even at
+  matching dims the vector spaces are incompatible, so a provider switch
+  requires a full re-embed — a fail-loud guard
+  (`domain/embedding_guard.py`) refuses to mix vector spaces in one
+  store. See [`docs/v2/MIGRATION.md`](docs/v2/MIGRATION.md).
 - **LanceDB embeddings store.** Vectors and the cosine-metric
   `IVF_HNSW_SQ` (scalar-quantized HNSW) index live together in one
   versioned LanceDB dataset at `~/.claude/embeddings_lance/`; DuckDB
@@ -639,26 +616,13 @@ See `docs/adr/0015-stack-modernization.md` and
   the agent missed a proactive step) — falls through to Sonnet 4.6
   structured output. Scoped to user-role messages under 300 characters
   by default; longer turns are almost always genuine task instructions.
-- **Pre-registered eval gym (dropping in v2).** The `judges` / `freeze` /
-  `judge` / `kappa` family grades transcripts with a cross-provider Bedrock judge
-  panel (8 non-Anthropic/non-Amazon primaries + a within-family
-  Anthropic holdout to measure self-preference bias), then scores
-  inter-rater agreement with Cohen's + Fleiss' kappa and bootstrapped
-  95% CIs. `freeze` writes an immutable study manifest under
-  `~/.claude/studies/<sha>/` so a run is reproducible (`replay`);
-  `blind-handover` strips identity markers before grading; `kappa`
-  exits `66` below the agreement floor. No DuckDB views or `list-cache`
-  parquets — output goes to caller-named parquets stamped with the
-  freeze SHA.
-- **Transcript ↔ PR provenance (dropping in v2).** `bind` writes a
-  host-neutral binding
-  between a merged commit and the transcript that produced it, encoded
-  as three `git-interpret-trailers` trailers plus a JSON note under
-  `refs/notes/transcripts`. `resolve` reads it back (trailer-first,
-  note-fallback, loud on digest disagreement); `review-sheet` compresses
-  the bound transcript into a Markdown/JSON PR review sheet via Sonnet
-  4.6. Pure-stdlib, no new git infrastructure — see
-  [`docs/rfc/0001-transcript-pr-binding.md`](docs/rfc/0001-transcript-pr-binding.md).
+- **Hexagonal layering, machine-enforced.** `domain` (pure logic, no
+  boto3/duckdb/lancedb) < `infrastructure` (all adapters) < `application`
+  (use-cases + ports) < `interfaces` (the cyclopts CLI). The layers DAG
+  is an import-linter contract in `pyproject.toml`, checked by the
+  `lint:imports` gate on every commit. Formal invariants (backoff,
+  Hamming distance, turn ordering) are machine-checked in Lean 4 under
+  `proofs/` via the `proofs` gate.
 
 See [`docs/research_notes.md`](docs/research_notes.md) for deeper design
 rationale, and
@@ -676,7 +640,8 @@ for the data-model + roadmap direction.
 - [JSONL schema reference](docs/jsonl_schema_v1.sql) — column listings
   for every registered view.
 - [RFC 0001 — transcript ↔ PR binding](docs/rfc/0001-transcript-pr-binding.md)
-  — the `bind` / `resolve` / `review-sheet` convention.
+  — the `bind` / `resolve` / `review-sheet` convention (commands removed
+  in v2.0.0; kept as the design record).
 - [RFC 0002 — vision + roadmap](docs/rfc/0002-vision-and-roadmap.md) —
   the v2 data model and production direction.
 
