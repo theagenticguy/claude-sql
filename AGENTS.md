@@ -30,8 +30,15 @@ JSONLs:
    the corpus before reading specific transcripts.
 
 Every expensive output (embeddings, classifications, clusters, communities,
-friction) is cached in parquet under `~/.claude/`. Views register only the
-parquets that exist — missing ones warn and no-op, never crash.
+friction) is cached in parquet under
+`claude_sql_home()/corpora/<corpus_key>/` — **corpus-scoped**: the key
+follows the effective corpus root (`team_corpus_root` > `CLAUDE_CONFIG_DIR`
+> `~/.claude` → the reserved key `default`), so switching corpus never reads
+another corpus's analytics. Views register only the parquets that exist —
+missing ones warn and no-op, never crash. Two chained one-time migrations
+(`infrastructure/duckdb_connection.maybe_migrate_legacy_caches`) relocate
+pre-home caches from `~/.claude/` and pre-scoping caches from the home root
+into `corpora/default/`.
 
 ## Structure — hexagonal layers
 

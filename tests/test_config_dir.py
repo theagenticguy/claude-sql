@@ -10,6 +10,15 @@ and confirm the skills / plugin-cache dirs follow the same root. The helper
 reads ``os.environ`` at call time (matching the ``home.claude_sql_home``
 precedent), so ``monkeypatch.setenv`` is observed without a module reload.
 
+The analytics cache paths follow the SAME corpus axis: every default cache
+lands under ``claude_sql_home()/corpora/<corpus_key>/``, where the key is
+derived from the effective corpus root with the same precedence (an explicit
+``CLAUDE_SQL_*_PARQUET_PATH`` pin > ``team_corpus_root`` >
+``CLAUDE_CONFIG_DIR`` > ``~/.claude`` → the reserved key ``"default"``).
+Two ``Settings`` with different corpora must never share a cache path —
+before corpus scoping, switching corpus silently read the OTHER corpus's
+analytics parquets (a missing parquet warns; a wrong-corpus hit was silent).
+
 The ``_purge_config_env`` autouse fixture snapshots/restores every env var
 this module touches so ``CLAUDE_CONFIG_DIR`` state never leaks across modules
 (see ``.erpaval/solutions/best-practices/os-environ-leak-across-test-modules.md``).
@@ -25,7 +34,9 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from claude_sql.infrastructure.duckdb_connection import maybe_migrate_legacy_caches
 from claude_sql.infrastructure.duckdb_views import register_all
+from claude_sql.infrastructure.home import DEFAULT_CORPUS_KEY
 from claude_sql.infrastructure.settings import (
     Settings,
     _claude_config_root,
@@ -34,6 +45,7 @@ from claude_sql.infrastructure.settings import (
     _default_subagent_glob,
     _default_subagent_meta_glob,
     _default_user_skills_dir,
+    corpus_key,
 )
 
 _ENV_VARS_TO_PURGE: tuple[str, ...] = (
@@ -44,6 +56,8 @@ _ENV_VARS_TO_PURGE: tuple[str, ...] = (
     "CLAUDE_SQL_TEAM_CORPUS_ROOT",
     "CLAUDE_SQL_USER_SKILLS_DIR",
     "CLAUDE_SQL_PLUGINS_CACHE_DIR",
+    "CLAUDE_SQL_HOME",
+    "CLAUDE_SQL_TRAJECTORY_PARQUET_PATH",
 )
 
 
@@ -233,3 +247,175 @@ def test_register_all_binds_relocated_config_dir(
     n = con.execute("SELECT count(DISTINCT session_id) FROM sessions").fetchone()
     assert n is not None
     assert n[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Corpus-scoped analytics caches: corpora/<corpus_key>/ under claude_sql_home
+# ---------------------------------------------------------------------------
+
+#: Every Settings field naming a per-corpus cache — the full set that must
+#: move together when the corpus changes.
+_CORPUS_CACHE_FIELDS: tuple[str, ...] = (
+    "embeddings_parquet_path",
+    "lance_uri",
+    "classifications_parquet_path",
+    "trajectory_parquet_path",
+    "conflicts_parquet_path",
+    "clusters_parquet_path",
+    "cluster_terms_parquet_path",
+    "communities_parquet_path",
+    "community_profile_parquet_path",
+    "user_friction_parquet_path",
+    "skills_catalog_parquet_path",
+    "checkpoint_db_path",
+    "duckdb_temp_dir",
+    "ingest_stamps_parquet_path",
+)
+
+
+def _cache_paths(settings: Settings) -> dict[str, Path]:
+    return {field: getattr(settings, field) for field in _CORPUS_CACHE_FIELDS}
+
+
+def test_default_corpus_caches_land_under_corpora_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(a) Default corpus → every cache under ``corpora/default/``."""
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    settings = Settings()
+    assert corpus_key(settings) == DEFAULT_CORPUS_KEY
+    expected_parent = tmp_path / "corpora" / DEFAULT_CORPUS_KEY
+    for field, path in _cache_paths(settings).items():
+        assert path.parent == expected_parent, f"{field}={path} not under {expected_parent}"
+
+
+def test_legacy_home_root_caches_migrate_to_corpora_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(a) Pre-corpus-scoping caches at the home ROOT auto-move to default.
+
+    Seeds a home-root layout as written by pre-corpus-scoping versions and
+    asserts the one-shot relocation moves it (move, not copy) into
+    ``corpora/default/``, stamps the sentinel, and is idempotent.
+    """
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))
+    # Point HOME at an empty dir so phase 1 (~/.claude → home) is a no-op.
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    (tmp_path / "message_trajectory").mkdir(parents=True)
+    (tmp_path / "message_trajectory" / "part-1.parquet").write_bytes(b"\x00" * 32)
+    (tmp_path / "clusters.parquet").write_bytes(b"\x00" * 32)
+
+    maybe_migrate_legacy_caches()
+
+    default_dir = tmp_path / "corpora" / DEFAULT_CORPUS_KEY
+    assert (default_dir / "message_trajectory" / "part-1.parquet").exists()
+    assert (default_dir / "clusters.parquet").exists()
+    # Moved, not copied.
+    assert not (tmp_path / "message_trajectory").exists()
+    assert not (tmp_path / "clusters.parquet").exists()
+    assert (tmp_path / ".corpus_scoping_complete").exists()
+    # Idempotent: a second call must not disturb the scoped layout.
+    maybe_migrate_legacy_caches()
+    assert (default_dir / "clusters.parquet").exists()
+
+    # And the migrated caches are exactly where a fresh default-corpus
+    # Settings looks for them.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    settings = Settings()
+    assert settings.clusters_parquet_path == default_dir / "clusters.parquet"
+    assert settings.trajectory_parquet_path == default_dir / "message_trajectory"
+
+
+def test_config_dir_corpus_gets_distinct_cache_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(b) ``CLAUDE_CONFIG_DIR`` set → a distinct, non-default corpus dir."""
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "fleet-agent-7"))
+    settings = Settings()
+    key = corpus_key(settings)
+    assert key != DEFAULT_CORPUS_KEY
+    expected_parent = tmp_path / "home" / "corpora" / key
+    for field, path in _cache_paths(settings).items():
+        assert path.parent == expected_parent, f"{field}={path} not under {expected_parent}"
+
+
+def test_team_corpus_root_gets_distinct_cache_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(c) ``team_corpus_root`` set → a distinct corpus dir, beating CONFIG_DIR."""
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+    settings = Settings(team_corpus_root=tmp_path / "team")
+    key = corpus_key(settings)
+    assert key != DEFAULT_CORPUS_KEY
+    expected_parent = tmp_path / "home" / "corpora" / key
+    for field, path in _cache_paths(settings).items():
+        assert path.parent == expected_parent, f"{field}={path} not under {expected_parent}"
+    # The team-corpus key wins over the CLAUDE_CONFIG_DIR-derived key.
+    config_only = Settings()
+    assert key != corpus_key(config_only)
+
+
+def test_team_corpus_root_env_var_scopes_caches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(c) ``CLAUDE_SQL_TEAM_CORPUS_ROOT`` via env scopes caches identically."""
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_SQL_TEAM_CORPUS_ROOT", str(tmp_path / "team"))
+    via_env = Settings()
+    via_kwarg = Settings(team_corpus_root=tmp_path / "team")
+    assert _cache_paths(via_env) == _cache_paths(via_kwarg)
+
+
+def test_explicit_cache_path_pin_still_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(d) An explicit ``CLAUDE_SQL_TRAJECTORY_PARQUET_PATH`` beats scoping."""
+    pinned = tmp_path / "elsewhere" / "trajectory"
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_SQL_TRAJECTORY_PARQUET_PATH", str(pinned))
+    # The pin must survive every corpus axis, including team_corpus_root.
+    settings = Settings(team_corpus_root=tmp_path / "team")
+    assert settings.trajectory_parquet_path == pinned
+    # Unpinned siblings still land in the team-corpus dir.
+    key = corpus_key(settings)
+    assert settings.clusters_parquet_path.parent == tmp_path / "home" / "corpora" / key
+
+
+def test_different_corpora_never_share_a_cache_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """(e) THE regression lock: distinct corpora → disjoint cache paths.
+
+    Before corpus scoping, all three of these Settings pointed every
+    analytics cache at the same ``claude_sql_home()`` location — switching
+    corpus silently read the other corpus's parquets. Assert pairwise
+    inequality on every cache field across the three corpus axes.
+    """
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path / "home"))
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    default_settings = Settings()
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "other-corpus"))
+    config_dir_settings = Settings()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    team_settings = Settings(team_corpus_root=tmp_path / "team-corpus")
+
+    labeled = [
+        ("default", _cache_paths(default_settings)),
+        ("config-dir", _cache_paths(config_dir_settings)),
+        ("team", _cache_paths(team_settings)),
+    ]
+    for i, (name_a, paths_a) in enumerate(labeled):
+        for name_b, paths_b in labeled[i + 1 :]:
+            for field in _CORPUS_CACHE_FIELDS:
+                assert paths_a[field] != paths_b[field], (
+                    f"{field} shared between {name_a} and {name_b}: {paths_a[field]}"
+                )

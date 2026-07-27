@@ -21,7 +21,13 @@ from pathlib import Path
 
 import pytest
 
-from claude_sql.infrastructure.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.infrastructure.home import (
+    DEFAULT_CORPUS_KEY,
+    claude_sql_home,
+    corpus_caches_at_home_root,
+    corpus_slug,
+    recognized_legacy_caches,
+)
 from claude_sql.infrastructure.settings import Settings
 
 _ENV_VARS_TO_PURGE: tuple[str, ...] = (
@@ -29,6 +35,7 @@ _ENV_VARS_TO_PURGE: tuple[str, ...] = (
     "XDG_DATA_HOME",
     "CLAUDE_SQL_TRAJECTORY_PARQUET_PATH",
     "CLAUDE_SQL_CLUSTERS_PARQUET_PATH",
+    "CLAUDE_CONFIG_DIR",
 )
 
 
@@ -121,6 +128,43 @@ def test_recognized_legacy_caches_missing_root_returns_empty(tmp_path: Path) -> 
     assert recognized_legacy_caches(nonexistent) == {}
 
 
+def test_corpus_slug_default_corpus_is_stable() -> None:
+    """The historical interactive corpus always maps to the reserved key."""
+    assert corpus_slug("~/.claude") == DEFAULT_CORPUS_KEY
+    assert corpus_slug(Path("~/.claude").expanduser()) == DEFAULT_CORPUS_KEY
+
+
+def test_corpus_slug_is_legible_and_collision_safe(tmp_path: Path) -> None:
+    """Non-default roots get a sanitized-dirname + short-hash key.
+
+    Two roots that share a dirname (``alice/.claude`` vs ``bob/.claude``)
+    must still land on distinct keys — the hash suffix carries the full
+    resolved path.
+    """
+    alice = tmp_path / "alice" / ".claude"
+    bob = tmp_path / "bob" / ".claude"
+    slug_a, slug_b = corpus_slug(alice), corpus_slug(bob)
+    assert slug_a != slug_b
+    assert slug_a.startswith("claude-")
+    assert slug_b.startswith("claude-")
+    # Deterministic: same root, same key.
+    assert corpus_slug(alice) == slug_a
+
+
+def test_corpus_caches_at_home_root_lists_unscoped_caches(tmp_path: Path) -> None:
+    """The home-root walker picks up exactly the per-corpus cache names."""
+    (tmp_path / "message_trajectory").mkdir()
+    (tmp_path / "clusters.parquet").write_bytes(b"")
+    (tmp_path / "state.db").write_bytes(b"")
+    # Already-scoped and non-corpus entries must be ignored.
+    (tmp_path / "corpora").mkdir()
+    (tmp_path / "profiling").mkdir()
+    (tmp_path / ".migration_complete").write_bytes(b"")
+
+    found = corpus_caches_at_home_root(tmp_path)
+    assert set(found) == {"message_trajectory", "clusters.parquet", "state.db"}
+
+
 def test_settings_paths_default_under_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Setting ``CLAUDE_SQL_HOME`` re-roots every default-derived cache path."""
     monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))
@@ -163,7 +207,11 @@ def test_settings_user_pinned_path_preserved(
 
 
 def test_settings_ingest_stamps_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The new ``ingest_stamps_parquet_path`` field defaults under home."""
+    """The ``ingest_stamps_parquet_path`` field defaults under the corpus dir."""
     monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     settings = Settings()
-    assert settings.ingest_stamps_parquet_path == tmp_path / "ingest_stamps"
+    assert (
+        settings.ingest_stamps_parquet_path
+        == tmp_path / "corpora" / DEFAULT_CORPUS_KEY / "ingest_stamps"
+    )

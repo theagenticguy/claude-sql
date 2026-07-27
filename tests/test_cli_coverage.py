@@ -204,12 +204,13 @@ def _common_for(corpus: dict[str, str], fmt: OutputFormat = OutputFormat.JSON) -
 def test_migrate_legacy_caches_moves_directories(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Recognized ``~/.claude/`` caches are moved into ``CLAUDE_SQL_HOME``.
+    """Recognized ``~/.claude/`` caches land in ``corpora/default/``.
 
-    Pin the happy path: a legacy ``embeddings_lance/`` dir under the
-    fake ``$HOME/.claude/`` and a ``state.db`` legacy file get moved to
-    the new home, and the ``.migration_complete`` sentinel is stamped.
-    A second call is a no-op (sentinel exists).
+    Pin the happy path across BOTH chained phases: a legacy
+    ``embeddings_lance/`` dir under the fake ``$HOME/.claude/`` and a
+    ``state.db`` legacy file get moved to the new home (phase 1) and then
+    scoped under ``corpora/default/`` (phase 2); both sentinels are
+    stamped. A second call is a no-op (sentinels exist).
     """
     fake_home = tmp_path / "user_home"
     legacy = fake_home / ".claude"
@@ -225,16 +226,22 @@ def test_migrate_legacy_caches_moves_directories(
 
     cli._maybe_migrate_legacy_caches()
 
-    assert (new_home / "embeddings_lance" / "data.lance").exists()
-    assert (new_home / "state.db").exists()
+    default_dir = new_home / "corpora" / "default"
+    assert (default_dir / "embeddings_lance" / "data.lance").exists()
+    assert (default_dir / "state.db").exists()
     assert (new_home / ".migration_complete").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
     assert not (legacy / "embeddings_lance").exists()
     assert not (legacy / "state.db").exists()
+    # Nothing left stranded at the home root.
+    assert not (new_home / "embeddings_lance").exists()
+    assert not (new_home / "state.db").exists()
 
-    # Idempotency: second call short-circuits on the sentinel.
+    # Idempotency: second call short-circuits on the sentinels.
     cli._maybe_migrate_legacy_caches()
-    # Marker still there — function returned early without crashing.
+    # Markers still there — function returned early without crashing.
     assert (new_home / ".migration_complete").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
 
 
 def test_migrate_legacy_caches_skips_when_destination_exists(
@@ -263,8 +270,11 @@ def test_migrate_legacy_caches_skips_when_destination_exists(
 
     # Legacy preserved (not moved over the populated destination).
     assert (legacy / "embeddings_lance" / "data.lance").exists()
-    # Destination's prior contents intact.
-    assert (new_home / "embeddings_lance" / "existing.lance").exists()
+    # Destination's prior contents intact — relocated by the corpus-scoping
+    # phase into ``corpora/default/`` (it was a pre-corpus-scoping cache at
+    # the home root), never overwritten by the legacy copy.
+    assert (new_home / "corpora" / "default" / "embeddings_lance" / "existing.lance").exists()
+    assert not (new_home / "embeddings_lance").exists()
     assert (new_home / ".migration_complete").exists()
 
 

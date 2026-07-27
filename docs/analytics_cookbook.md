@@ -29,12 +29,15 @@ prepared-statement parameter and error out.
 
 ## Which sections run today
 
-Caches live under `claude_sql_home()` — `$CLAUDE_SQL_HOME` overrides;
-otherwise `$XDG_DATA_HOME/claude-sql/` (Linux) /
+Caches live under `claude_sql_home()/corpora/<corpus_key>/` —
+`$CLAUDE_SQL_HOME` overrides the home; otherwise
+`$XDG_DATA_HOME/claude-sql/` (Linux) /
 `~/Library/Application Support/claude-sql/` (macOS) / `~/.claude-sql/`
-(universal fallback). The migration from `~/.claude/` is one-time
-idempotent, so existing installs may still see the legacy parent on
-first run.
+(universal fallback). `<corpus_key>` follows the effective corpus root
+(`team_corpus_root` > `CLAUDE_CONFIG_DIR` > `~/.claude` → `default`), so
+each corpus reads only its own analytics. The migrations — `~/.claude/`
+→ home, then home root → `corpora/default/` — are one-time idempotent,
+so existing installs may still see a legacy parent on first run.
 
 | Section | Backing parquet | Prerequisite |
 |---|---|---|

@@ -26,7 +26,7 @@ value (with surrounding quotes for strings) before running. Don't paste
 `{{...}}` into `claude-sql query` raw — DuckDB will treat it as a
 prepared-statement parameter and error out.
 
-### Cache home (v1.0+)
+### Cache home (v1.0+) and corpus scoping (v2.1+)
 
 Derived caches now live under a dedicated parent directory, **not**
 `~/.claude/`. Resolution order: `$CLAUDE_SQL_HOME` → `$XDG_DATA_HOME/claude-sql/`
@@ -37,6 +37,16 @@ recognized caches (`embeddings_lance/`, `clusters.parquet`,
 the migration is one-time idempotent. Paths in this cookbook reference
 the new home; under the previous default they sat alongside Claude Code's
 own state.
+
+Within the home, caches are **corpus-scoped**: everything derived from
+one transcript corpus sits under `corpora/<corpus_key>/`, keyed by the
+effective corpus root (`team_corpus_root` > `CLAUDE_CONFIG_DIR` >
+`~/.claude`, which maps to the reserved key `default`). Switching corpus
+via `CLAUDE_CONFIG_DIR` or `CLAUDE_SQL_TEAM_CORPUS_ROOT` therefore never
+reads another corpus's analytics parquets. Pre-scoping caches at the home
+root are auto-relocated into `corpora/default/` once, on first connect
+(also one-time idempotent). Explicit `CLAUDE_SQL_*_PATH` /
+`CLAUDE_SQL_LANCE_URI` pins bypass the scoping entirely.
 
 All output shapes below are illustrative — they show column layout and
 expected row counts, not data from any specific user's corpus.
@@ -361,8 +371,8 @@ AWS_PROFILE=your-profile claude-sql embed --since-days 7
 ```
 
 `register_vss()` attaches the LanceDB embeddings store at connection
-open from `claude_sql_home()/embeddings_lance/` (typically
-`~/.claude-sql/embeddings_lance/`). Until that store has a populated
+open from `claude_sql_home()/corpora/<corpus_key>/embeddings_lance/`
+(typically `~/.claude-sql/corpora/default/embeddings_lance/`). Until that store has a populated
 `message_embeddings` table, the corresponding DuckDB view is empty.
 `--since-days 7` is a cheap starter; ramp to `30` or `90` once you've
 confirmed the pipeline.
@@ -685,8 +695,8 @@ through pydantic-settings with the `CLAUDE_SQL_` prefix.
 |---|---|---|
 | `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | Pin lower on a shared host or in CI. |
 | `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | Use an absolute size like `'4GB'` on shared hosts; percentage strings are resolved against host RAM at apply time. |
-| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude-sql/duckdb_tmp` | Point at faster / bigger storage if clustering spills. Avoid `/tmp` on Amazon devboxes — it's a 4 GB tmpfs. |
-| `CLAUDE_SQL_LANCE_URI` | `~/.claude-sql/embeddings_lance` | Move the LanceDB embeddings store off `claude_sql_home()` if disk space is tight. |
+| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `<home>/corpora/<corpus_key>/duckdb_tmp` | Point at faster / bigger storage if clustering spills. Avoid `/tmp` on Amazon devboxes — it's a 4 GB tmpfs. |
+| `CLAUDE_SQL_LANCE_URI` | `<home>/corpora/<corpus_key>/embeddings_lance` | Move the LanceDB embeddings store off `claude_sql_home()` if disk space is tight (pin bypasses corpus scoping). |
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Drop to 2-4 if Bedrock starts throttling Cohere Embed v4 (rare on global CRIS). |
 | `CLAUDE_SQL_LLM_CONCURRENCY` | `2` | Bump to 4 cautiously for Sonnet 4.6; tenacity catches transient throttles. |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Higher captures more friction signals at higher Bedrock cost. |
@@ -707,11 +717,13 @@ node — feed it back to an LLM or `jq` to find the dominant operator.
 
 ### Cache layout
 
-All paths below are relative to `claude_sql_home()` — that's
-`~/.claude-sql/` on Linux without `XDG_DATA_HOME`,
+All paths below are relative to `claude_sql_home()/corpora/<corpus_key>/`
+— the home is `~/.claude-sql/` on Linux without `XDG_DATA_HOME`,
 `~/Library/Application Support/claude-sql/` on macOS, or whatever
-`$CLAUDE_SQL_HOME` resolves to. Six caches use the **sharded directory**
-layout (one `part-<ts_ns>.parquet` per worker chunk):
+`$CLAUDE_SQL_HOME` resolves to, and `<corpus_key>` is `default` for the
+interactive `~/.claude` corpus (see "Cache home" above). Six caches use
+the **sharded directory** layout (one `part-<ts_ns>.parquet` per worker
+chunk):
 
 - `embeddings/` — legacy parquet shards (rolled forward into LanceDB)
 - `session_classifications/`
