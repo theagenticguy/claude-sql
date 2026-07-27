@@ -165,6 +165,11 @@ def test_corpus_caches_at_home_root_lists_unscoped_caches(tmp_path: Path) -> Non
     assert set(found) == {"message_trajectory", "clusters.parquet", "state.db"}
 
 
+def test_corpus_caches_at_home_root_missing_root_returns_empty(tmp_path: Path) -> None:
+    """A nonexistent home root yields no entries (no crash)."""
+    assert corpus_caches_at_home_root(tmp_path / "does-not-exist") == {}
+
+
 def test_settings_paths_default_under_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Setting ``CLAUDE_SQL_HOME`` re-roots every default-derived cache path."""
     monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))

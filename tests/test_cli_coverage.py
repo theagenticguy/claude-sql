@@ -297,6 +297,96 @@ def test_migrate_legacy_caches_no_legacy_stamps_marker(
     cli._maybe_migrate_legacy_caches()
 
     assert (new_home / ".migration_complete").exists()
+    # Phase 2 stamps its own sentinel on the same clean-home path.
+    assert (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_skips_when_destination_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Phase 2 never overwrites a populated ``corpora/default/`` cache.
+
+    Same conservatism as phase 1: an unscoped home-root cache whose name
+    already exists under ``corpora/default/`` stays where it is (surfaced
+    later by the ``unscoped:`` list-cache breadcrumb) and the rest of the
+    manifest still migrates.
+    """
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    default_dir = new_home / "corpora" / "default"
+    default_dir.mkdir(parents=True)
+    (default_dir / "clusters.parquet").write_bytes(b"already-scoped")
+    (new_home / "clusters.parquet").write_bytes(b"stale-root-copy")
+    (new_home / "cluster_terms.parquet").write_bytes(b"migrates-fine")
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+
+    cli._maybe_migrate_legacy_caches()
+
+    # Populated destination untouched; the root copy stays for manual
+    # reconciliation.
+    assert (default_dir / "clusters.parquet").read_bytes() == b"already-scoped"
+    assert (new_home / "clusters.parquet").exists()
+    # The non-conflicting sibling migrated.
+    assert (default_dir / "cluster_terms.parquet").read_bytes() == b"migrates-fine"
+    assert not (new_home / "cluster_terms.parquet").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_oserror_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ``OSError`` during the phase-2 move is logged, not raised.
+
+    Mirrors the phase-1 hostile-filesystem guarantee: the sentinel stays
+    unstamped so the next invocation retries.
+    """
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    new_home.mkdir()
+    (new_home / "clusters.parquet").write_bytes(b"\x00")
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+    # Phase 1 must complete so the failure comes from phase 2's move.
+    (new_home / ".migration_complete").touch()
+
+    def _raise(*_a: object, **_kw: object) -> None:
+        raise OSError("simulated read-only mount")
+
+    monkeypatch.setattr("claude_sql.infrastructure.duckdb_connection.shutil.move", _raise)
+
+    # Must not raise — the loop swallows OSError and warns.
+    cli._maybe_migrate_legacy_caches()
+    # Sentinel unstamped → the next call retries from a clean state.
+    assert not (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_marker_touch_failure_is_logged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failing sentinel stamp on the nothing-to-scope path is logged, not raised."""
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+
+    real_touch = Path.touch
+
+    def _selective_touch(self: Path, *a: object, **kw: object) -> None:
+        if self.name == ".corpus_scoping_complete":
+            raise OSError("simulated EACCES on marker stamp")
+        real_touch(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "touch", _selective_touch)
+
+    # Must NOT raise — the function logs and returns.
+    cli._maybe_migrate_legacy_caches()
 
 
 def test_migrate_legacy_caches_oserror_does_not_crash(
@@ -557,6 +647,31 @@ def test_list_cache_surfaces_legacy_breadcrumb(
     payload = json.loads(capsys.readouterr().out)
     names = {entry["name"] for entry in payload}
     assert any(name.startswith("legacy:") for name in names)
+
+
+def test_list_cache_surfaces_unscoped_breadcrumb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``list-cache`` flags home-root caches that weren't corpus-scoped.
+
+    Stamps both migration sentinels first so the auto-relocation
+    short-circuits, then plants an unscoped ``clusters.parquet`` at the
+    home root. The breadcrumb iterator should surface an
+    ``unscoped:clusters.parquet`` entry.
+    """
+    new_home = tmp_path / "claude_home"
+    new_home.mkdir(exist_ok=True)
+    (new_home / ".migration_complete").touch()
+    (new_home / ".corpus_scoping_complete").touch()
+    (new_home / "clusters.parquet").write_bytes(b"\x00" * 32)
+
+    corpus = _build_corpus(tmp_path)
+    cli.list_cache(common=_common_for(corpus, OutputFormat.JSON))
+    payload = json.loads(capsys.readouterr().out)
+    names = {entry["name"] for entry in payload}
+    assert "unscoped:clusters.parquet" in names
 
 
 # ---------------------------------------------------------------------------
