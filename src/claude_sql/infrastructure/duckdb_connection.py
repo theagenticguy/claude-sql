@@ -44,7 +44,12 @@ from claude_sql.infrastructure.duckdb_views import (
     register_analytics,
     register_vss,
 )
-from claude_sql.infrastructure.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.infrastructure.home import (
+    DEFAULT_CORPUS_KEY,
+    claude_sql_home,
+    corpus_caches_at_home_root,
+    recognized_legacy_caches,
+)
 
 if TYPE_CHECKING:
     from claude_sql.infrastructure.settings import Settings
@@ -79,10 +84,36 @@ def resolve_memory_limit(limit: str) -> str:
 
 
 _MIGRATION_MARKER = ".migration_complete"
+_CORPUS_MIGRATION_MARKER = ".corpus_scoping_complete"
 
 
 def maybe_migrate_legacy_caches() -> None:
-    """One-time move of recognized caches from ``~/.claude/`` → ``CLAUDE_SQL_HOME``.
+    """One-time cache relocations, chained: two idempotent phases.
+
+    Phase 1 (RFC 0002 §5.1): recognized caches under ``~/.claude/`` move to
+    ``CLAUDE_SQL_HOME`` (sentinel ``.migration_complete``).
+
+    Phase 2 (corpus scoping): per-corpus caches at the ``CLAUDE_SQL_HOME``
+    *root* — where pre-corpus-scoping versions wrote them for every corpus —
+    move to ``corpora/default/`` (sentinel ``.corpus_scoping_complete``).
+    Only the default key receives migrated caches: root-level caches were in
+    practice built from the interactive ``~/.claude`` corpus. Non-default
+    corpora (``CLAUDE_CONFIG_DIR`` / ``team_corpus_root``) never had
+    correct caches — the old layout served them the default corpus's
+    parquets — so they deliberately start empty and rebuild.
+
+    Chaining phase 1 into phase 2 means a v1-era layout migrates
+    ``~/.claude/`` → home root → ``corpora/default/`` in one call.
+
+    Idempotent. Safe to call from any subcommand entry point. Each phase
+    stamps its sentinel on first success; later runs are no-ops.
+    """
+    _migrate_dot_claude_to_home()
+    _migrate_home_root_to_default_corpus()
+
+
+def _migrate_dot_claude_to_home() -> None:
+    """Phase 1: one-time move of recognized caches ``~/.claude/`` → home.
 
     Runs at most once per ``CLAUDE_SQL_HOME`` directory: a sentinel file
     (``.migration_complete``) in the home short-circuits subsequent calls.
@@ -90,9 +121,6 @@ def maybe_migrate_legacy_caches() -> None:
     against ``OSError`` so a hostile filesystem (read-only mount, EACCES
     on a single subtree) can't crash startup — we log a warning and the
     user can rerun ``claude-sql`` later or migrate manually.
-
-    Idempotent. Safe to call from any subcommand entry point. The first
-    successful run stamps the marker; later runs are no-ops.
     """
     home = claude_sql_home()
     marker = home / _MIGRATION_MARKER
@@ -126,6 +154,47 @@ def maybe_migrate_legacy_caches() -> None:
         # crash startup. The next invocation will retry from a clean
         # state (marker not stamped → loop runs again).
         logger.warning("legacy cache migration skipped: {}", exc)
+
+
+def _migrate_home_root_to_default_corpus() -> None:
+    """Phase 2: one-time move of home-ROOT caches → ``corpora/default/``.
+
+    Same discipline as phase 1: sentinel-gated (``.corpus_scoping_complete``
+    at the home root), move-don't-copy (``shutil.move`` — atomic rename on
+    one filesystem, and the home root and ``corpora/`` always share one),
+    never overwrite a populated destination, and swallow-and-warn on
+    ``OSError`` so a hostile filesystem can't crash startup.
+    """
+    home = claude_sql_home()
+    marker = home / _CORPUS_MIGRATION_MARKER
+    if marker.exists():
+        return
+    stray = corpus_caches_at_home_root(home)
+    if not stray:
+        try:
+            marker.touch()
+        except OSError as exc:
+            logger.warning("could not stamp corpus-scoping marker at {}: {}", marker, exc)
+        return
+    default_dir = home / "corpora" / DEFAULT_CORPUS_KEY
+    try:
+        names = ", ".join(sorted(stray))
+        logger.info(
+            "scoping claude-sql caches to the default corpus: {}/{{{}}} -> {}/",
+            home,
+            names,
+            default_dir,
+        )
+        default_dir.mkdir(parents=True, exist_ok=True)
+        for name, src in stray.items():
+            dst = default_dir / name
+            if dst.exists():
+                logger.warning("skipping migrate {}: destination {} already exists", src, dst)
+                continue
+            shutil.move(str(src), str(dst))
+        marker.touch()
+    except OSError as exc:
+        logger.warning("corpus-scoping cache migration skipped: {}", exc)
 
 
 def apply_duckdb_pragmas(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
@@ -314,6 +383,7 @@ _sql_uses_catalog = sql_uses_catalog
 
 
 __all__ = [
+    "_CORPUS_MIGRATION_MARKER",
     "_MIGRATION_MARKER",
     "_PERCENT_LIMIT_RE",
     "_VSS_TOKENS",

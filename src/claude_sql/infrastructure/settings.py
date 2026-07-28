@@ -27,7 +27,7 @@ from claude_sql.domain.config import (
     TermsConfig,
     TranscriptCaps,
 )
-from claude_sql.infrastructure.home import claude_sql_home
+from claude_sql.infrastructure.home import claude_sql_home, corpus_slug
 
 
 def _claude_config_root() -> str:
@@ -57,12 +57,47 @@ def _default_subagent_meta_glob() -> str:
     return f"{_claude_config_root()}/projects/*/*/subagents/agent-*.meta.json"
 
 
+def _corpus_cache_dir() -> Path:
+    """Parent directory for every analytics cache of the effective corpus.
+
+    ``claude_sql_home()/corpora/<corpus_key>/`` — the corpus-scoping fix:
+    caches derived from one transcript corpus must never be read back while
+    another corpus is selected (via ``CLAUDE_CONFIG_DIR`` or
+    ``team_corpus_root``). The historical interactive corpus (``~/.claude``)
+    maps to the stable key ``"default"`` so existing users' caches remain
+    addressable after the one-time relocation
+    (``duckdb_connection.maybe_migrate_legacy_caches``).
+
+    Keys by ``CLAUDE_CONFIG_DIR`` (falling back to ``~/.claude``), read at
+    call time like every helper in this module. The ``team_corpus_root``
+    tier — which outranks ``CLAUDE_CONFIG_DIR``, matching the input-glob
+    precedence — is applied by the ``_derive_corpus_scoped_cache_paths``
+    model validator, the single owner of that field regardless of whether it
+    arrives via process env, ``.env``, or constructor kwarg.
+    """
+    return claude_sql_home() / "corpora" / corpus_slug(_claude_config_root())
+
+
+def corpus_key(settings: Settings) -> str:
+    """Return the cache-directory key for ``settings``' effective corpus.
+
+    Pure projection: ``team_corpus_root`` (when set on the model — env,
+    ``.env``, or kwarg) wins over ``CLAUDE_CONFIG_DIR``, which wins over
+    ``~/.claude``. The default interactive corpus always maps to
+    ``"default"``; any other root maps to a sanitized-dirname + short-hash
+    slug (see :func:`claude_sql.infrastructure.home.corpus_slug`).
+    """
+    if settings.team_corpus_root is not None:
+        return corpus_slug(settings.team_corpus_root)
+    return corpus_slug(_claude_config_root())
+
+
 def _default_embeddings_parquet() -> Path:
     # Legacy parquet shard directory. Kept here for one-time migration only —
     # the live embeddings store is now LanceDB (see ``_default_lance_uri``).
     # The field name keeps the ``_parquet_path`` suffix so existing call sites
     # that hand the path to migrators / cache-list helpers stay stable.
-    return claude_sql_home() / "embeddings"
+    return _corpus_cache_dir() / "embeddings"
 
 
 def _default_lance_uri() -> Path:
@@ -71,43 +106,43 @@ def _default_lance_uri() -> Path:
     Replaces the parquet-shards + ``hnsw.duckdb`` combo. Lance handles
     storage, versioning, and the IVF_HNSW_SQ index in one place.
     """
-    return claude_sql_home() / "embeddings_lance"
+    return _corpus_cache_dir() / "embeddings_lance"
 
 
 def _default_classifications_parquet() -> Path:
-    return claude_sql_home() / "session_classifications"
+    return _corpus_cache_dir() / "session_classifications"
 
 
 def _default_trajectory_parquet() -> Path:
-    return claude_sql_home() / "message_trajectory"
+    return _corpus_cache_dir() / "message_trajectory"
 
 
 def _default_conflicts_parquet() -> Path:
-    return claude_sql_home() / "session_conflicts"
+    return _corpus_cache_dir() / "session_conflicts"
 
 
 def _default_clusters_parquet() -> Path:
-    return claude_sql_home() / "clusters.parquet"
+    return _corpus_cache_dir() / "clusters.parquet"
 
 
 def _default_cluster_terms_parquet() -> Path:
-    return claude_sql_home() / "cluster_terms.parquet"
+    return _corpus_cache_dir() / "cluster_terms.parquet"
 
 
 def _default_communities_parquet() -> Path:
-    return claude_sql_home() / "session_communities.parquet"
+    return _corpus_cache_dir() / "session_communities.parquet"
 
 
 def _default_community_profile_parquet() -> Path:
-    return claude_sql_home() / "community_profile.parquet"
+    return _corpus_cache_dir() / "community_profile.parquet"
 
 
 def _default_user_friction_parquet() -> Path:
-    return claude_sql_home() / "user_friction"
+    return _corpus_cache_dir() / "user_friction"
 
 
 def _default_skills_catalog_parquet() -> Path:
-    return claude_sql_home() / "skills_catalog.parquet"
+    return _corpus_cache_dir() / "skills_catalog.parquet"
 
 
 def _default_user_skills_dir() -> Path:
@@ -124,15 +159,18 @@ def _default_plugins_cache_dir() -> Path:
 def _default_checkpoint_db() -> Path:
     # SQLite WAL state file. The legacy ``claude_sql.duckdb`` path is migrated
     # once on first open by ``checkpointer._migrate_from_duckdb_if_present``.
-    return claude_sql_home() / "state.db"
+    # Corpus-scoped: checkpoints key by ``(session_id, pipeline)``, and a team
+    # corpus that includes the user's own transcripts shares session_ids with
+    # the personal corpus — a shared state.db would silently skip re-scoring.
+    return _corpus_cache_dir() / "state.db"
 
 
 def _default_duckdb_temp_dir() -> Path:
-    return claude_sql_home() / "duckdb_tmp"
+    return _corpus_cache_dir() / "duckdb_tmp"
 
 
 def _default_ingest_stamps_parquet() -> Path:
-    return claude_sql_home() / "ingest_stamps"
+    return _corpus_cache_dir() / "ingest_stamps"
 
 
 def _default_duckdb_threads() -> int:
@@ -424,7 +462,7 @@ class Settings(BaseSettings):
     duckdb_memory_limit: str = "70%"
     #: Spill directory. Amazon devboxes ship ``/tmp`` as a 4 GB tmpfs that
     #: thrashes the host once a clustering run starts spilling — point at
-    #: ``~/.claude/duckdb_tmp`` (real disk) instead.
+    #: ``claude_sql_home()/corpora/<corpus_key>/duckdb_tmp`` (real disk) instead.
     duckdb_temp_dir: Path = Field(default_factory=_default_duckdb_temp_dir)
 
     @model_validator(mode="after")
@@ -465,6 +503,49 @@ class Settings(BaseSettings):
             "subagent_meta_glob",
             f"{resolved}/*/projects/*/subagents/agent-*.meta.json",
         )
+        return self
+
+    @model_validator(mode="after")
+    def _derive_corpus_scoped_cache_paths(self) -> Self:
+        """Re-key the analytics cache paths when ``team_corpus_root`` is set.
+
+        The default factories key every cache under
+        ``claude_sql_home()/corpora/<key of CLAUDE_CONFIG_DIR or ~/.claude>``.
+        ``team_corpus_root`` outranks ``CLAUDE_CONFIG_DIR`` in the input-glob
+        precedence, so it must outrank it for the cache key too — otherwise a
+        team-corpus run reads the personal corpus's analytics parquets (the
+        exact silent-wrong-corpus bug this scoping exists to fix). The field
+        can arrive via process env, ``.env``, or constructor kwarg; handling
+        it here (not in the factories) covers all three uniformly.
+
+        Per-field user pins always win, same discipline as
+        ``_derive_team_corpus_globs``: a cache path is rewritten only while
+        it still equals its factory default (compared against factory
+        *output*, never a literal, so factory refactors can't break pins).
+        """
+        root = self.team_corpus_root
+        if root is None:
+            return self
+        team_dir = claude_sql_home() / "corpora" / corpus_slug(root)
+        field_to_factory: dict[str, Path] = {
+            "embeddings_parquet_path": _default_embeddings_parquet(),
+            "lance_uri": _default_lance_uri(),
+            "classifications_parquet_path": _default_classifications_parquet(),
+            "trajectory_parquet_path": _default_trajectory_parquet(),
+            "conflicts_parquet_path": _default_conflicts_parquet(),
+            "clusters_parquet_path": _default_clusters_parquet(),
+            "cluster_terms_parquet_path": _default_cluster_terms_parquet(),
+            "communities_parquet_path": _default_communities_parquet(),
+            "community_profile_parquet_path": _default_community_profile_parquet(),
+            "user_friction_parquet_path": _default_user_friction_parquet(),
+            "skills_catalog_parquet_path": _default_skills_catalog_parquet(),
+            "checkpoint_db_path": _default_checkpoint_db(),
+            "duckdb_temp_dir": _default_duckdb_temp_dir(),
+            "ingest_stamps_parquet_path": _default_ingest_stamps_parquet(),
+        }
+        for field, factory_default in field_to_factory.items():
+            if getattr(self, field) == factory_default:
+                object.__setattr__(self, field, team_dir / factory_default.name)
         return self
 
     @property

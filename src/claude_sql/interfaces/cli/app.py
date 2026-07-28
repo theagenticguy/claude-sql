@@ -75,7 +75,11 @@ from claude_sql.infrastructure.duckdb_views import (
     register_raw,
     register_views,
 )
-from claude_sql.infrastructure.home import claude_sql_home, recognized_legacy_caches
+from claude_sql.infrastructure.home import (
+    claude_sql_home,
+    corpus_caches_at_home_root,
+    recognized_legacy_caches,
+)
 from claude_sql.infrastructure.logging_setup import configure_logging
 from claude_sql.infrastructure.parquet_cache import (
     count_rows,
@@ -846,6 +850,20 @@ def list_cache(*, common: Common | None = None) -> None:
             {
                 "name": f"legacy:{name}",
                 "path": str(legacy_path),
+                "exists": True,
+                "bytes": None,
+                "mtime": None,
+                "rows": None,
+            }
+        )
+    # Same breadcrumb for the corpus-scoping move: per-corpus caches still
+    # sitting at the CLAUDE_SQL_HOME root (pre-corpus-scoping layout) after
+    # the auto-relocation to corpora/default/ ran.
+    for name, stray_path in corpus_caches_at_home_root().items():
+        entries.append(
+            {
+                "name": f"unscoped:{name}",
+                "path": str(stray_path),
                 "exists": True,
                 "bytes": None,
                 "mtime": None,

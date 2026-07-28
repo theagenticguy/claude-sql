@@ -38,7 +38,7 @@ Run one SQL query against the claude-sql catalog and emit results.
 
 Flags:
 
-- `--profile-json` — set DuckDB profiling PRAGMAs and write a JSON timing tree under `~/.claude/profiling/`. `src/claude_sql/interfaces/cli/app.py:545`.
+- `--profile-json` — set DuckDB profiling PRAGMAs and write a JSON timing tree under `claude_sql_home()/profiling/`. `src/claude_sql/interfaces/cli/app.py:545`.
 
 ## explain
 
@@ -53,7 +53,7 @@ Show the DuckDB query plan and highlight pushdown / noteworthy operators.
 Flags:
 
 - `--analyze` — run `EXPLAIN ANALYZE` (executes the query and reports real timings); off by default so probing is free. `src/claude_sql/interfaces/cli/app.py:624`.
-- `--profile-json` — write a JSON profiling tree under `~/.claude/profiling/`. `src/claude_sql/interfaces/cli/app.py:625`.
+- `--profile-json` — write a JSON profiling tree under `claude_sql_home()/profiling/`. `src/claude_sql/interfaces/cli/app.py:625`.
 
 ## schema
 

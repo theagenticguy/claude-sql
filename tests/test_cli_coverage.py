@@ -204,12 +204,13 @@ def _common_for(corpus: dict[str, str], fmt: OutputFormat = OutputFormat.JSON) -
 def test_migrate_legacy_caches_moves_directories(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Recognized ``~/.claude/`` caches are moved into ``CLAUDE_SQL_HOME``.
+    """Recognized ``~/.claude/`` caches land in ``corpora/default/``.
 
-    Pin the happy path: a legacy ``embeddings_lance/`` dir under the
-    fake ``$HOME/.claude/`` and a ``state.db`` legacy file get moved to
-    the new home, and the ``.migration_complete`` sentinel is stamped.
-    A second call is a no-op (sentinel exists).
+    Pin the happy path across BOTH chained phases: a legacy
+    ``embeddings_lance/`` dir under the fake ``$HOME/.claude/`` and a
+    ``state.db`` legacy file get moved to the new home (phase 1) and then
+    scoped under ``corpora/default/`` (phase 2); both sentinels are
+    stamped. A second call is a no-op (sentinels exist).
     """
     fake_home = tmp_path / "user_home"
     legacy = fake_home / ".claude"
@@ -225,16 +226,22 @@ def test_migrate_legacy_caches_moves_directories(
 
     cli._maybe_migrate_legacy_caches()
 
-    assert (new_home / "embeddings_lance" / "data.lance").exists()
-    assert (new_home / "state.db").exists()
+    default_dir = new_home / "corpora" / "default"
+    assert (default_dir / "embeddings_lance" / "data.lance").exists()
+    assert (default_dir / "state.db").exists()
     assert (new_home / ".migration_complete").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
     assert not (legacy / "embeddings_lance").exists()
     assert not (legacy / "state.db").exists()
+    # Nothing left stranded at the home root.
+    assert not (new_home / "embeddings_lance").exists()
+    assert not (new_home / "state.db").exists()
 
-    # Idempotency: second call short-circuits on the sentinel.
+    # Idempotency: second call short-circuits on the sentinels.
     cli._maybe_migrate_legacy_caches()
-    # Marker still there — function returned early without crashing.
+    # Markers still there — function returned early without crashing.
     assert (new_home / ".migration_complete").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
 
 
 def test_migrate_legacy_caches_skips_when_destination_exists(
@@ -263,8 +270,11 @@ def test_migrate_legacy_caches_skips_when_destination_exists(
 
     # Legacy preserved (not moved over the populated destination).
     assert (legacy / "embeddings_lance" / "data.lance").exists()
-    # Destination's prior contents intact.
-    assert (new_home / "embeddings_lance" / "existing.lance").exists()
+    # Destination's prior contents intact — relocated by the corpus-scoping
+    # phase into ``corpora/default/`` (it was a pre-corpus-scoping cache at
+    # the home root), never overwritten by the legacy copy.
+    assert (new_home / "corpora" / "default" / "embeddings_lance" / "existing.lance").exists()
+    assert not (new_home / "embeddings_lance").exists()
     assert (new_home / ".migration_complete").exists()
 
 
@@ -287,6 +297,96 @@ def test_migrate_legacy_caches_no_legacy_stamps_marker(
     cli._maybe_migrate_legacy_caches()
 
     assert (new_home / ".migration_complete").exists()
+    # Phase 2 stamps its own sentinel on the same clean-home path.
+    assert (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_skips_when_destination_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Phase 2 never overwrites a populated ``corpora/default/`` cache.
+
+    Same conservatism as phase 1: an unscoped home-root cache whose name
+    already exists under ``corpora/default/`` stays where it is (surfaced
+    later by the ``unscoped:`` list-cache breadcrumb) and the rest of the
+    manifest still migrates.
+    """
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    default_dir = new_home / "corpora" / "default"
+    default_dir.mkdir(parents=True)
+    (default_dir / "clusters.parquet").write_bytes(b"already-scoped")
+    (new_home / "clusters.parquet").write_bytes(b"stale-root-copy")
+    (new_home / "cluster_terms.parquet").write_bytes(b"migrates-fine")
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+
+    cli._maybe_migrate_legacy_caches()
+
+    # Populated destination untouched; the root copy stays for manual
+    # reconciliation.
+    assert (default_dir / "clusters.parquet").read_bytes() == b"already-scoped"
+    assert (new_home / "clusters.parquet").exists()
+    # The non-conflicting sibling migrated.
+    assert (default_dir / "cluster_terms.parquet").read_bytes() == b"migrates-fine"
+    assert not (new_home / "cluster_terms.parquet").exists()
+    assert (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_oserror_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An ``OSError`` during the phase-2 move is logged, not raised.
+
+    Mirrors the phase-1 hostile-filesystem guarantee: the sentinel stays
+    unstamped so the next invocation retries.
+    """
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    new_home.mkdir()
+    (new_home / "clusters.parquet").write_bytes(b"\x00")
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+    # Phase 1 must complete so the failure comes from phase 2's move.
+    (new_home / ".migration_complete").touch()
+
+    def _raise(*_a: object, **_kw: object) -> None:
+        raise OSError("simulated read-only mount")
+
+    monkeypatch.setattr("claude_sql.infrastructure.duckdb_connection.shutil.move", _raise)
+
+    # Must not raise — the loop swallows OSError and warns.
+    cli._maybe_migrate_legacy_caches()
+    # Sentinel unstamped → the next call retries from a clean state.
+    assert not (new_home / ".corpus_scoping_complete").exists()
+
+
+def test_corpus_scoping_marker_touch_failure_is_logged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failing sentinel stamp on the nothing-to-scope path is logged, not raised."""
+    fake_home = tmp_path / "user_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    new_home = tmp_path / "new_home"
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(new_home))
+
+    real_touch = Path.touch
+
+    def _selective_touch(self: Path, *a: object, **kw: object) -> None:
+        if self.name == ".corpus_scoping_complete":
+            raise OSError("simulated EACCES on marker stamp")
+        real_touch(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "touch", _selective_touch)
+
+    # Must NOT raise — the function logs and returns.
+    cli._maybe_migrate_legacy_caches()
 
 
 def test_migrate_legacy_caches_oserror_does_not_crash(
@@ -547,6 +647,31 @@ def test_list_cache_surfaces_legacy_breadcrumb(
     payload = json.loads(capsys.readouterr().out)
     names = {entry["name"] for entry in payload}
     assert any(name.startswith("legacy:") for name in names)
+
+
+def test_list_cache_surfaces_unscoped_breadcrumb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``list-cache`` flags home-root caches that weren't corpus-scoped.
+
+    Stamps both migration sentinels first so the auto-relocation
+    short-circuits, then plants an unscoped ``clusters.parquet`` at the
+    home root. The breadcrumb iterator should surface an
+    ``unscoped:clusters.parquet`` entry.
+    """
+    new_home = tmp_path / "claude_home"
+    new_home.mkdir(exist_ok=True)
+    (new_home / ".migration_complete").touch()
+    (new_home / ".corpus_scoping_complete").touch()
+    (new_home / "clusters.parquet").write_bytes(b"\x00" * 32)
+
+    corpus = _build_corpus(tmp_path)
+    cli.list_cache(common=_common_for(corpus, OutputFormat.JSON))
+    payload = json.loads(capsys.readouterr().out)
+    names = {entry["name"] for entry in payload}
+    assert "unscoped:clusters.parquet" in names
 
 
 # ---------------------------------------------------------------------------

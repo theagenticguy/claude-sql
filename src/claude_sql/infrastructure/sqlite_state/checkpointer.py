@@ -23,9 +23,12 @@ DuckDB single-writer file lock used to force a 20× retry storm under parallel
 classify/trajectory/conflicts pipelines; SQLite's ``busy_timeout`` pragma
 absorbs transient writer contention transparently in microseconds.
 
-The file lives at ``~/.claude/state.db`` (overridable via
-``CLAUDE_SQL_CHECKPOINT_DB_PATH``). On first connect, if the legacy
-``~/.claude/claude_sql.duckdb`` exists, its contents are migrated once.
+The file lives at ``claude_sql_home()/corpora/<corpus_key>/state.db``
+(overridable via ``CLAUDE_SQL_CHECKPOINT_DB_PATH``) — corpus-scoped, because
+checkpoints key by ``(session_id, pipeline)`` and a shared file would let one
+corpus's completions silently skip another's re-scoring. On first connect, if
+the legacy ``claude_sql.duckdb`` exists next to the target path, its contents
+are migrated once.
 """
 
 from __future__ import annotations

@@ -81,7 +81,7 @@ flowchart LR
     R --> V[business views]
     V --> Q[["claude-sql query<br/>claude-sql explain<br/>claude-sql schema"]]
     V --> E["claude-sql embed<br/>(Cohere Embed v4 on Bedrock,<br/>or Ollama / ONNX BGE)"]
-    E --> P["LanceDB store<br/>(~/.claude/embeddings_lance/<br/>FLOAT[1024] + IVF_HNSW_SQ index)"]
+    E --> P["LanceDB store<br/>(corpora/&lt;corpus_key&gt;/embeddings_lance/<br/>FLOAT[1024] + IVF_HNSW_SQ index)"]
     P --> S[["claude-sql search"]]
     V --> L["claude-sql classify / trajectory /<br/>conflicts / friction (Sonnet 4.6 +<br/>output_config.format)"]
     L --> PA["session_classifications/, message_trajectory/,<br/>session_conflicts/, user_friction/<br/>(sharded part-*.parquet)"]
@@ -98,6 +98,14 @@ flowchart LR
 Every parquet is cached and rebuilt only on explicit re-run. Views
 register over whichever parquets exist at connection open — missing ones
 warn and no-op, never crash.
+
+Caches are **corpus-scoped**: they live under
+`claude_sql_home()/corpora/<corpus_key>/`, keyed by the effective corpus
+root (`team_corpus_root` > `CLAUDE_CONFIG_DIR` > `~/.claude`, which maps
+to the reserved key `default`). Switching corpus can therefore never
+read another corpus's analytics parquets; each corpus builds and reads
+its own. Caches written by earlier versions at the `claude_sql_home()`
+root are auto-relocated into `corpora/default/` once, on first connect.
 
 ## Install
 
@@ -434,15 +442,15 @@ path) follow the same prefix convention — see
 | `CLAUDE_SQL_EMBED_CONCURRENCY` | `8` | Parallel Cohere Embed v4 calls (global CRIS) |
 | `CLAUDE_SQL_LLM_CONCURRENCY` | `16` | Parallel Sonnet 4.6 calls (global CRIS) |
 | `CLAUDE_SQL_BATCH_SIZE` | `96` | Cohere batch size |
-| `CLAUDE_SQL_LANCE_URI` | `~/.claude/embeddings_lance` | LanceDB embeddings store (`FLOAT[1024]` vectors + IVF_HNSW_SQ index) |
+| `CLAUDE_SQL_LANCE_URI` | `<home>/corpora/<corpus_key>/embeddings_lance` | LanceDB embeddings store (`FLOAT[1024]` vectors + IVF_HNSW_SQ index) |
 | `CLAUDE_SQL_HNSW_METRIC` | `cosine` | Vector index distance metric (`cosine` / `l2` / `dot`) |
-| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `~/.claude/embeddings/` | **Legacy** parquet shards; kept only for one-time migration into LanceDB |
-| `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `~/.claude/user_friction/` | Friction cache (sharded) |
+| `CLAUDE_SQL_EMBEDDINGS_PARQUET_PATH` | `<home>/corpora/<corpus_key>/embeddings/` | **Legacy** parquet shards; kept only for one-time migration into LanceDB |
+| `CLAUDE_SQL_USER_FRICTION_PARQUET_PATH` | `<home>/corpora/<corpus_key>/user_friction/` | Friction cache (sharded) |
 | `CLAUDE_SQL_FRICTION_MAX_CHARS` | `300` | Short-message cutoff for the friction classifier |
 | `CLAUDE_SQL_DUCKDB_THREADS` | `os.cpu_count()` | DuckDB worker threads |
 | `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` | `'70%'` | DuckDB memory ceiling (percentage or absolute size) |
-| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `~/.claude/duckdb_tmp` | DuckDB spill directory (avoids `/tmp` tmpfs thrash) |
-| `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `~/.claude/skills_catalog.parquet` | Skills catalog parquet |
+| `CLAUDE_SQL_DUCKDB_TEMP_DIR` | `<home>/corpora/<corpus_key>/duckdb_tmp` | DuckDB spill directory (avoids `/tmp` tmpfs thrash) |
+| `CLAUDE_SQL_SKILLS_CATALOG_PARQUET_PATH` | `<home>/corpora/<corpus_key>/skills_catalog.parquet` | Skills catalog parquet |
 | `CLAUDE_SQL_USER_SKILLS_DIR` | `$CLAUDE_CONFIG_DIR/skills` | Root scanned for user-installed skills |
 | `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `$CLAUDE_CONFIG_DIR/plugins/cache` | Root scanned for plugin skills + commands |
 | `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Leiden determinism |
