@@ -35,7 +35,7 @@ jobs:
             --config p/owasp-top-ten \
             --sarif --output=semgrep.sarif \
             --metrics=off || true
-      - uses: github/codeql-action/upload-sarif@v4
+      - uses: github/codeql-action/upload-sarif@v4.37.4
         if: always()
         with:
           sarif_file: semgrep.sarif

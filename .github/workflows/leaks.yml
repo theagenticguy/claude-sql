@@ -45,7 +45,7 @@ jobs:
         # findings surface through code scanning UI, not the scan's
         # exit code.  See .erpaval/solutions/best-practices/sarif-scanner-report-vs-gate.md.
         run: betterleaks git . -f sarif -r betterleaks.sarif --exit-code=0
-      - uses: github/codeql-action/upload-sarif@v4
+      - uses: github/codeql-action/upload-sarif@v4.37.4
         if: always()
         with:
           sarif_file: betterleaks.sarif
