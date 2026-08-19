@@ -161,6 +161,27 @@ def test_stamping_creates_missing_parents(tmp_path: Path) -> None:
     assert sidecar.read_text() == "7"
 
 
+def test_an_unreadable_sidecar_is_stale_not_an_error(tmp_path: Path) -> None:
+    """A freshness probe must never be the thing that fails a stage."""
+    out = _output(tmp_path)
+    sidecar = sidecar_for(out, input_name="src")
+    # A directory where a file is expected: ``read_text`` raises IsADirectoryError.
+    sidecar.mkdir()
+
+    assert not is_output_fresh(out, sidecar=sidecar, input_mtime_ns=1)
+
+
+def test_an_unwritable_sidecar_warns_instead_of_raising(tmp_path: Path) -> None:
+    """A failed stamp costs a recompute; failing the stage that just succeeded is worse."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("i am a file")
+    sidecar = blocker / "nested" / "out.parquet.src_mtime"
+
+    stamp_output(sidecar, 7)  # NotADirectoryError swallowed
+
+    assert not sidecar.exists()
+
+
 def test_a_stamp_round_trips(tmp_path: Path) -> None:
     out = _output(tmp_path)
     sidecar = sidecar_for(out, input_name="src")
