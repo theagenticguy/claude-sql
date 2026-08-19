@@ -16,6 +16,7 @@ import pytest
 
 from claude_sql.application.use_cases.terms import run_terms
 from claude_sql.infrastructure.duckdb_views import register_raw, register_views
+from claude_sql.infrastructure.freshness import newest_mtime_ns, sidecar_for, stamp_output
 from claude_sql.infrastructure.settings import Settings
 from conftest import (
     _seed_subagent_stub,
@@ -174,22 +175,14 @@ def test_run_terms_raises_when_clusters_too_small(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_terms_returns_cached_result(tmp_path: Path) -> None:
-    settings = _settings_with_minimal_tfidf(tmp_path)
-    # Existing clusters parquet (must pass the 16-byte sniff so the
-    # short-circuit isn't pre-empted by FileNotFoundError).
-    _write_clusters_parquet(
-        settings.clusters_parquet_path,
-        [("a", 0), ("b", 0), ("c", 1)],
-    )
-    # Pre-write a fake cluster_terms parquet — three rows over two clusters.
-    cached_rows = [
-        {"cluster_id": 0, "term": "alpha", "weight": 0.7, "rank": 1},
-        {"cluster_id": 0, "term": "beta", "weight": 0.3, "rank": 2},
-        {"cluster_id": 1, "term": "gamma", "weight": 0.9, "rank": 1},
-    ]
+def _write_cached_terms(settings: Settings) -> None:
+    """Pre-write a cluster_terms parquet — three rows over two clusters."""
     pl.DataFrame(
-        cached_rows,
+        [
+            {"cluster_id": 0, "term": "alpha", "weight": 0.7, "rank": 1},
+            {"cluster_id": 0, "term": "beta", "weight": 0.3, "rank": 2},
+            {"cluster_id": 1, "term": "gamma", "weight": 0.9, "rank": 1},
+        ],
         schema={
             "cluster_id": pl.Int32,
             "term": pl.Utf8,
@@ -198,6 +191,22 @@ def test_run_terms_returns_cached_result(tmp_path: Path) -> None:
         },
     ).write_parquet(settings.cluster_terms_parquet_path)
 
+
+def test_run_terms_returns_cached_result(tmp_path: Path) -> None:
+    """A cache hit needs the SIDECAR to match, not merely an output to exist."""
+    settings = _settings_with_minimal_tfidf(tmp_path)
+    # Existing clusters parquet (must pass the 16-byte sniff so the
+    # short-circuit isn't pre-empted by FileNotFoundError).
+    _write_clusters_parquet(
+        settings.clusters_parquet_path,
+        [("a", 0), ("b", 0), ("c", 1)],
+    )
+    _write_cached_terms(settings)
+    stamp_output(
+        sidecar_for(settings.cluster_terms_parquet_path, input_name="clusters"),
+        newest_mtime_ns(settings.clusters_parquet_path),
+    )
+
     con = duckdb.connect(":memory:")
     try:
         out = run_terms(con, settings, force=False)
@@ -205,6 +214,46 @@ def test_run_terms_returns_cached_result(tmp_path: Path) -> None:
         con.close()
 
     assert out == {"clusters": 2, "terms": 3}
+
+
+def test_run_terms_recomputes_when_the_clustering_moved(tmp_path: Path) -> None:
+    """Regression lock: an existing output must NOT be trusted on its own.
+
+    HDBSCAN re-mints ``cluster_id`` on every fit, so terms built against an
+    earlier clustering describe a partition that no longer exists. Under the
+    existence gate this returned the stale rows forever; now it recomputes,
+    which here surfaces as the missing ``messages_text`` view rather than a
+    quietly wrong answer.
+    """
+    settings = _settings_with_minimal_tfidf(tmp_path)
+    _write_clusters_parquet(settings.clusters_parquet_path, [("a", 0), ("b", 1)])
+    _write_cached_terms(settings)
+    # A sidecar stamped from a DIFFERENT clustering state.
+    stamp_output(
+        sidecar_for(settings.cluster_terms_parquet_path, input_name="clusters"),
+        12345,
+    )
+
+    con = duckdb.connect(":memory:")
+    try:
+        with pytest.raises(duckdb.CatalogException):
+            run_terms(con, settings, force=False)
+    finally:
+        con.close()
+
+
+def test_run_terms_recomputes_when_no_sidecar_exists(tmp_path: Path) -> None:
+    """Fail closed: an unsubstantiated freshness claim is not a cache hit."""
+    settings = _settings_with_minimal_tfidf(tmp_path)
+    _write_clusters_parquet(settings.clusters_parquet_path, [("a", 0), ("b", 1)])
+    _write_cached_terms(settings)
+
+    con = duckdb.connect(":memory:")
+    try:
+        with pytest.raises(duckdb.CatalogException):
+            run_terms(con, settings, force=False)
+    finally:
+        con.close()
     # Output parquet was not rewritten — still has our exact synthetic rows
     # (float32 round-trip means we compare structure, not bit-equal weights).
     df = pl.read_parquet(settings.cluster_terms_parquet_path)

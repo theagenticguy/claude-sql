@@ -28,6 +28,7 @@ from claude_sql.application.use_cases.community import (
     neighbors_of,
     run_communities,
 )
+from claude_sql.infrastructure.freshness import newest_mtime_ns, sidecar_for, stamp_output
 from claude_sql.infrastructure.settings import Settings
 from claude_sql.interfaces.cli import app as cli
 from claude_sql.interfaces.cli.app import Common
@@ -127,11 +128,18 @@ def test_run_communities_cache_hit_returns_summary(tmp_path: Path) -> None:
     )
     df.write_parquet(out)
 
+    # The cache hit keys on the EMBEDDINGS store's mtime — communities are built
+    # from session centroids, so that is the real input — and needs a matching
+    # sidecar, not merely an existing output.
+    lance_uri = tmp_path / "emb_lance"
+    lance_uri.mkdir()
     settings = Settings(
         embeddings_parquet_path=tmp_path / "no-such-emb",
+        lance_uri=lance_uri,
         communities_parquet_path=out,
         community_profile_parquet_path=tmp_path / "profile.parquet",
     )
+    stamp_output(sidecar_for(out, input_name="embeddings"), newest_mtime_ns(lance_uri))
     con = duckdb.connect(":memory:")
     try:
         stats = run_communities(con, settings, force=False)
@@ -144,6 +152,52 @@ def test_run_communities_cache_hit_returns_summary(tmp_path: Path) -> None:
     assert isinstance(stats["quality"], float)
     assert math.isnan(float(stats["quality"]))
     assert stats["algorithm"] == "leiden_cpm"
+
+
+def test_run_communities_recomputes_when_embeddings_moved(tmp_path: Path) -> None:
+    """Regression lock: an existing output alone is not a freshness claim.
+
+    Under the previous existence gate this returned the stale summary forever
+    while ``embed`` advanced the store hourly. Now it recomputes, which without
+    a bound ``message_embeddings`` view surfaces as a loud RuntimeError instead
+    of a quietly weeks-old answer.
+    """
+    out = tmp_path / "communities.parquet"
+    pl.DataFrame(
+        {
+            "session_id": ["a", "b"],
+            "community_id": [0, 0],
+            "size": [2, 2],
+            "is_medoid": [True, False],
+            "coherence": [0.9, 0.9],
+            "gamma_used": [0.5, 0.5],
+        },
+        schema={
+            "session_id": pl.Utf8,
+            "community_id": pl.Int32,
+            "size": pl.Int32,
+            "is_medoid": pl.Boolean,
+            "coherence": pl.Float32,
+            "gamma_used": pl.Float32,
+        },
+    ).write_parquet(out)
+    lance_uri = tmp_path / "emb_lance"
+    lance_uri.mkdir()
+    settings = Settings(
+        embeddings_parquet_path=tmp_path / "no-such-emb",
+        lance_uri=lance_uri,
+        communities_parquet_path=out,
+        community_profile_parquet_path=tmp_path / "profile.parquet",
+    )
+    # A sidecar stamped from a DIFFERENT embeddings state.
+    stamp_output(sidecar_for(out, input_name="embeddings"), 4242)
+
+    con = duckdb.connect(":memory:")
+    try:
+        with pytest.raises(RuntimeError):
+            run_communities(con, settings, force=False)
+    finally:
+        con.close()
 
 
 # ---------------------------------------------------------------------------
