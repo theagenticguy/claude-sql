@@ -288,6 +288,33 @@ respectively), so they have no dry-run gate.
 | `shell` | Launch the `duckdb` REPL with everything pre-registered |
 | `list-cache` | Report freshness + row counts for every parquet cache |
 | `peek <session_id>` | One-shot session summary — line count, role mix, top tools, samples |
+| `watch` | Daemon: hold one warm connection and advance its snapshot as transcripts land (free; `--embed-limit N` opts into capped embedding) |
+
+### `watch` — near-live freshness
+
+The raw readers materialize as DuckDB TEMP TABLEs, so **freshness is a property of a
+process, not of the corpus**: any long-lived reader answers from the instant it
+registered. `watch` holds a connection and re-reads only the transcript files whose mtime
+moved — measured **0.22 s** per refresh versus **6.2 s** for a full re-registration over
+9,082 files.
+
+```bash
+claude-sql watch                       # OS events (needs the `watch` extra), free
+claude-sql watch --embed-limit 512     # also keep semantic search fresh (spends)
+claude-sql watch --force-polling       # network mounts where inotify never fires
+```
+
+Changes are coalesced per source file and flushed once the file has been quiet for
+`--quiet-period` seconds — the "turn finished writing" signal, observed rather than
+announced by a hook. `--max-wait` bounds how long a continuously-appended transcript can
+go unrefreshed, so an active session still lands on a fixed cadence. The event stream
+decides *when* to refresh, never *what*: each flush rescans the watermark, so a dropped OS
+event self-heals.
+
+There is deliberately no one-shot mode. A fresh process has no prior snapshot to advance,
+so it pays the full registration regardless; incrementality only pays inside a resident
+process. `snapshot_as_of(con)` is the accessor for an embedding consumer that needs to
+know what instant its answers cover.
 
 **Embeddings + structure**
 
@@ -296,8 +323,8 @@ respectively), so they have no dry-run gate.
 | `embed` | Backfill embeddings via the active provider — `--embedding-provider {cohere-bedrock,ollama,onnx-bge}` (spends by default) |
 | `search <text>` | IVF_HNSW_SQ cosine semantic search over the LanceDB store |
 | `ingest` | Stamp messages with `approx_tokens` / `simhash64` / canonical UUID (CPU only) |
-| `cluster` | UMAP → HDBSCAN over message embeddings (CPU only; `--force` to rebuild) |
-| `terms` | c-TF-IDF term labels per cluster (CPU only) |
+| `cluster` | UMAP 50-D → HDBSCAN over message embeddings (CPU only; `--force` to rebuild, `--viz` to also fit the opt-in 2-D `x`/`y` projection) |
+| `terms` | c-TF-IDF term labels per cluster (CPU only; recomputes when `clusters.parquet` moves) |
 | `community` | Leiden + CPM over mutual-kNN session centroids; emits medoid + coherence + resolution profile + `--neighbors-of` |
 
 **LLM analytics (Sonnet 4.6 — default `--dry-run`)**
@@ -454,6 +481,7 @@ path) follow the same prefix convention — see
 | `CLAUDE_SQL_USER_SKILLS_DIR` | `$CLAUDE_CONFIG_DIR/skills` | Root scanned for user-installed skills |
 | `CLAUDE_SQL_PLUGINS_CACHE_DIR` | `$CLAUDE_CONFIG_DIR/plugins/cache` | Root scanned for plugin skills + commands |
 | `CLAUDE_SQL_SEED` | `42` | UMAP / HDBSCAN / Leiden determinism |
+| `CLAUDE_SQL_UMAP_COMPUTE_VIZ` | `false` | Fit the 2-D viz projection into `clusters.parquet`'s `x`/`y`. Off by default: no code path reads those columns and the fit was 66% of the clustering stage's wall clock (807 s of 1,247 s over 128,453 embeddings). With it off the columns hold NULLs |
 | `CLAUDE_SQL_LEIDEN_KNN_K` | `15` | Mutual-kNN k for the session-centroid graph |
 | `CLAUDE_SQL_LEIDEN_EDGE_FLOOR` | `0.3` | Cosine floor below which edges are dropped |
 | `CLAUDE_SQL_LEIDEN_MIN_COMMUNITY_SIZE` | `3` | Communities below this collapse to noise (`-1`) |
