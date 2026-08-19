@@ -27,22 +27,37 @@ if TYPE_CHECKING:
     from claude_sql.domain.config import ClusteringConfig
 
 
-def cluster_embeddings(matrix: np.ndarray, cfg: ClusteringConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Reduce with UMAP (50d + 2d) and label with HDBSCAN.
+def cluster_embeddings(
+    matrix: np.ndarray, cfg: ClusteringConfig
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Reduce with UMAP (50d, optionally + 2d) and label with HDBSCAN.
+
+    The 50-d reduction is load-bearing: HDBSCAN's density estimates degrade at
+    the embedding provider's native width (1024-d for Cohere Embed v4), and the
+    post-UMAP space is what makes ``metric="euclidean"`` below sound.
+
+    The 2-d reduction is a viz projection and nothing in the codebase reads it —
+    it is written to ``clusters.parquet`` as ``x`` / ``y`` and available to
+    ad-hoc SQL only. It is also the single most expensive step: measured on
+    128,453 embeddings, the 50-d fit took 414 s and the 2-d fit took 807 s, so
+    it is 66% of the stage's wall clock. ``cfg.compute_viz_coords`` gates it, and
+    the default is off.
 
     Parameters
     ----------
     matrix
         Contiguous ``(N, dim)`` float32 embedding matrix.
     cfg
-        UMAP + HDBSCAN hyperparameters (+ ``seed``).
+        UMAP + HDBSCAN hyperparameters (+ ``seed``, ``compute_viz_coords``).
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
+    tuple[np.ndarray, np.ndarray | None]
         ``(labels, coords)`` where ``labels`` is an ``(N,)`` int array of
-        cluster ids (``-1`` for noise) and ``coords`` is the ``(N, 2)`` float
-        UMAP viz projection.
+        cluster ids (``-1`` for noise). ``coords`` is the ``(N, 2)`` float UMAP
+        viz projection, or ``None`` when ``cfg.compute_viz_coords`` is false —
+        ``None``, not zeros, so the caller writes SQL NULLs and a reader can
+        tell "not computed" from "projected to the origin".
     """
     # Heavy imports inside the function so module import stays cheap.
     import hdbscan
@@ -66,22 +81,26 @@ def cluster_embeddings(matrix: np.ndarray, cfg: ClusteringConfig) -> tuple[np.nd
     x50 = reducer_cluster.fit_transform(matrix)  # 50d projection matrix
     logger.info("UMAP 50d done in {:.1f}s", time.monotonic() - t0)
 
-    t1 = time.monotonic()
-    logger.info(
-        "UMAP → {}d (viz): n_neighbors={}, min_dist={}",
-        cfg.umap_n_components_2,
-        cfg.umap_n_neighbors,
-        cfg.umap_min_dist_viz,
-    )
-    reducer_viz = umap.UMAP(
-        n_components=cfg.umap_n_components_2,
-        n_neighbors=cfg.umap_n_neighbors,
-        min_dist=cfg.umap_min_dist_viz,
-        metric=cfg.umap_metric,
-        random_state=cfg.seed,
-    )
-    coords = reducer_viz.fit_transform(matrix)  # 2d viz projection matrix
-    logger.info("UMAP 2d done in {:.1f}s", time.monotonic() - t1)
+    coords: np.ndarray | None = None
+    if cfg.compute_viz_coords:
+        t1 = time.monotonic()
+        logger.info(
+            "UMAP → {}d (viz): n_neighbors={}, min_dist={}",
+            cfg.umap_n_components_2,
+            cfg.umap_n_neighbors,
+            cfg.umap_min_dist_viz,
+        )
+        reducer_viz = umap.UMAP(
+            n_components=cfg.umap_n_components_2,
+            n_neighbors=cfg.umap_n_neighbors,
+            min_dist=cfg.umap_min_dist_viz,
+            metric=cfg.umap_metric,
+            random_state=cfg.seed,
+        )
+        coords = reducer_viz.fit_transform(matrix)  # 2d viz projection matrix
+        logger.info("UMAP 2d done in {:.1f}s", time.monotonic() - t1)
+    else:
+        logger.info("UMAP 2d viz projection skipped (no consumer; enable with --viz)")
 
     t2 = time.monotonic()
     logger.info(
