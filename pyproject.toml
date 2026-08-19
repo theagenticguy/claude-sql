@@ -68,6 +68,9 @@ onnx = [
 llm-analytics = [
     "strands-agents[openai]>=1.46,<2",
 ]
+watch = [
+    "watchfiles>=1.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.12"]
