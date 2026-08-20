@@ -1,3 +1,17 @@
+## v2.1.0 (2026-08-20)
+
+### Feat
+
+- near-real-time snapshot refresh + watch daemon (#175)
+
+### Fix
+
+- **settings**: corpus-scope the analytics caches under corpora/<corpus_key>/ (#168)
+
+### Refactor
+
+- **cleanup**: drop dead ANALYTICS_VIEW_NAMES + fix stale core-package comments (#164)
+
 ## v2.0.0 (2026-07-20)
 
 ### BREAKING CHANGE
