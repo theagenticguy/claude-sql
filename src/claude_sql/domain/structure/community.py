@@ -75,8 +75,12 @@ def _build_mutual_knn(
     # Take upper triangle to avoid duplicates.
     iu, ju = np.triu_indices(n, k=1)
     keep = weighted[iu, ju] > 0.0
-    edges = list(zip(iu[keep].tolist(), ju[keep].tolist(), strict=True))
-    weights = weighted[iu, ju][keep].tolist()
+    # ``ndarray.tolist()`` is typed Any; coerce elementwise so the declared
+    # return type is actually established rather than asserted.
+    edges: list[tuple[int, int]] = [
+        (int(i), int(j)) for i, j in zip(iu[keep].tolist(), ju[keep].tolist(), strict=True)
+    ]
+    weights: list[float] = [float(w) for w in weighted[iu, ju][keep].tolist()]
     return edges, weights
 
 

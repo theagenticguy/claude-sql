@@ -100,7 +100,7 @@ class WritingWatcher:
     def changed_batches(self) -> Iterator[frozenset[str]]:
         path = _write_new_session(self._root)
         yield frozenset({path})
-        yield frozenset()
+        yield frozenset[str]()
 
 
 def test_watch_streams_a_flush_then_a_summary(
@@ -176,7 +176,7 @@ def test_watch_exits_zero_on_keyboard_interrupt(
     class InterruptingWatcher:
         def changed_batches(self) -> Iterator[frozenset[str]]:
             raise KeyboardInterrupt
-            yield frozenset()  # pragma: no cover - unreachable, satisfies the generator shape
+            yield frozenset[str]()  # pragma: no cover - unreachable, satisfies the generator shape
 
     monkeypatch.setattr(
         cli,

@@ -71,7 +71,9 @@ class OllamaEmbedder:
             timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json()["embeddings"]
+        # Untyped-JSON boundary: name the shape once here rather than returning Any.
+        vectors: list[list[float]] = resp.json()["embeddings"]
+        return vectors
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Batch corpus embedding in one ``/api/embed`` call (``input`` accepts

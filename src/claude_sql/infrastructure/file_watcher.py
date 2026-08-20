@@ -100,7 +100,7 @@ class PollingWatcher:
                 # The first scan establishes the baseline. Yielding it as a
                 # change set would flush the entire corpus on startup.
                 self._previous = current
-                yield frozenset()
+                yield frozenset[str]()
             else:
                 delta = diff_source_mtimes(self._previous, current)
                 self._previous = current
