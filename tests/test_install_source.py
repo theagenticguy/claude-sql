@@ -75,6 +75,58 @@ requirements = [{ name = "claude-sql", git = "https://example/x.git" }]
     }
 
 
+def test_read_install_source_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Verbatim receipt from a real `uv tool install claude-sql==2.1.0`
+    # (probed 2026-08-20): a registry install carries a `specifier` and NONE of
+    # directory / url / git, so the source kind has to be inferred from absence.
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path))
+    _write_receipt(
+        tmp_path,
+        """
+[tool]
+requirements = [{ name = "claude-sql", specifier = "==2.1.0" }]
+entrypoints = [
+    { name = "claude-sql", install-path = "/home/u/.local/bin/claude-sql", from = "claude-sql" },
+]
+""",
+    )
+    info = read_install_source("claude-sql")
+    assert info == {
+        "source_kind": "registry",
+        "source": "claude-sql==2.1.0",
+        "install_path": "/home/u/.local/bin/claude-sql",
+    }
+
+
+def test_read_install_source_registry_without_specifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `uv tool install claude-sql` pins no version, so the entry is name-only.
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path))
+    _write_receipt(tmp_path, '[tool]\nrequirements = [{ name = "claude-sql" }]\n')
+    assert read_install_source("claude-sql") == {
+        "source_kind": "registry",
+        "source": "claude-sql",
+    }
+
+
+def test_format_version_names_a_registry_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The regression this locks: the published wheel is the most common install
+    # of all, and reporting it as the unknown-source placeholder `source: ?`
+    # makes `--version` useless for the users most likely to run it.
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path))
+    _write_receipt(
+        tmp_path,
+        '[tool]\nrequirements = [{ name = "claude-sql", specifier = "==2.1.0" }]\n',
+    )
+    out = format_version()
+    assert "installed from registry: claude-sql==2.1.0" in out
+    assert "source: ?" not in out
+    assert "project venv" not in out
+
+
 def test_read_install_source_malformed_toml(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

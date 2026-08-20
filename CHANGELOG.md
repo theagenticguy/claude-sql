@@ -1,3 +1,10 @@
+## v2.1.1 (2026-08-20)
+
+### Fix
+
+- **version**: name a registry install instead of reporting `source: ?`
+- **cluster**: report a cluster count on the cache-hit path, not a row count (#178)
+
 ## v2.1.0 (2026-08-20)
 
 ### Feat
