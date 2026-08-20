@@ -12,7 +12,10 @@ sidecar files — queryable in place. Four analytics layers stack on top of thos
 JSONLs:
 
 1. **SQL** — DuckDB reads the JSONLs with zero copy; views + macros normalize
-   messages, tool calls, todos, subagents, costs.
+   messages, tool calls, todos, subagents, costs. Because the raw readers are TEMP
+   TABLEs, a connection is a *snapshot*: `claude-sql watch` holds one and advances it
+   incrementally as transcripts land (`refresh_raw`), and `snapshot_as_of` reports what
+   instant it covers.
 2. **Semantic search** — an embedding provider (Cohere Embed v4 on Bedrock by
    default) embeds every message; a LanceDB `IVF_HNSW_SQ` cosine index, read
    back through DuckDB's `lance` extension, serves top-k in milliseconds. The
@@ -212,6 +215,14 @@ community IDs are stable across reruns. The Leiden seed flows into both
 resolution-profile bisection, so same-seed reruns produce byte-equal parquets.
 Don't reach for different seeds without a reason.
 
+**The 2-D UMAP viz projection is opt-in and defaults OFF**
+(`CLAUDE_SQL_UMAP_COMPUTE_VIZ` / `claude-sql cluster --viz`). No code path in claude-sql,
+tower-bonk, or the console reads the `x` / `y` columns it fills — only ad-hoc SQL can —
+and it was 66% of the clustering stage's wall clock (measured 807 s of 1,247 s over
+128,453 embeddings; the 50-D fit HDBSCAN actually needs was 414 s). With it off the
+columns stay in `clusters.parquet` and `VIEW_SCHEMA` holding NULLs, because dropping them
+would break every `message_clusters` bind and 0.0 would assert a position at the origin.
+
 The clustering/community/terms internals — Leiden+CPM over the mutual-kNN graph,
 the auto-γ resolution profile, the CountVectorizer + in-house c-TF-IDF math, and
 the per-classifier (trajectory / conflicts / friction) pipeline schemas — are
@@ -287,10 +298,39 @@ Re-cited to the current module paths — verify before editing.
   time (DuckDB rejects `%` as a unit). `temp_directory` is `~/.claude/duckdb_tmp`
   instead of `/tmp` — Amazon devboxes ship `/tmp` as a 4 GB tmpfs and a
   clustering spill there thrashes the host.
-- **Cluster mtime sidecar** (`domain/structure/cluster.py`,
-  `application/use_cases/cluster.py`): skip the ~40 s UMAP+HDBSCAN refit when the
-  embeddings haven't moved, comparing the latest part-file mtime against the
-  sidecar. `force=True` always rebuilds.
+- **Source-mtime sidecars are the ONLY staleness gate** (`infrastructure/freshness.py`,
+  consumed by `application/use_cases/{cluster,terms,community}.py`). Each of the three
+  expensive derived stages stamps the newest `mtime_ns` of its single input and skips
+  itself only when that value matches exactly. `force=True` always rebuilds.
+  **Never gate a derived stage on "its output exists"** — that inverts the pipeline.
+  `terms` and `community` did exactly that and were pinned at 2026-07-27 on the live
+  corpus while `cluster` (correctly keyed on the embeddings mtime) re-fit every couple of
+  hours, so c-TF-IDF labels described a `cluster_id` partition that no longer existed —
+  HDBSCAN re-mints those ids on every fit. Note which input each stage keys on, because
+  they differ: `cluster` and `community` both key on the **Lance embeddings store**
+  (communities are Leiden+CPM over session centroids and never read `clusters.parquet`),
+  `terms` keys on **`clusters.parquet`**. The sidecar filename carries the input name so
+  one stage cannot read another's stamp.
+- **A connection is a SNAPSHOT, and it can now say so** (`infrastructure/duckdb_views.py`).
+  `register_raw` records a per-file mtime watermark in two TEMP TABLEs
+  (`v_raw_source_files`, `v_raw_snapshot`) alongside the raw readers.
+  `snapshot_as_of(con)` reports what instant the snapshot covers — the authoritative
+  accessor an in-process consumer needs to distinguish "genuinely absent" from "newer
+  than my snapshot". `refresh_raw(con)` advances it by re-reading only the source files
+  whose mtime moved: measured **6.2 s** for a full `register_raw` versus **0.22 s** for a
+  one-file refresh over 9,082 files. It degrades to a full rebuild — and reports
+  `rebuilt` / `rebuild_reason` rather than hiding it — when there is no prior snapshot,
+  the corpus is remote (`s3://`, no observable mtimes), or more than
+  `_MAX_INCREMENTAL_FILES` moved.
+- **Never `executemany` a per-file watermark** (`_write_watermark_rows`). DuckDB's Python
+  `executemany` runs one prepared execution per row: **15.0 s** for the live corpus's
+  9,082 rows, which is 40× the rest of a refresh and was also being paid on every
+  `register_raw`. Bulk-insert through a registered polars frame instead.
+- **`refresh_raw` and `register_raw` share ONE projection** (`_raw_events_select` /
+  `_raw_subagents_select`). `refresh_raw` issues `INSERT INTO <table> SELECT …`, which is
+  positional — two projections that drifted by a column would land values in the wrong
+  columns instead of erroring. `tests/test_refresh_raw.py` pins both the `DESCRIBE`
+  layout and a computed column's value after a refresh.
 
 ## Environment variables
 
@@ -300,10 +340,15 @@ README has the full table. Common overrides: `CLAUDE_SQL_DEFAULT_GLOB`,
 `CLAUDE_SQL_FRICTION_MAX_CHARS` (default 300), `CLAUDE_SQL_EMBED_CONCURRENCY`
 (default 8), `CLAUDE_SQL_LLM_CONCURRENCY` (default 2),
 `CLAUDE_SQL_DUCKDB_THREADS`, `CLAUDE_SQL_DUCKDB_MEMORY_LIMIT` (`'70%'` default),
-`CLAUDE_SQL_DUCKDB_TEMP_DIR`, `CLAUDE_SQL_LANCE_URI`.
+`CLAUDE_SQL_DUCKDB_TEMP_DIR`, `CLAUDE_SQL_LANCE_URI`, `CLAUDE_SQL_UMAP_COMPUTE_VIZ`
+(default `false` — the 2-D viz projection is opt-in; see below).
 
 ## How to run it
 
+- **Optional extras**: `ollama` / `onnx` (alternative embedding providers),
+  `llm-analytics` (Strands), and `watch` (`watchfiles`, for OS-event change detection in
+  `claude-sql watch` — without it the watcher polls an mtime scan every `--poll-seconds`,
+  which costs ~90 ms per tick over 6.7k files).
 - **As a uv tool** (preferred end-user path): `mise run tool:install` →
   `claude-sql --version`. Reinstall after pulling with `mise run tool:upgrade`.
   Remove with `mise run tool:uninstall`.

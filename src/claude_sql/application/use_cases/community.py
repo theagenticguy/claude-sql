@@ -67,6 +67,12 @@ from claude_sql.domain.structure.community import (
     _run_leiden_cpm,
     _warn_disconnected,
 )
+from claude_sql.infrastructure.freshness import (
+    is_output_fresh,
+    newest_mtime_ns,
+    sidecar_for,
+    stamp_output,
+)
 from claude_sql.infrastructure.settings import Settings
 
 
@@ -262,8 +268,15 @@ def run_communities(
     out_path = settings.communities_parquet_path
     profile_path = settings.community_profile_parquet_path
 
-    if out_path.exists() and out_path.stat().st_size > 16 and not force:
-        logger.info("Communities parquet exists at {}; pass force=True to rebuild", out_path)
+    # Freshness keys on the EMBEDDINGS store, not on this output's existence and
+    # not on clusters.parquet: communities are Leiden+CPM over session centroids
+    # built straight from ``message_embeddings`` (see ``_load_session_centroids``),
+    # so the clustering is not an input at all. An existence gate pinned this
+    # output for weeks while its real input advanced hourly.
+    sidecar = sidecar_for(out_path, input_name="embeddings")
+    embeddings_mtime_ns = newest_mtime_ns(settings.lance_uri)
+    if not force and is_output_fresh(out_path, sidecar=sidecar, input_mtime_ns=embeddings_mtime_ns):
+        logger.info("Embeddings unchanged since last community run; reusing {}.", out_path)
         df = pl.read_parquet(out_path)
         real = df.filter(pl.col("community_id") != NOISE_COMMUNITY_ID)
         noise_n = df.height - real.height
@@ -383,6 +396,7 @@ def run_communities(
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path)
+    stamp_output(sidecar, embeddings_mtime_ns)
     logger.info(
         "Leiden+CPM: {} kept >= {} sessions, {} singletons -> noise. Wrote {} rows to {}",
         n_real,

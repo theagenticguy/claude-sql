@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, override
+from typing import TYPE_CHECKING, Annotated, Any, Literal, override
 
 import duckdb
 import polars as pl
@@ -74,6 +74,7 @@ from claude_sql.infrastructure.duckdb_views import (
     register_all,
     register_raw,
     register_views,
+    snapshot_as_of,
 )
 from claude_sql.infrastructure.home import (
     claude_sql_home,
@@ -109,6 +110,12 @@ from claude_sql.interfaces.cli.output import (
     validate_glob,
 )
 
+if TYPE_CHECKING:
+    # ``watch``'s per-flush callback is typed against this; the use-case module
+    # itself stays a deferred import inside the command body (the watch loop
+    # pulls the embed subtree).
+    from claude_sql.application.use_cases.watch import FlushReport
+
 _APP_HELP = """\
 Zero-copy SQL + Cohere Embed v4 semantic search + Sonnet 4.6 analytics over
 ~/.claude/ JSONL transcripts (and their subagent sidecars).
@@ -117,6 +124,7 @@ Surfaces at a glance
 --------------------
   schema / list-cache / explain   introspection (read-only, zero cost)
   query / shell                   run SQL against 18 views + 14 macros
+  watch                           daemon: keep the snapshot near-live (free)
   embed / search                  Cohere Embed v4 + HNSW cosine search
   classify / trajectory /         Sonnet 4.6 analytics -- each defaults to
   conflicts / friction            --dry-run; pass --no-dry-run to spend
@@ -1808,8 +1816,8 @@ def ingest(
 
 
 @app.command
-def cluster(*, force: bool = False, common: Common | None = None) -> None:
-    """Cluster message embeddings with UMAP (8D) + HDBSCAN. Writes clusters.parquet.
+def cluster(*, force: bool = False, viz: bool = False, common: Common | None = None) -> None:
+    """Cluster message embeddings with UMAP (50D) + HDBSCAN. Writes clusters.parquet.
 
     Prereq
     ------
@@ -1817,19 +1825,33 @@ def cluster(*, force: bool = False, common: Common | None = None) -> None:
 
     Output columns (``message_clusters`` view)
     ------------------------------------------
-    uuid, cluster_id (int; -1 = noise), probability (HDBSCAN soft label).
+    uuid, cluster_id (int; -1 = noise), x, y (2-D viz projection; NULL unless
+    ``--viz``), is_noise (bool). There is no ``probability`` column — HDBSCAN
+    runs with ``prediction_data=False``.
 
-    Cost: zero (CPU-only, no Bedrock). Seeded by ``CLAUDE_SQL_SEED=42`` so
-    cluster IDs are stable across reruns unless the embedding set changes.
+    Cost: zero dollars (CPU-only, no Bedrock), but not zero time. Measured on
+    128,453 embeddings: UMAP 50-D 414 s + HDBSCAN 19 s, plus 807 s for the
+    optional 2-D viz fit. Skipped entirely when the embeddings have not moved
+    since the last run (mtime sidecar).
+
+    Seeded by ``CLAUDE_SQL_SEED=42``, so a rerun over the SAME embedding set
+    reproduces cluster IDs byte-for-byte. Note the converse: HDBSCAN re-mints
+    cluster IDs whenever the embedding set changes, which is why ``terms``
+    recomputes off this parquet's mtime rather than its own existence.
 
     Flags
     -----
-    --force   Re-cluster even if clusters.parquet already exists.
+    --force   Re-cluster even if the embeddings have not moved.
+    --viz     Also fit the 2-D UMAP projection into ``x`` / ``y``. Off by
+              default: nothing in claude-sql or the console reads those columns
+              (ad-hoc SQL can), and the fit is ~66% of the stage's wall clock.
     """
     from claude_sql.application.use_cases.cluster import run_clustering
 
     _configure(common)
     settings = _resolve_settings(common)
+    if viz:
+        settings = settings.model_copy(update={"umap_compute_viz": True})
     stats = run_clustering(settings, force=force)
     logger.info(
         "cluster: {} messages, {} clusters, {} noise ({:.1%})",
@@ -2115,12 +2137,148 @@ def analyze(
     )
 
 
+@app.command
+def watch(
+    *,
+    quiet_period: float = 5.0,
+    max_wait: float = 60.0,
+    poll_seconds: float = 2.0,
+    force_polling: bool = False,
+    embed_limit: int = 0,
+    max_flushes: int = 0,
+    embedding_provider: str | None = None,
+    common: Common | None = None,
+) -> None:
+    """Hold a warm connection and keep its snapshot fresh as transcripts land.
+
+    Why this exists
+    ---------------
+    The raw readers materialize as DuckDB TEMP TABLEs, so freshness is a
+    property of a PROCESS, not of the corpus: a long-lived reader answers from
+    the instant it registered. ``watch`` holds one connection and advances it
+    incrementally — re-reading only the transcript files whose mtime moved — so
+    a consumer attached to that snapshot is seconds behind instead of hours.
+
+    Incrementality only pays inside a resident process. A fresh invocation of
+    any command pays the full registration (measured 6.4 s over 11,669 files),
+    and no flag here changes that, so there is deliberately no one-shot mode:
+    a cron that starts a new process gains nothing from an incremental refresh
+    because it has no prior snapshot to advance.
+
+    Change detection
+    ----------------
+    Filesystem events (``watchfiles``, from the ``watch`` extra) when available,
+    otherwise an mtime poll. Events are coalesced per source file and a file is
+    refreshed once it has been quiet for ``--quiet-period`` seconds — the
+    "turn finished writing" signal. ``--max-wait`` bounds how long a
+    continuously-appended transcript can go unrefreshed, so an active session
+    still lands on a fixed cadence instead of never.
+
+    The event stream decides WHEN to refresh, never WHAT: each flush rescans the
+    watermark and re-reads whatever actually moved, so a dropped OS event
+    self-heals on the next flush instead of stranding a session forever.
+
+    Cost
+    ----
+    The refresh is free (local reads). Embedding is NOT, so ``--embed-limit``
+    defaults to ``0`` — no provider calls at all. Pass a positive value to embed
+    up to that many new messages per flush; the cap is per flush, deliberately,
+    so a backlog cannot turn into one unbounded charge.
+
+    Flags
+    -----
+    --quiet-period S    Seconds of silence before a file is refreshed (5.0).
+    --max-wait S        Starvation bound for a continuously-written file (60.0).
+                        ``0`` disables it, leaving the pure idle rule.
+    --poll-seconds S    Poll interval / heartbeat cadence (2.0).
+    --force-polling     Skip OS events. Use on network mounts where inotify is
+                        accepted and then never fires.
+    --embed-limit N     Embed up to N new messages per flush. ``0`` = no spend.
+    --max-flushes N     Exit after N flushes. ``0`` = run until interrupted.
+                        ``--max-flushes 1`` blocks until the next change settles,
+                        applies it, and exits.
+    --embedding-provider {cohere-bedrock,ollama,onnx-bge}
+                        Only meaningful with ``--embed-limit``.
+
+    Output
+    ------
+    One JSON object per flush on stdout (NDJSON), then a final summary object::
+
+        {"flush_index": 1, "files_touched_count": 2, "rows_inserted_count": 37,
+         "rows_deleted_count": 12, "embedded_count": 0, "rebuilt": false,
+         "covers_through": "2026-08-19T21:17:10.412000+00:00", ...}
+
+    Exit codes: 0 success (including a clean Ctrl-C), 70 runtime.
+    """
+    from claude_sql.application.use_cases.watch import WatchConfig, run_watch
+    from claude_sql.infrastructure.file_watcher import build_file_watcher
+
+    _configure(common)
+    settings = _apply_embedding_provider(_resolve_settings(common), embedding_provider)
+    fmt = _fmt(common)
+    patterns = [settings.default_glob, settings.subagent_glob]
+
+    config = WatchConfig(
+        quiet_period_seconds=quiet_period,
+        max_wait_seconds=max_wait,
+        embed_limit=embed_limit,
+        max_flushes=max_flushes,
+    )
+    watcher = build_file_watcher(
+        patterns,
+        poll_seconds=poll_seconds,
+        force_polling=force_polling,
+    )
+
+    con = duckdb.connect(":memory:")
+    try:
+        if settings_need_s3(settings):
+            configure_s3(con, settings)
+        register_raw(
+            con,
+            glob=settings.default_glob,
+            subagent_glob=settings.subagent_glob,
+            subagent_meta_glob=settings.subagent_meta_glob,
+        )
+        register_views(con)
+        snapshot = snapshot_as_of(con)
+        if snapshot is not None:
+            logger.info(
+                "watching from a snapshot covering through {} ({} files)",
+                snapshot.covers_through,
+                snapshot.files_scanned_count,
+            )
+
+        def _stream(report: FlushReport) -> None:
+            """Emit each flush as it happens so the daemon is observable live."""
+            if resolve_format(fmt) is not OutputFormat.TABLE:
+                sys.stdout.write(json.dumps(report.to_payload(), default=str))
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+        try:
+            totals = run_watch(
+                con=con,
+                settings=settings,
+                watcher=watcher,
+                config=config,
+                on_flush=_stream,
+            )
+        except KeyboardInterrupt:
+            # Ctrl-C on a daemon is the documented way to stop it, not a fault.
+            logger.info("watch: interrupted, shutting down")
+            return
+        emit_json(totals.to_payload(), fmt)
+    finally:
+        con.close()
+
+
 @app.default
 def _default(*, common: Common | None = None) -> None:
     """Print a hint when ``claude-sql`` is invoked without a subcommand."""
     del common
     print("claude-sql - pass a subcommand or --help")
-    print("  schema | query | explain | shell | list-cache | peek")
+    print("  schema | query | explain | shell | list-cache | peek | watch")
     print("  ingest | embed | search")
     print("  classify | trajectory | conflicts | friction | cluster | terms | community | analyze")
 

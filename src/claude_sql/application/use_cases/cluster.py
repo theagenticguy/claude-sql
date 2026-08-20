@@ -29,6 +29,12 @@ import polars as pl
 from loguru import logger
 
 from claude_sql.domain.structure.cluster import cluster_embeddings
+from claude_sql.infrastructure.freshness import (
+    is_output_fresh,
+    newest_mtime_ns,
+    sidecar_for,
+    stamp_output,
+)
 from claude_sql.infrastructure.settings import Settings
 
 if TYPE_CHECKING:
@@ -98,28 +104,14 @@ def run_clustering(
             f"LanceDB embeddings missing at {in_path}. Run `claude-sql embed` first."
         )
 
-    # Mtime-sidecar fast path: if the Lance dataset hasn't moved since the
-    # last successful clustering, skip the ~40 s UMAP+HDBSCAN refit. The
-    # sidecar lives next to the output parquet and stores the dataset
-    # directory's nanosecond mtime; hand-edits to clusters.parquet alone
-    # won't bust the cache (use ``force=True`` for that).
-    sidecar = out_path.with_suffix(out_path.suffix + ".embeddings_mtime")
-    # Walk the Lance directory tree once and take the max mtime — Lance
-    # writes new fragments to disk, so the deepest mtime tracks the data.
-    import contextlib
-
-    candidate_mtimes = [in_path.stat().st_mtime_ns]
-    for child in in_path.rglob("*"):
-        with contextlib.suppress(OSError):
-            candidate_mtimes.append(child.stat().st_mtime_ns)
-    in_mtime_ns = max(candidate_mtimes)
-    if (
-        not force
-        and out_path.exists()
-        and out_path.stat().st_size > 16
-        and sidecar.exists()
-        and sidecar.read_text().strip() == str(in_mtime_ns)
-    ):
+    # Mtime-sidecar fast path: if the Lance dataset hasn't moved since the last
+    # successful clustering, skip the UMAP+HDBSCAN refit (measured 1,247 s on
+    # 128,453 embeddings with the viz projection on, 440 s without). Shares one
+    # implementation with ``terms`` and ``community`` via ``infrastructure.freshness``
+    # so the three stages cannot drift into different notions of "stale".
+    sidecar = sidecar_for(out_path, input_name="embeddings")
+    in_mtime_ns = newest_mtime_ns(in_path)
+    if not force and is_output_fresh(out_path, sidecar=sidecar, input_mtime_ns=in_mtime_ns):
         logger.info("Embeddings unchanged since last cluster run; reusing {}.", out_path)
         df = pl.read_parquet(out_path)
         return {
@@ -137,7 +129,7 @@ def run_clustering(
             "Clusters parquet at {} predates sidecar; reusing and stamping mtime.",
             out_path,
         )
-        sidecar.write_text(str(in_mtime_ns))
+        stamp_output(sidecar, in_mtime_ns)
         df = pl.read_parquet(out_path)
         return {
             "total": len(df),
@@ -164,12 +156,19 @@ def run_clustering(
     # them back into the typed columns the schema already pins (mirrors the
     # read-side boxing fix in #68, now on the write side). ``coords`` columns
     # are sliced views, so copy to contiguous float32 before handing them over.
+    #
+    # ``x`` / ``y`` stay in the schema when the viz projection is off, holding
+    # NULLs. The ``message_clusters`` view and its ``VIEW_SCHEMA`` entry name
+    # those columns, so dropping them would break every bind; NULL says "not
+    # computed" where 0.0 would assert a position at the origin.
+    viz_x = np.ascontiguousarray(coords[:, 0], dtype=np.float32) if coords is not None else None
+    viz_y = np.ascontiguousarray(coords[:, 1], dtype=np.float32) if coords is not None else None
     df = pl.DataFrame(
         {
             "uuid": uuids,
             "cluster_id": labels.astype(np.int32),
-            "x": np.ascontiguousarray(coords[:, 0], dtype=np.float32),
-            "y": np.ascontiguousarray(coords[:, 1], dtype=np.float32),
+            "x": viz_x if viz_x is not None else [None] * len(uuids),
+            "y": viz_y if viz_y is not None else [None] * len(uuids),
             "is_noise": labels < 0,
         },
         schema={
@@ -182,7 +181,7 @@ def run_clustering(
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path)
-    sidecar.write_text(str(in_mtime_ns))
+    stamp_output(sidecar, in_mtime_ns)
     logger.info(
         "Wrote {} rows to {} (total elapsed: {:.1f}s)",
         len(df),

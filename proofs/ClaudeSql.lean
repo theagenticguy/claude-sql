@@ -8,5 +8,6 @@
 
 import ClaudeSql.Basic
 import ClaudeSql.Backoff
+import ClaudeSql.Debounce
 import ClaudeSql.Hamming
 import ClaudeSql.TurnSort

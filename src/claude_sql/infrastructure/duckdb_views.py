@@ -34,15 +34,28 @@ Design notes
   field referenced by any downstream view or macro must appear in the dict
   or it silently disappears. ``union_by_name=true`` stays enabled to NULL-
   fill the listed fields across files with per-file drift.
+* Because the raw readers are TEMP TABLEs, a connection is a SNAPSHOT.
+  :func:`register_raw` records a per-file mtime watermark alongside them;
+  :func:`refresh_raw` advances the snapshot by re-reading only the files that
+  moved, and :func:`snapshot_as_of` reports what instant the snapshot covers so
+  an embedding consumer can distinguish "absent" from "newer than my snapshot".
 """
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 from loguru import logger
 
+from claude_sql.domain.watch import (
+    RawRefreshStats,
+    RawSnapshot,
+    diff_source_mtimes,
+)
 from claude_sql.infrastructure.duckdb_s3 import configure_s3, settings_need_s3
 from claude_sql.infrastructure.parquet_cache import iter_part_files
 from claude_sql.infrastructure.settings import (
@@ -52,6 +65,37 @@ from claude_sql.infrastructure.settings import (
     _default_subagent_glob,
     _default_subagent_meta_glob,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+# ---------------------------------------------------------------------------
+# Raw-reader object names + snapshot watermark constants
+# ---------------------------------------------------------------------------
+#: The two materialized raw readers. Named constants because ``refresh_raw``
+#: has to interpolate them into DELETE / INSERT statements, and a literal typo
+#: there would create a second table instead of failing.
+_RAW_EVENTS_TABLE: str = "v_raw_events"
+_RAW_SUBAGENTS_TABLE: str = "v_raw_subagents"
+#: Per-file mtime watermark backing ``refresh_raw``'s delta, and the one-row
+#: coverage report backing ``snapshot_as_of``. Both carry the ``v_raw_`` prefix
+#: and are deliberately absent from :data:`VIEW_NAMES`: they describe the raw
+#: readers rather than being business views, so ``claude-sql schema`` should not
+#: advertise them as queryable surface.
+_SOURCE_FILES_TABLE: str = "v_raw_source_files"
+_SNAPSHOT_TABLE: str = "v_raw_snapshot"
+#: Transient name the watermark bulk-insert registers its frame under.
+_WATERMARK_FRAME: str = "_claude_sql_watermark_frame"
+#: Watermark row discriminator. Values are code-side constants, never user input.
+_KIND_EVENT: str = "event"
+_KIND_SUBAGENT: str = "subagent"
+#: Above this many moved files, ``refresh_raw`` rebuilds wholesale instead of
+#: embedding a vast ``IN`` list and re-reading most of the corpus anyway. Sized
+#: well above a busy hour (measured: 15 transcript files touched per hour across
+#: both live corpora) and well below the corpus (14,142 files).
+_MAX_INCREMENTAL_FILES: int = 2_000
+#: Anchor for epoch-nanosecond → datetime conversion.
+_EPOCH_UTC: datetime = datetime(1970, 1, 1, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # Glob constants
@@ -468,6 +512,78 @@ def _render_columns_clause(columns: dict[str, str]) -> str:
     return ", ".join(f"{name}: {_sql_str(typ)}" for name, typ in columns.items())
 
 
+def _sql_str_list(values: Sequence[str]) -> str:
+    """Render a SQL list literal — ``['a', 'b']`` — for ``read_json``.
+
+    ``read_json`` accepts a list of paths anywhere it accepts a glob, which is
+    what lets :func:`refresh_raw` re-read exactly the files that moved. Values
+    are quote-escaped by :func:`_sql_str`; they originate from a filesystem
+    scan, so escaping is load-bearing here rather than defensive.
+    """
+    return "[" + ", ".join(_sql_str(value) for value in values) + "]"
+
+
+# The raw-reader projections, rendered from ONE source per table so
+# :func:`register_raw` (whole glob) and :func:`refresh_raw` (a path list) cannot
+# drift apart. Column ORDER matters and is the reason these are shared rather
+# than merely similar: ``refresh_raw`` issues ``INSERT INTO <table> SELECT ...``,
+# which is positional, so a projection that differed by one column between the
+# two paths would land values in the wrong columns instead of erroring.
+def _raw_events_select(source_sql: str) -> str:
+    """The ``v_raw_events`` projection over ``source_sql`` (a glob or path list)."""
+    return f"""
+            SELECT *,
+                   filename AS source_file,
+                   -- Two on-disk layouts produce a session id from the path:
+                   --   local : .../<session_id>.jsonl
+                   --   S3SessionStore : .../<session_id>/part-<epochMs>-<rand>.jsonl
+                   -- The part-file form keys the session on the parent
+                   -- directory; the flat form keys on the basename. Detect the
+                   -- part layout first so S3-mirrored corpora bind correctly.
+                   CASE
+                       WHEN regexp_full_match(filename, '.*/part-[^/]*\\.jsonl$')
+                       THEN regexp_extract(filename, '/([^/]+)/part-[^/]*\\.jsonl$', 1)
+                       ELSE regexp_extract(filename, '([^/]+)\\.jsonl$', 1)
+                   END AS session_id_file
+            FROM read_json(
+                {source_sql},
+                format='newline_delimited',
+                union_by_name=true,
+                filename=true,
+                ignore_errors=true,
+                columns={{{_render_columns_clause(_RAW_EVENT_COLUMNS)}}},
+                maximum_object_size={_MAX_OBJECT_SIZE}
+            )
+            """
+
+
+def _raw_subagents_select(source_sql: str) -> str:
+    """The ``v_raw_subagents`` projection over ``source_sql`` (a glob or path list)."""
+    return f"""
+            SELECT *,
+                   filename AS source_file,
+                   regexp_extract(
+                       filename,
+                       '/([0-9a-f-]{{36}})/subagents/agent-([a-f0-9]+)\\.jsonl$',
+                       1
+                   ) AS parent_session_id,
+                   regexp_extract(
+                       filename,
+                       '/([0-9a-f-]{{36}})/subagents/agent-([a-f0-9]+)\\.jsonl$',
+                       2
+                   ) AS agent_hex
+            FROM read_json(
+                {source_sql},
+                format='newline_delimited',
+                union_by_name=true,
+                filename=true,
+                ignore_errors=true,
+                columns={{{_render_columns_clause(_RAW_SUBAGENT_COLUMNS)}}},
+                maximum_object_size={_MAX_OBJECT_SIZE}
+            )
+            """
+
+
 def register_raw(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -513,36 +629,10 @@ def register_raw(
         subagent_meta_glob if subagent_meta_glob is not None else _default_subagent_meta_glob()
     )
 
-    raw_event_cols = _render_columns_clause(_RAW_EVENT_COLUMNS)
-    raw_subagent_cols = _render_columns_clause(_RAW_SUBAGENT_COLUMNS)
-
     try:
         con.execute(
-            f"""
-            CREATE OR REPLACE TEMP TABLE v_raw_events AS
-            SELECT *,
-                   filename AS source_file,
-                   -- Two on-disk layouts produce a session id from the path:
-                   --   local : .../<session_id>.jsonl
-                   --   S3SessionStore : .../<session_id>/part-<epochMs>-<rand>.jsonl
-                   -- The part-file form keys the session on the parent
-                   -- directory; the flat form keys on the basename. Detect the
-                   -- part layout first so S3-mirrored corpora bind correctly.
-                   CASE
-                       WHEN regexp_full_match(filename, '.*/part-[^/]*\\.jsonl$')
-                       THEN regexp_extract(filename, '/([^/]+)/part-[^/]*\\.jsonl$', 1)
-                       ELSE regexp_extract(filename, '([^/]+)\\.jsonl$', 1)
-                   END AS session_id_file
-            FROM read_json(
-                {_sql_str(glob)},
-                format='newline_delimited',
-                union_by_name=true,
-                filename=true,
-                ignore_errors=true,
-                columns={{{raw_event_cols}}},
-                maximum_object_size={_MAX_OBJECT_SIZE}
-            );
-            """
+            f"CREATE OR REPLACE TEMP TABLE {_RAW_EVENTS_TABLE} AS "
+            f"{_raw_events_select(_sql_str(glob))};"
         )
         logger.debug(
             "Registered v_raw_events (TEMP TABLE) from glob {} with explicit columns",
@@ -550,30 +640,8 @@ def register_raw(
         )
 
         con.execute(
-            f"""
-            CREATE OR REPLACE TEMP TABLE v_raw_subagents AS
-            SELECT *,
-                   filename AS source_file,
-                   regexp_extract(
-                       filename,
-                       '/([0-9a-f-]{{36}})/subagents/agent-([a-f0-9]+)\\.jsonl$',
-                       1
-                   ) AS parent_session_id,
-                   regexp_extract(
-                       filename,
-                       '/([0-9a-f-]{{36}})/subagents/agent-([a-f0-9]+)\\.jsonl$',
-                       2
-                   ) AS agent_hex
-            FROM read_json(
-                {_sql_str(subagent_glob)},
-                format='newline_delimited',
-                union_by_name=true,
-                filename=true,
-                ignore_errors=true,
-                columns={{{raw_subagent_cols}}},
-                maximum_object_size={_MAX_OBJECT_SIZE}
-            );
-            """
+            f"CREATE OR REPLACE TEMP TABLE {_RAW_SUBAGENTS_TABLE} AS "
+            f"{_raw_subagents_select(_sql_str(subagent_glob))};"
         )
         logger.debug("Registered v_raw_subagents (TEMP TABLE) from glob {}", subagent_glob)
 
@@ -609,6 +677,400 @@ def register_raw(
         # register-or-fail-loud — any DuckDB error must surface to the caller.
         logger.exception("Failed to register raw views")
         raise
+
+    # Stamp the watermark LAST, and only on the success path: a half-registered
+    # connection with a recorded watermark would let a later ``refresh_raw``
+    # believe it holds a snapshot it never built and skip files it never read.
+    _stamp_watermark(con, glob=glob, subagent_glob=subagent_glob)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot watermark — what instant the raw TEMP TABLEs cover
+# ---------------------------------------------------------------------------
+
+
+def _scan_raw_watermark(*, glob: str, subagent_glob: str) -> dict[str, dict[str, int]] | None:
+    """Scan both transcript globs into ``{kind: {path: mtime_ns}}``.
+
+    Returns ``None`` when the corpus is remote, which is "unobservable", never
+    "empty" — see :func:`claude_sql.infrastructure.source_files.scan_globs`.
+    """
+    from claude_sql.infrastructure.source_files import scan_globs
+
+    events = scan_globs([glob])
+    if events is None:
+        return None
+    subagents = scan_globs([subagent_glob])
+    if subagents is None:
+        return None
+    return {_KIND_EVENT: events, _KIND_SUBAGENT: subagents}
+
+
+def _epoch_ns_to_datetime(epoch_ns: int) -> datetime:
+    """Epoch nanoseconds → tz-aware UTC datetime, exact to microseconds.
+
+    Integer-divides to microseconds rather than dividing by 1e9: the float path
+    loses precision on modern epoch values, and ``datetime`` is
+    microsecond-resolution anyway, so nanosecond tail digits have nowhere to go.
+    """
+    return _EPOCH_UTC + timedelta(microseconds=epoch_ns // 1000)
+
+
+def _write_watermark_rows(
+    con: duckdb.DuckDBPyConnection,
+    rows: Sequence[tuple[str, int, str]],
+) -> None:
+    """Bulk-insert watermark rows into :data:`_SOURCE_FILES_TABLE`.
+
+    Goes through a registered polars frame, NOT ``executemany``. DuckDB's Python
+    ``executemany`` runs one prepared execution per row: measured 15.0 s for the
+    9,082 rows of the live interactive corpus, which is 40x the entire rest of a
+    refresh (0.16 s scan + 0.18 s re-read) and would also have been paid on every
+    ``register_raw``. The registered-frame path is a bulk scan and lands in
+    milliseconds.
+
+    Columns are named explicitly in the ``SELECT`` rather than ``SELECT *`` so a
+    future column addition to either side fails loudly instead of shifting values
+    into the wrong columns.
+    """
+    if not rows:
+        return
+    import polars as pl
+
+    frame = pl.DataFrame(
+        {
+            "source_file": [row[0] for row in rows],
+            "mtime_ns": [row[1] for row in rows],
+            "kind": [row[2] for row in rows],
+        },
+        schema={"source_file": pl.Utf8, "mtime_ns": pl.Int64, "kind": pl.Utf8},
+    )
+    con.register(_WATERMARK_FRAME, frame)
+    try:
+        con.execute(
+            f"INSERT INTO {_SOURCE_FILES_TABLE} (source_file, mtime_ns, kind) "
+            f"SELECT source_file, mtime_ns, kind FROM {_WATERMARK_FRAME}"
+        )
+    finally:
+        con.unregister(_WATERMARK_FRAME)
+
+
+def _create_watermark_tables(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the two watermark TEMP TABLEs, replacing any prior contents."""
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE {_SOURCE_FILES_TABLE} (
+            source_file VARCHAR NOT NULL,
+            mtime_ns    BIGINT  NOT NULL,
+            kind        VARCHAR NOT NULL
+        );
+        """
+    )
+    # Both instants are stored as epoch-nanosecond BIGINTs, not TIMESTAMPTZ.
+    # DuckDB cannot hand a TIMESTAMPTZ back to Python without ``pytz`` installed
+    # ("Required module 'pytz' failed to import"), and a tz-aware column would be
+    # a new runtime dependency for a two-field metadata row. BIGINT epoch
+    # nanoseconds round-trip exactly and :func:`snapshot_as_of` converts at the
+    # boundary, so the value objects still carry tz-aware datetimes.
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE {_SNAPSHOT_TABLE} (
+            registered_at_ns    BIGINT NOT NULL,
+            covers_through_ns   BIGINT,
+            files_scanned_count BIGINT,
+            refresh_count       BIGINT NOT NULL
+        );
+        """
+    )
+
+
+def _stamp_watermark(con: duckdb.DuckDBPyConnection, *, glob: str, subagent_glob: str) -> None:
+    """Record the post-:func:`register_raw` watermark for this connection.
+
+    Best-effort by design: a corpus whose watermark cannot be scanned (remote,
+    or a filesystem that refuses the sweep) still gets a snapshot row, with
+    ``covers_through`` / ``files_scanned_count`` NULL so the absence is visible
+    rather than guessed. :func:`refresh_raw` reads those NULLs as "no watermark
+    to diff against" and degrades to a full rebuild.
+    """
+    scan = _scan_raw_watermark(glob=glob, subagent_glob=subagent_glob)
+    _create_watermark_tables(con)
+    covers_through_ns: int | None = None
+    files_scanned_count: int | None = None
+    if scan is not None:
+        rows = [
+            (path, mtime_ns, kind)
+            for kind, entries in scan.items()
+            for path, mtime_ns in entries.items()
+        ]
+        _write_watermark_rows(con, rows)
+        covers_through_ns = max((mtime_ns for _, mtime_ns, _ in rows), default=None)
+        files_scanned_count = len(rows)
+    con.execute(
+        f"INSERT INTO {_SNAPSHOT_TABLE} "
+        "(registered_at_ns, covers_through_ns, files_scanned_count, refresh_count) "
+        "VALUES (?, ?, ?, 0)",
+        [time.time_ns(), covers_through_ns, files_scanned_count],
+    )
+    logger.debug(
+        "Stamped raw watermark: {} files, covers_through={}",
+        files_scanned_count,
+        None if covers_through_ns is None else _epoch_ns_to_datetime(covers_through_ns),
+    )
+
+
+def _load_watermark(con: duckdb.DuckDBPyConnection) -> dict[str, dict[str, int]]:
+    """Read the recorded ``{kind: {path: mtime_ns}}`` watermark off ``con``."""
+    rows = con.execute(f"SELECT kind, source_file, mtime_ns FROM {_SOURCE_FILES_TABLE}").fetchall()
+    watermark: dict[str, dict[str, int]] = {_KIND_EVENT: {}, _KIND_SUBAGENT: {}}
+    for kind, source_file, mtime_ns in rows:
+        watermark.setdefault(str(kind), {})[str(source_file)] = int(mtime_ns)
+    return watermark
+
+
+def _temp_object_present(con: duckdb.DuckDBPyConnection, name: str) -> bool:
+    """Probe whether a TEMP TABLE exists on ``con`` without binding it.
+
+    ``duckdb_tables()`` is a catalog function, so this is a cheap metadata read
+    — unlike a ``SELECT`` against the table, which would materialize it.
+    """
+    row = con.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?",
+        [name],
+    ).fetchone()
+    return row is not None and int(row[0]) > 0
+
+
+def snapshot_as_of(con: duckdb.DuckDBPyConnection) -> RawSnapshot | None:
+    """What instant ``con``'s raw snapshot covers, or ``None`` if never built.
+
+    This is the authoritative freshness accessor for an in-process consumer.
+    ``v_raw_events`` is a TEMP TABLE, so every read on a long-lived connection
+    is an answer about a past instant; a consumer that needs to distinguish
+    "there is genuinely no such session" from "my snapshot predates it" must
+    ask the producer rather than substitute its own clock.
+
+    Returns
+    -------
+    RawSnapshot | None
+        ``None`` when this connection has never run :func:`register_raw` (so
+        there is no snapshot to describe). Otherwise the recorded coverage,
+        whose ``covers_through`` may itself be ``None`` for a remote corpus.
+    """
+    if not _temp_object_present(con, _SNAPSHOT_TABLE):
+        return None
+    row = con.execute(
+        f"SELECT registered_at_ns, covers_through_ns, files_scanned_count, refresh_count "
+        f"FROM {_SNAPSHOT_TABLE}"
+    ).fetchone()
+    if row is None:
+        return None
+    registered_at_ns, covers_through_ns, files_scanned_count, refresh_count = row
+    return RawSnapshot(
+        registered_at=_epoch_ns_to_datetime(int(registered_at_ns)),
+        covers_through=(
+            None if covers_through_ns is None else _epoch_ns_to_datetime(int(covers_through_ns))
+        ),
+        files_scanned_count=None if files_scanned_count is None else int(files_scanned_count),
+        refresh_count=int(refresh_count),
+    )
+
+
+def _delete_rows_for(con: duckdb.DuckDBPyConnection, table: str, paths: Sequence[str]) -> int:
+    """Delete every raw row sourced from ``paths``; return the deleted count."""
+    if not paths:
+        return 0
+    row = con.execute(f"DELETE FROM {table} WHERE source_file IN {_sql_str_list(paths)}").fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+def _insert_rows_from(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    paths: Sequence[str],
+    select_for: Callable[[str], str],
+) -> int:
+    """Re-read ``paths`` into ``table``; return the inserted count."""
+    if not paths:
+        return 0
+    row = con.execute(f"INSERT INTO {table} {select_for(_sql_str_list(paths))}").fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+def refresh_raw(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    glob: str | None = None,
+    subagent_glob: str | None = None,
+    subagent_meta_glob: str | None = None,
+    max_incremental_files: int = _MAX_INCREMENTAL_FILES,
+) -> RawRefreshStats:
+    """Advance ``con``'s raw snapshot by re-reading only the files that moved.
+
+    The raw readers are TEMP TABLEs, so a process holding a connection serves a
+    frozen corpus until something rebuilds them. Rebuilding via
+    :func:`register_raw` re-reads every transcript; this re-reads only the source
+    files whose ``mtime_ns`` advanced since the recorded watermark. Measured on
+    the live interactive corpus (9,082 files): **6.2 s** for a full
+    ``register_raw`` versus **0.22 s** for a one-file refresh, of which 0.16 s is
+    the watermark rescan that runs whether or not anything moved.
+
+    Only the RAW tier moves. The analytics views bind frozen parquet path lists
+    and the VSS view binds a Lance namespace — those need
+    :func:`claude_sql.infrastructure.duckdb_connection.refresh_analytics_views`
+    and ``rebind_vss`` respectively, which are separate on purpose because a
+    transcript append does not invalidate either.
+
+    Degrades to a full :func:`register_raw` — and says so in
+    ``RawRefreshStats.rebuilt`` / ``rebuild_reason`` — when an incremental
+    refresh would be wrong or pointless:
+
+    * the connection has no snapshot yet (nothing to advance);
+    * the watermark is unobservable (remote ``s3://`` corpus);
+    * more than ``max_incremental_files`` files moved, where re-reading the
+      corpus wholesale is cheaper than a vast ``IN`` list.
+
+    Parameters
+    ----------
+    con
+        A connection that has already run :func:`register_raw`.
+    glob, subagent_glob, subagent_meta_glob
+        Same defaults as :func:`register_raw`; pass the same values the
+        connection was registered with.
+    max_incremental_files
+        Upper bound on the incremental path. Crossing it logs at INFO and
+        rebuilds — a silent cap would report a fast refresh while doing a slow
+        one.
+
+    Returns
+    -------
+    RawRefreshStats
+        What moved, and whether the refresh was incremental.
+    """
+    glob = glob if glob is not None else _default_glob()
+    subagent_glob = subagent_glob if subagent_glob is not None else _default_subagent_glob()
+
+    def _rebuild(reason: str) -> RawRefreshStats:
+        logger.info("refresh_raw: full rebuild ({})", reason)
+        register_raw(
+            con,
+            glob=glob,
+            subagent_glob=subagent_glob,
+            subagent_meta_glob=subagent_meta_glob,
+        )
+        snapshot = snapshot_as_of(con)
+        return RawRefreshStats(
+            rebuilt=True,
+            rebuild_reason=reason,
+            files_touched_count=snapshot.files_scanned_count or 0 if snapshot else 0,
+            files_removed_count=0,
+            rows_deleted_count=0,
+            rows_inserted_count=0,
+            covers_through=snapshot.covers_through if snapshot else None,
+        )
+
+    if not _temp_object_present(con, _RAW_EVENTS_TABLE) or not _temp_object_present(
+        con, _SNAPSHOT_TABLE
+    ):
+        return _rebuild("no prior snapshot on this connection")
+
+    current = _scan_raw_watermark(glob=glob, subagent_glob=subagent_glob)
+    if current is None:
+        return _rebuild("watermark unobservable (remote corpus)")
+
+    previous = _load_watermark(con)
+    prior_snapshot = snapshot_as_of(con)
+    if prior_snapshot is not None and prior_snapshot.files_scanned_count is None:
+        return _rebuild("prior snapshot recorded no watermark")
+
+    deltas = {
+        kind: diff_source_mtimes(previous.get(kind, {}), current.get(kind, {}))
+        for kind in (_KIND_EVENT, _KIND_SUBAGENT)
+    }
+    changed_count = sum(delta.changed_count for delta in deltas.values())
+    if changed_count == 0:
+        logger.debug("refresh_raw: nothing moved")
+        return RawRefreshStats(
+            rebuilt=False,
+            rebuild_reason=None,
+            files_touched_count=0,
+            files_removed_count=0,
+            rows_deleted_count=0,
+            rows_inserted_count=0,
+            covers_through=prior_snapshot.covers_through if prior_snapshot else None,
+        )
+    if changed_count > max_incremental_files:
+        return _rebuild(f"{changed_count} files moved, over the {max_incremental_files} cap")
+
+    tables = {
+        _KIND_EVENT: (_RAW_EVENTS_TABLE, _raw_events_select),
+        _KIND_SUBAGENT: (_RAW_SUBAGENTS_TABLE, _raw_subagents_select),
+    }
+    rows_deleted = 0
+    rows_inserted = 0
+    try:
+        for kind, delta in deltas.items():
+            if delta.is_empty:
+                continue
+            table, select_for = tables[kind]
+            # DELETE both touched and removed, INSERT only touched: a modified
+            # file's old rows must go before its new rows land, or the table
+            # would hold two generations of the same transcript.
+            rows_deleted += _delete_rows_for(con, table, (*delta.touched, *delta.removed))
+            rows_inserted += _insert_rows_from(con, table, delta.touched, select_for)
+    except duckdb.Error:
+        # A mid-flight failure can leave one table's rows deleted and not
+        # reinserted, which is a silently WRONG snapshot rather than a stale one.
+        # Rebuild to a known-consistent state and report it, never return the
+        # torn snapshot as a success.
+        logger.exception("refresh_raw failed mid-flight; rebuilding to a consistent snapshot")
+        return _rebuild("incremental refresh raised")
+
+    files_touched = sum(len(delta.touched) for delta in deltas.values())
+    files_removed = sum(len(delta.removed) for delta in deltas.values())
+    covers_through = _advance_watermark(con, current)
+    logger.debug(
+        "refresh_raw: {} files touched, {} removed, {} rows in / {} rows out",
+        files_touched,
+        files_removed,
+        rows_inserted,
+        rows_deleted,
+    )
+    return RawRefreshStats(
+        rebuilt=False,
+        rebuild_reason=None,
+        files_touched_count=files_touched,
+        files_removed_count=files_removed,
+        rows_deleted_count=rows_deleted,
+        rows_inserted_count=rows_inserted,
+        covers_through=covers_through,
+    )
+
+
+def _advance_watermark(
+    con: duckdb.DuckDBPyConnection,
+    current: dict[str, dict[str, int]],
+) -> datetime | None:
+    """Replace the recorded watermark with ``current``; return new coverage.
+
+    Rewrites the whole watermark rather than patching the delta: the scan that
+    produced ``current`` is the authoritative observation, and a patch would
+    leave rows for files the scan no longer sees.
+    """
+    rows = [
+        (path, mtime_ns, kind)
+        for kind, entries in current.items()
+        for path, mtime_ns in entries.items()
+    ]
+    con.execute(f"DELETE FROM {_SOURCE_FILES_TABLE}")
+    _write_watermark_rows(con, rows)
+    covers_through_ns = max((mtime_ns for _, mtime_ns, _ in rows), default=None)
+    con.execute(
+        f"UPDATE {_SNAPSHOT_TABLE} SET registered_at_ns = ?, covers_through_ns = ?, "
+        "files_scanned_count = ?, refresh_count = refresh_count + 1",
+        [time.time_ns(), covers_through_ns, len(rows)],
+    )
+    return None if covers_through_ns is None else _epoch_ns_to_datetime(covers_through_ns)
 
 
 # ---------------------------------------------------------------------------

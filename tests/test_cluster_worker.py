@@ -74,6 +74,39 @@ def synthetic_settings(tmp_path: Path) -> Settings:
     )
 
 
+def test_the_viz_projection_is_off_by_default(synthetic_settings: Settings) -> None:
+    """``x`` / ``y`` stay in the schema but hold NULLs when the 2-d fit is skipped.
+
+    The columns cannot be dropped — ``message_clusters`` and its ``VIEW_SCHEMA``
+    entry name them — and NULL is the honest value: 0.0 would assert that every
+    message projects to the origin.
+    """
+    assert synthetic_settings.umap_compute_viz is False
+
+    run_clustering(synthetic_settings, force=True)
+
+    df = pl.read_parquet(synthetic_settings.clusters_parquet_path)
+    assert set(df.columns) == {"uuid", "cluster_id", "x", "y", "is_noise"}
+    assert df.schema["x"] == pl.Float32
+    assert df.schema["y"] == pl.Float32
+    assert df["x"].null_count() == len(df)
+    assert df["y"].null_count() == len(df)
+    # The clustering itself still happened.
+    assert df["cluster_id"].max() is not None
+
+
+def test_the_viz_projection_fills_coordinates_when_enabled(
+    synthetic_settings: Settings,
+) -> None:
+    settings = synthetic_settings.model_copy(update={"umap_compute_viz": True})
+
+    run_clustering(settings, force=True)
+
+    df = pl.read_parquet(settings.clusters_parquet_path)
+    assert df["x"].null_count() == 0
+    assert df["y"].null_count() == 0
+
+
 def test_clustering_smoke(synthetic_settings: Settings) -> None:
     stats = run_clustering(synthetic_settings, force=True)
     assert stats["total"] == 250
@@ -81,6 +114,8 @@ def test_clustering_smoke(synthetic_settings: Settings) -> None:
     assert stats["clusters"] >= 2
     # Output parquet exists with the right columns
     df = pl.read_parquet(synthetic_settings.clusters_parquet_path)
+    # ``x`` / ``y`` are present but NULL — the viz projection is opt-in; see
+    # ``test_the_viz_projection_is_off_by_default``.
     assert set(df.columns) == {"uuid", "cluster_id", "x", "y", "is_noise"}
     assert len(df) == 250
     # Pin the column dtypes: the worker hands polars numpy arrays directly

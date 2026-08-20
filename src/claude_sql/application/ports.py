@@ -43,7 +43,7 @@ from claude_sql.domain.ports import EmbeddingProvider, LlmAnalyticsProvider
 from claude_sql.domain.retrieval import SearchHit
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
     from datetime import datetime
     from pathlib import Path
 
@@ -109,6 +109,35 @@ class TranscriptReaderPort(Protocol):
 
     def session_ids(self, *, since_days: int | None = None, limit: int | None = None) -> list[str]:
         """Return the newest-first session ids matching the window."""
+        ...
+
+
+@runtime_checkable
+class FileWatcherPort(Protocol):
+    """Port: a stream of transcript source files that changed.
+
+    Wraps whatever notices that the corpus moved. Two adapters implement it and
+    the use-case cannot tell them apart: an OS-event source (``watchfiles``,
+    under the ``watch`` extra) and a polling source that diffs an mtime scan on
+    an interval. Both yield the same thing — a batch of absolute paths — so the
+    debounce, the refresh, and the reporting are written once.
+
+    The roots and the filename filter are adapter state; the use-case never
+    names a directory.
+    """
+
+    def changed_batches(self) -> Iterator[frozenset[str]]:
+        """Yield batches of absolute paths that changed, blocking between them.
+
+        Each batch is what the source observed since the previous yield. An
+        adapter MAY yield an empty batch as a heartbeat so the caller can run
+        its debounce clock without a change having occurred — the use-case
+        treats an empty batch as "time passed, nothing new".
+
+        Terminates when the source is exhausted (a bounded test double, or a
+        polling source configured with a finite tick count). A live source runs
+        until the caller stops consuming.
+        """
         ...
 
 
@@ -295,6 +324,7 @@ __all__ = [
     "CheckpointPort",
     "Clock",
     "EmbeddingProvider",
+    "FileWatcherPort",
     "LlmAnalyticsProvider",
     "PortResult",
     "ReaderPort",

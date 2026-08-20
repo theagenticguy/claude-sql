@@ -21,6 +21,12 @@ import polars as pl
 from loguru import logger
 
 from claude_sql.domain.structure.terms import compute_ctfidf
+from claude_sql.infrastructure.freshness import (
+    is_output_fresh,
+    newest_mtime_ns,
+    sidecar_for,
+    stamp_output,
+)
 
 if TYPE_CHECKING:
     import duckdb
@@ -59,9 +65,16 @@ def run_terms(
         raise FileNotFoundError(
             f"Clusters parquet missing at {clusters_path}.  Run `claude-sql cluster` first."
         )
-    if out.exists() and out.stat().st_size > 16 and not force:
+
+    # Freshness keys on the CLUSTERS parquet's mtime, not on this output's mere
+    # existence. HDBSCAN re-mints ``cluster_id`` on every fit, so terms computed
+    # against an earlier clustering label a partition that no longer exists —
+    # an existence gate makes that state permanent and silent.
+    sidecar = sidecar_for(out, input_name="clusters")
+    clusters_mtime_ns = newest_mtime_ns(clusters_path)
+    if not force and is_output_fresh(out, sidecar=sidecar, input_mtime_ns=clusters_mtime_ns):
         df = pl.read_parquet(out)
-        logger.info("cluster_terms parquet already exists at {}", out)
+        logger.info("Clusters unchanged since last terms run; reusing {}.", out)
         return {"clusters": int(df["cluster_id"].n_unique()), "terms": len(df)}
 
     # Project the god-Settings down to the c-TF-IDF slice (T-2-4): the vectorizer
@@ -112,6 +125,7 @@ def run_terms(
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out_df.write_parquet(out)
+    stamp_output(sidecar, clusters_mtime_ns)
     logger.info(
         "Wrote {} term-rows across {} clusters in {:.1f}s",
         len(out_df),

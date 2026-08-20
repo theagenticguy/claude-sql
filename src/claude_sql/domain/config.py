@@ -42,6 +42,12 @@ class ClusteringConfig:
     hdbscan_min_cluster_size: int
     hdbscan_min_samples: int
     seed: int
+    #: Whether to fit the 2-d viz projection alongside the 50-d clustering one.
+    #: Off by default: no code path reads the resulting ``x`` / ``y`` columns,
+    #: and the fit is 66% of the stage's wall clock (measured 807 s of 1,247 s on
+    #: 128,453 embeddings). The ``umap_n_components_2`` / ``umap_min_dist_viz``
+    #: knobs above only apply when this is true.
+    compute_viz_coords: bool = False
 
 
 @dataclass(frozen=True, slots=True)

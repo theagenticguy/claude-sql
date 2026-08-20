@@ -414,6 +414,12 @@ class Settings(BaseSettings):
     umap_min_dist_cluster: float = 0.0
     umap_min_dist_viz: float = 0.1
     umap_metric: str = "cosine"
+    #: Fit the 2-d viz projection alongside the 50-d clustering one. OFF by
+    #: default: no code path reads the ``x`` / ``y`` columns it produces (only
+    #: ad-hoc SQL can), and it is 66% of the clustering stage's wall clock
+    #: (measured 807 s of 1,247 s over 128,453 embeddings). ``claude-sql cluster
+    #: --viz`` turns it on for one run.
+    umap_compute_viz: bool = False
     hdbscan_min_cluster_size: int = 20
     hdbscan_min_samples: int = 5
     #: Mutual-kNN k for the session-centroid graph.  k=15 is the Scanpy /
@@ -589,6 +595,7 @@ class Settings(BaseSettings):
             umap_min_dist_cluster=self.umap_min_dist_cluster,
             umap_min_dist_viz=self.umap_min_dist_viz,
             umap_metric=self.umap_metric,
+            compute_viz_coords=self.umap_compute_viz,
             hdbscan_min_cluster_size=self.hdbscan_min_cluster_size,
             hdbscan_min_samples=self.hdbscan_min_samples,
             seed=self.seed,
