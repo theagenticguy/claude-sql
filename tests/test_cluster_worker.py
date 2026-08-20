@@ -11,6 +11,7 @@ import pytest
 
 from claude_sql.application.use_cases.cluster import run_clustering
 from claude_sql.infrastructure import lance_store
+from claude_sql.infrastructure.freshness import sidecar_for
 from claude_sql.infrastructure.settings import Settings
 
 
@@ -72,6 +73,60 @@ def synthetic_settings(tmp_path: Path) -> Settings:
         hdbscan_min_samples=3,
         output_dimension=1024,  # not used by clustering; lance schema dim is set explicitly
     )
+
+
+def test_cache_hit_and_compute_paths_report_identical_stats(
+    synthetic_settings: Settings,
+) -> None:
+    """The stats dict must not change meaning depending on which path served it.
+
+    ``clusters`` is a CLUSTER count on the compute path (``labels.max() + 1``).
+    A cache hit that re-derived it as ``(cluster_id >= 0).sum()`` returned the
+    count of non-noise ROWS instead — the same key carrying a different
+    quantity, which on the live corpus read as ``139054 messages, 80057
+    clusters`` against a parquet holding 1,080 real clusters.
+
+    Asserts the invariant (the two paths agree) rather than a literal copied
+    from output, so it keeps biting if either path's arithmetic changes.
+    """
+    computed = run_clustering(synthetic_settings, force=True)
+    assert computed["clusters"] > 0, "fixture must produce at least one real cluster"
+
+    cached = run_clustering(synthetic_settings, force=False)
+
+    assert cached == computed
+
+
+def test_cache_hit_clusters_is_a_cluster_count_not_a_row_count(
+    synthetic_settings: Settings,
+) -> None:
+    """Pin the quantity directly against the parquet it was read from."""
+    run_clustering(synthetic_settings, force=True)
+
+    cached = run_clustering(synthetic_settings, force=False)
+
+    df = pl.read_parquet(synthetic_settings.clusters_parquet_path)
+    real = df.filter(pl.col("cluster_id") >= 0)
+    assert cached["clusters"] == real["cluster_id"].n_unique()
+    # The bug's value, named so the distinction cannot be re-collapsed by a
+    # future edit: non-noise ROWS is a different (larger) number entirely.
+    assert cached["clusters"] < int((df["cluster_id"] >= 0).sum())
+    assert cached["total"] == len(df)
+    assert cached["noise"] == int((df["cluster_id"] < 0).sum())
+
+
+def test_legacy_no_sidecar_path_also_reports_a_cluster_count(
+    synthetic_settings: Settings,
+) -> None:
+    """The second cache-hit branch (parquet present, sidecar absent) agrees too."""
+    computed = run_clustering(synthetic_settings, force=True)
+    sidecar = sidecar_for(synthetic_settings.clusters_parquet_path, input_name="embeddings")
+    sidecar.unlink()
+
+    cached = run_clustering(synthetic_settings, force=False)
+
+    assert sidecar.exists(), "the legacy branch must stamp a sidecar on the way out"
+    assert cached == computed
 
 
 def test_the_viz_projection_is_off_by_default(synthetic_settings: Settings) -> None:

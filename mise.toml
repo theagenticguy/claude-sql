@@ -201,13 +201,17 @@ description = "Build the publishable claude-sql wheel + sdist into dist/"
 # root, so `uv build` produces the one self-contained wheel directly.
 run = "uv build"
 
+# Both install tasks carry the `watch` extra. Without it `claude-sql watch`
+# still runs but silently falls back to polling an mtime scan every tick instead
+# of taking OS events, so a deploy that omits it degrades the daemon in a way
+# nothing reports.
 [tasks."tool:install"]
-description = "Install claude-sql as a uv tool (global, isolated venv)"
-run = "uv tool install --from . claude-sql --force --reinstall"
+description = "Install claude-sql as a uv tool (global, isolated venv, watch extra)"
+run = "uv tool install --from '.[watch]' claude-sql --force --reinstall"
 
 [tasks."tool:upgrade"]
 description = "Re-install claude-sql from the current working tree (use after pulling)"
-run = "uv tool install --from . claude-sql --force --reinstall"
+run = "uv tool install --from '.[watch]' claude-sql --force --reinstall"
 
 [tasks."tool:uninstall"]
 description = "Uninstall the claude-sql uv tool"
