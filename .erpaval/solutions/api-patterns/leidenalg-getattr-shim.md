@@ -25,16 +25,22 @@ pattern: |
   ```python
   def _run_leiden_cpm(g, *, gamma, seed, n_iterations) -> object:
       import leidenalg as la
+
       return la.find_partition(
-          g, la.CPMVertexPartition, weights="weight",
-          resolution_parameter=gamma, seed=seed, n_iterations=n_iterations,
+          g,
+          la.CPMVertexPartition,
+          weights="weight",
+          resolution_parameter=gamma,
+          seed=seed,
+          n_iterations=n_iterations,
       )
 
+
   partition = _run_leiden_cpm(g, gamma=γ, seed=42, n_iterations=-1)
-  quality = float(getattr(partition, "quality")())     # noqa: B009
-  membership = list(getattr(partition, "membership")) # noqa: B009
-  n_communities = len(set(membership))                 # not len(partition);
-                                                       # the stubs reject Sized too
+  quality = float(getattr(partition, "quality")())  # noqa: B009
+  membership = list(getattr(partition, "membership"))  # noqa: B009
+  n_communities = len(set(membership))  # not len(partition);
+  # the stubs reject Sized too
   ```
 
   Tradeoff: cleaner IDE assistance is lost on these calls. Acceptable because
@@ -69,7 +75,7 @@ quality = float(partition.quality())
 n = len(partition)
 
 # Good: shim out to runtime attribute access
-quality = float(getattr(partition, "quality")())   # noqa: B009
+quality = float(getattr(partition, "quality")())  # noqa: B009
 membership = list(getattr(partition, "membership"))  # noqa: B009
 n = len(set(membership))
 ```

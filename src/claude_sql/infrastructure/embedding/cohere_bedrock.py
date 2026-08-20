@@ -124,7 +124,9 @@ def _invoke_bedrock_sync(
         accept="application/json",
     )
     payload = json.loads(resp["body"].read())
-    return payload["embeddings"][embedding_type]
+    # Untyped-JSON boundary: name the shape once here rather than returning Any.
+    vectors: list[list[int]] | list[list[float]] = payload["embeddings"][embedding_type]
+    return vectors
 
 
 async def _embed_one_batch(

@@ -21,6 +21,7 @@ attribute while the moved entrypoint resolves names in its own (real) module.
 from new.home import entrypoint, _private_a, _private_b  # for ty's static resolution
 import sys as _sys
 from new import home as _real
+
 _sys.modules[__name__] = _real
 ```
 

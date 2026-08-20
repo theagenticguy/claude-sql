@@ -163,8 +163,9 @@ def lance_schema(dim: int) -> pa.Schema:
 class SessionClassification(BaseModel):
     model_config = ConfigDict(extra="forbid")
     autonomy_tier: Literal["manual", "assisted", "autonomous"]
-    work_category: Literal["sde", "admin", "strategy_business", "events",
-                           "thought_leadership", "other"]
+    work_category: Literal[
+        "sde", "admin", "strategy_business", "events", "thought_leadership", "other"
+    ]
     success: Literal["success", "partial", "failure", "unknown"]
     goal: str = Field(..., min_length=1, max_length=280)
     confidence: float = Field(..., ge=0.0, le=1.0)
@@ -198,6 +199,7 @@ def render_turn_text(
     total_chars: int = 200_000,
     truncation_notice: bool = False,
 ) -> str: ...
+
 
 @dataclass(slots=True)
 class TranscriptRow:
@@ -347,8 +349,9 @@ CREATE TABLE IF NOT EXISTS session_checkpoint (
 ```
 ```python
 def load_as_map(self, pipeline: str) -> dict[str, tuple[datetime | None, datetime | None]]: ...
-def mark_completed(self, *, pipeline: str,
-                   rows: Iterable[tuple[str, datetime | None, datetime | None]]) -> int: ...
+def mark_completed(
+    self, *, pipeline: str, rows: Iterable[tuple[str, datetime | None, datetime | None]]
+) -> int: ...
 def count_rows(self) -> int: ...
 ```
 

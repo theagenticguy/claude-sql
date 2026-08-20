@@ -26,11 +26,11 @@ Verification options (ordered by reliability):
 Payload shape (new):
 ```python
 usage = {
-    "input_tokens": ...,               # NEW tokens (not cached)
+    "input_tokens": ...,  # NEW tokens (not cached)
     "output_tokens": ...,
     "cache_creation_input_tokens": ...,  # ~1.25× input rate (5m)
-    "cache_read_input_tokens": ...,     # 0.1× input rate
-    "cache_creation": {                 # present with 1h TTL
+    "cache_read_input_tokens": ...,  # 0.1× input rate
+    "cache_creation": {  # present with 1h TTL
         "ephemeral_5m_input_tokens": ...,
         "ephemeral_1h_input_tokens": ...,  # 2× input rate
     },

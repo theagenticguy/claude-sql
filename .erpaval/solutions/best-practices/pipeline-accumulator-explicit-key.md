@@ -49,12 +49,18 @@ Each worker passes its own pipeline name explicitly:
 ```python
 # llm_shared.py
 async def classify_one(
-    client, model_id, schema, text, *,
-    max_tokens, thinking_mode, sem,
+    client,
+    model_id,
+    schema,
+    text,
+    *,
+    max_tokens,
+    thinking_mode,
+    sem,
     system: str | None = None,
     pipeline: str = "classifier",  # <-- explicit, not derived
-) -> dict:
-    ...
+) -> dict: ...
+
 
 # trajectory_worker.py
 result = await classify_one(

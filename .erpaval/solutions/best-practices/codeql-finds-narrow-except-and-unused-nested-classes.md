@@ -23,6 +23,7 @@ pattern: |
   ```python
   try:
       import tenacity.nap
+
       monkeypatch.setattr(tenacity.nap.time, "sleep", noop)
   except (ImportError, AttributeError):
       pass  # ← CodeQL: empty except without explanatory comment
@@ -49,12 +50,16 @@ pattern: |
 
   ```python
   def test_safe_preview_falls_back_to_str_on_unserializable() -> None:
-      class NotJSON:               # ← CodeQL: unused local variable
+      class NotJSON:  # ← CodeQL: unused local variable
           def __repr__(self): ...
-      class Hostile:                # ← also unused
+
+      class Hostile:  # ← also unused
           ...
+
       # only this third one actually gets used
-      class HardToSerialize: pass
+      class HardToSerialize:
+          pass
+
       h = HardToSerialize()
       assert isinstance(_safe_preview(h), str)
   ```
@@ -80,7 +85,7 @@ pattern: |
   ```python
   # WRONG — task group can't tear down cleanly
   try:
-      ... # bedrock + parquet write
+      ...  # bedrock + parquet write
   except BaseException as exc:  # noqa: BLE001 — never abort the task group
       logger.warning("session {} aborted ({})", sid, exc)
       retry_queue.enqueue(..., error=str(exc))

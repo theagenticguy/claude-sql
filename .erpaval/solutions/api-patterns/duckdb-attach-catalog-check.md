@@ -53,6 +53,7 @@ def _attached_embeddings_table_present(con: duckdb.DuckDBPyConnection) -> bool:
     ).fetchone()
     return bool(row and row[0])
 
+
 # In register_vss:
 con.execute(f"ATTACH '{persisted_path}' AS hnsw_store;")
 rebuild = _hnsw_rebuild_needed(parquet, persisted_path)

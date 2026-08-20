@@ -182,13 +182,15 @@ Flow:
    a polars frame to Lance (`:477-493`) with the explicit schema:
 
 ```python
-schema={
-    "uuid": pl.Utf8,
-    "model": pl.Utf8,
-    "dim": pl.Int32,
-    "embedding": pl.Array(pl.Float32, settings.output_dimension),
-    "embedded_at": pl.Datetime("us", "UTC"),
-},
+schema = (
+    {
+        "uuid": pl.Utf8,
+        "model": pl.Utf8,
+        "dim": pl.Int32,
+        "embedding": pl.Array(pl.Float32, settings.output_dimension),
+        "embedded_at": pl.Datetime("us", "UTC"),
+    },
+)
 ```
 
    The `model` column is stamped `settings.active_model_id` and `dim` is stamped
@@ -238,7 +240,7 @@ default `1024`) — and threaded, unvalidated, into three consumers:
    ```python
    def open_or_create_table(db, *, dim):
        if _has_table(db, TABLE_NAME):
-           return db.open_table(TABLE_NAME)   # dim is NOT checked here
+           return db.open_table(TABLE_NAME)  # dim is NOT checked here
        return db.create_table(TABLE_NAME, schema=lance_schema(dim), mode="create")
    ```
 
@@ -388,6 +390,7 @@ required) in the future `application/ports` layer — for `v1.2.1` it can live a
 from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
+
 @runtime_checkable
 class EmbeddingProvider(Protocol):
     """Port: turn text into vectors. One adapter per backend.
@@ -471,13 +474,13 @@ Request / response shapes (grounded in current Ollama API docs):
 ```python
 # POST http://localhost:11434/api/embed
 # body:
-{"model": "bge-m3", "input": ["text one", "text two"]}   # input: str | list[str]
+{"model": "bge-m3", "input": ["text one", "text two"]}  # input: str | list[str]
 # response:
 {"model": "bge-m3", "embeddings": [[...], [...]], "total_duration": ...}
 #                     ^ always list[list[float]], one per input, L2-normalized
 
 # legacy POST /api/embeddings (singular, un-normalized — avoid):
-{"model": "bge-m3", "prompt": "one text"}          # -> {"embedding": [...]}
+{"model": "bge-m3", "prompt": "one text"}  # -> {"embedding": [...]}
 ```
 
 Adapter behavior:
@@ -534,27 +537,30 @@ from tokenizers import Tokenizer
 
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
+
 class OnnxBgeEmbedder:
     def __init__(self, onnx_path, tokenizer_path, dim):
         self._tok = Tokenizer.from_file(tokenizer_path)
-        self._tok.enable_padding(); self._tok.enable_truncation(max_length=512)
+        self._tok.enable_padding()
+        self._tok.enable_truncation(max_length=512)
         self._sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self._inputs = {i.name for i in self._sess.get_inputs()}
         self._dim = dim
 
     def _run(self, texts):
         encs = self._tok.encode_batch(texts)
-        ids  = np.array([e.ids for e in encs], dtype=np.int64)
+        ids = np.array([e.ids for e in encs], dtype=np.int64)
         mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
         feeds = {"input_ids": ids, "attention_mask": mask}
         if "token_type_ids" in self._inputs:
             feeds["token_type_ids"] = np.zeros_like(ids)
-        last_hidden = self._sess.run(None, feeds)[0]   # [B, seq, hidden]
-        emb = last_hidden[:, 0]                          # CLS pooling — NOT mean
+        last_hidden = self._sess.run(None, feeds)[0]  # [B, seq, hidden]
+        emb = last_hidden[:, 0]  # CLS pooling — NOT mean
         return emb / np.linalg.norm(emb, axis=1, keepdims=True)
 
     async def embed_documents(self, texts):
-        if not texts: return []
+        if not texts:
+            return []
         return self._run(texts).tolist()
 
     def embed_query(self, text):
@@ -608,12 +614,12 @@ embedding_provider: Literal["bedrock", "ollama", "onnx"] = "bedrock"
 #   env: CLAUDE_SQL_EMBEDDING_PROVIDER
 
 # Ollama
-ollama_host: str = "http://localhost:11434"       # CLAUDE_SQL_OLLAMA_HOST
-ollama_model: str = "bge-m3"                       # CLAUDE_SQL_OLLAMA_MODEL
+ollama_host: str = "http://localhost:11434"  # CLAUDE_SQL_OLLAMA_HOST
+ollama_model: str = "bge-m3"  # CLAUDE_SQL_OLLAMA_MODEL
 
 # ONNX
-onnx_model_repo: str = "BAAI/bge-small-en-v1.5"    # CLAUDE_SQL_ONNX_MODEL_REPO
-onnx_model_dim: int = 384                          # CLAUDE_SQL_ONNX_MODEL_DIM
+onnx_model_repo: str = "BAAI/bge-small-en-v1.5"  # CLAUDE_SQL_ONNX_MODEL_REPO
+onnx_model_dim: int = 384  # CLAUDE_SQL_ONNX_MODEL_DIM
 ```
 
 The existing Bedrock fields (`model_id`, `output_dimension`, `embedding_type`,

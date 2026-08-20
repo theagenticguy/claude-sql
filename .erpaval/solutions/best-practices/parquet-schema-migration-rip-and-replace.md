@@ -44,6 +44,7 @@ import pyarrow.parquet as pq
 
 _LEGACY_SCHEMA_MARKERS: frozenset[str] = frozenset({"conflict_idx", "empty"})
 
+
 def _purge_legacy_shards(target: Path) -> None:
     parts = iter_part_files(target)
     if not parts:

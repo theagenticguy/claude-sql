@@ -19,6 +19,8 @@ signature:
 ```python
 async def _fake(client, model_id, schema, text, *, max_tokens, thinking_mode, sem, system=None):
     return {...}
+
+
 monkeypatch.setattr(llm_shared, "classify_one", _fake)
 ```
 

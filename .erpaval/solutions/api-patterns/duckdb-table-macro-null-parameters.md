@@ -24,9 +24,9 @@ pattern: |
 
   ```python
   import re
-  CREATE_MACRO_RE = re.compile(
-      r"CREATE OR REPLACE MACRO (\w+)\(([^)]*)\)", re.IGNORECASE
-  )
+
+  CREATE_MACRO_RE = re.compile(r"CREATE OR REPLACE MACRO (\w+)\(([^)]*)\)", re.IGNORECASE)
+
 
   def test_macro_signatures_match_ddl():
       source = inspect.getsource(register_macros)

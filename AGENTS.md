@@ -120,9 +120,10 @@ see `docs/v2/DESIGN.md`, `docs/v2/MIGRATION.md`, and
 - **Python: 3.14 toolchain, `>=3.13` floor.** The dev toolchain runs 3.14
   (`.python-version` = `3.14`, `mise.toml [tools].python` = `3.14`), while
   `pyproject.toml requires-python` stays `>=3.13` so the wheel still installs on
-  3.13. `hdbscan` is the sole `cp314` blocker for the clustering stack; the base
-  planes (SQL + semantic search + LLM analytics) are cp314-ready. See
-  `docs/adr/0015-stack-modernization.md`.
+  3.13. Every dependency ships a `cp314` wheel, clustering included (probed
+  2026-08-20: `hdbscan` 0.8.44 publishes cp310–cp314), so no plane needs an
+  sdist build on the 3.14 toolchain. See `docs/adr/0015-stack-modernization.md`
+  for how the version floor was chosen.
 - **Formatting:** `mise run fmt:write` applies ruff formatting. Line length 100.
   Ruff runs a 32-family strict selector set (E, W, F, I, N, UP, B, SIM, ANN,
   ASYNC, BLE, C4, DTZ, ERA, FBT, G, ICN, ISC, LOG, PERF, PIE, PL, PT, PTH, RET,

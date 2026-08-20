@@ -27,6 +27,7 @@ pattern: |
 
   ```python
   from claude_sql import lance_store
+
   db = lance_store.connect_db(lance_uri)
   if not lance_store._has_table(db, lance_store.TABLE_NAME):
       # No embeddings table — create empty fallback so semantic_search binds.

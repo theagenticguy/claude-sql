@@ -216,8 +216,10 @@ def test_read_turn_text_collapse_contract(tmp_corpus: dict[str, Any]) -> None:
     # DELTA-1: the assistant's tool_use folds into its own message line, after
     # the text body — not a standalone marker line.
     assert lines == [
-        "[user 2026-04-01T10:00:00.000Z] "
-        "first message in session one — long enough to clear the filter",
+        (
+            "[user 2026-04-01T10:00:00.000Z] "
+            "first message in session one — long enough to clear the filter"
+        ),
         "[assistant 2026-04-01T10:00:10.000Z] ok let me check the file [tool_use:Read]",
         "[user 2026-04-01T10:00:12.000Z] [tool_result]",
         "[user 2026-04-01T10:00:30.000Z] thanks, that's exactly what I expected from the file read",
@@ -321,7 +323,7 @@ def _seed_lance(lance_uri: Path, rows: list[tuple[str, list[float]]], *, dim: in
 def _uuid_of(reader: DuckDbTranscriptReader, sid: str, role: str) -> str:
     """Fetch a real message uuid from the corpus so the join lands."""
     rows = reader.session_messages(sid)
-    return next(r["uuid"] for r in rows if r["role"] == role and r["kind"] == "text")
+    return str(next(r["uuid"] for r in rows if r["role"] == role and r["kind"] == "text"))
 
 
 def test_search_returns_ranked_hits(tmp_path: Path, tmp_corpus: dict[str, Any]) -> None:

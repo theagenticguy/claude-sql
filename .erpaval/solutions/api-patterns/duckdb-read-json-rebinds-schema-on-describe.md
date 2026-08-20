@@ -61,6 +61,7 @@ VIEW_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
     # ...
 }
 
+
 # tests/test_sql_views.py — drift test
 def test_view_schema_matches_describe_all(tmp_corpus):
     con = duckdb.connect(":memory:")

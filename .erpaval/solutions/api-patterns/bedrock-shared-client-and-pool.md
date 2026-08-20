@@ -25,6 +25,7 @@ from botocore.config import Config
 _LOCK = threading.Lock()
 _CACHE: dict[tuple[str, int], object] = {}
 
+
 def build_client(region: str, max_conc: int) -> object:
     pool = max(32, max_conc * 2)
     key = (region, pool)
@@ -36,7 +37,7 @@ def build_client(region: str, max_conc: int) -> object:
                     region_name=region,
                     max_pool_connections=pool,
                     connect_timeout=10,
-                    read_timeout=600,   # Sonnet adaptive thinking can run past 60s
+                    read_timeout=600,  # Sonnet adaptive thinking can run past 60s
                     retries={"max_attempts": 0, "mode": "adaptive"},
                 ),
             )

@@ -257,8 +257,14 @@ def _collapse_row_body(row: TranscriptRow, *, per_turn_chars: int) -> str:
     message = _parse_message(row.message)
     if message is None:
         return ""
-    content = message.get("content")
+    # ``object``, not the ``Any`` the dict lookup yields: an unvalidated JSON
+    # value has no static shape, and typing it as ``object`` forces every use
+    # through the isinstance checks below — which this function already does —
+    # so the narrowed branches produce real ``str`` / ``list`` instead of
+    # re-widening the result to ``Any``.
+    content: object = message.get("content")
 
+    body: str
     if isinstance(content, str):
         body = content.strip()
     elif isinstance(content, list):

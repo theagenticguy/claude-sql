@@ -160,8 +160,10 @@ def discover_unembedded(
         sql += f"\nLIMIT {int(limit)}"
 
     rows = con.execute(sql).fetchall()
-    # DuckDB returns UUIDs as uuid.UUID objects; polars wants str for pl.Utf8.
-    pairs = [(str(r[0]), r[1]) for r in rows]
+    # DuckDB returns UUIDs as uuid.UUID objects and untyped columns as Any;
+    # polars wants str for pl.Utf8, and the WHERE clause above already
+    # guarantees a non-empty text body, so both coercions are total.
+    pairs: list[tuple[str, str]] = [(str(r[0]), str(r[1])) for r in rows]
     if anti_in_python:
         pairs = [(u, t) for u, t in pairs if u not in embedded]
     return pairs

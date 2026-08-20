@@ -301,6 +301,7 @@ hard-wired to Cohere-on-Bedrock across two functions:
 ```python
 class EmbeddingPort(Protocol):
     dim: int
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
     def embed_query(self, text: str) -> list[float]: ...
 ```
@@ -324,7 +325,7 @@ Today split across `lance_store.py` (write/index/scan) and the DuckDB
 ```python
 class VectorStorePort(Protocol):
     def upsert(self, rows: EmbeddingRows) -> None: ...
-    def embedded_uuids(self) -> set[str]: ...        # → get_embedded_uuids
+    def embedded_uuids(self) -> set[str]: ...  # → get_embedded_uuids
     def search(self, vector: list[float], k: int) -> list[Hit]: ...
     def count(self) -> int: ...
 ```
@@ -336,8 +337,15 @@ thinking_mode, system, pipeline)` (`llm_shared.py:404`) plus
 `_parse_structured_payload` (`:502`) and `BedrockRefusalError` (`:492`). Port:
 ```python
 class LlmPort(Protocol):
-    def classify(self, *, schema: dict, user_text: str, system: str | None,
-                 max_tokens: int, thinking: Literal["adaptive","disabled"]) -> dict: ...
+    def classify(
+        self,
+        *,
+        schema: dict,
+        user_text: str,
+        system: str | None,
+        max_tokens: int,
+        thinking: Literal["adaptive", "disabled"],
+    ) -> dict: ...
 ```
 Adapter = Bedrock Sonnet. The retry policy (tenacity `@retry`, `:397-403`),
 client caching (`_CLIENT_CACHE`, `:345`), and prompt-cache accounting

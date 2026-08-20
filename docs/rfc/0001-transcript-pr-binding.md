@@ -587,9 +587,9 @@ filter before the digest is computed:
 
 ```python
 SECRET_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"AKIA[0-9A-Z]{16}"),                    # AWS access key
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key
     re.compile(r"(ghp|ghu|gho|ghs|ghr)_[A-Za-z0-9]{36}"),  # GitHub PAT
-    re.compile(r"sk-[A-Za-z0-9]{48}"),                  # OpenAI API key
+    re.compile(r"sk-[A-Za-z0-9]{48}"),  # OpenAI API key
     re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     # ... extension point
 ]

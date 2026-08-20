@@ -32,8 +32,8 @@ pattern: |
   ```python
   _ANALYTICS_MACRO_REQUIREMENTS: dict[str, tuple[str, ...]] = {
       "friction_counts": ("user_friction_parquet_path",),
-      "friction_rate":   ("user_friction_parquet_path",),
-      "unused_skills":   ("user_friction_parquet_path", "skills_catalog_parquet_path"),
+      "friction_rate": ("user_friction_parquet_path",),
+      "unused_skills": ("user_friction_parquet_path", "skills_catalog_parquet_path"),
       # ...
   }
 
