@@ -31,6 +31,32 @@ from claude_sql.infrastructure.duckdb_views import register_raw, register_views
 from claude_sql.infrastructure.settings import Settings
 
 # ---------------------------------------------------------------------------
+# Home isolation (autouse — applies to every test in the suite)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_sql_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-root ``CLAUDE_SQL_HOME`` per test so no test touches the real home.
+
+    With the variable unset, ``claude_sql_home()`` resolves to ``~/.claude-sql`` —
+    the developer's own analytics home — and every corpus-scoped cache path derives
+    from it. A test that builds a :class:`Settings` for a temp corpus and then
+    touches any cache therefore creates a live ``corpora/<slug>/`` directory there,
+    named for a ``tmp_path`` that stops existing when the test ends. The suite also
+    has no business *reading* state it does not control.
+
+    Setting it here rather than in each test makes the guarantee unconditional: a new
+    test cannot forget. Tests that assert the resolution chain itself still win —
+    ``monkeypatch`` in the test body applies after this fixture, and those tests
+    delete the variable explicitly.
+    """
+    monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path_factory.mktemp("claude-sql-home")))
+
+
+# ---------------------------------------------------------------------------
 # JSONL fixture builders
 # ---------------------------------------------------------------------------
 

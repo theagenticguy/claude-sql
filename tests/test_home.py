@@ -56,6 +56,21 @@ def _purge_home_env() -> Iterator[None]:
             os.environ[var] = value
 
 
+def test_conftest_isolates_the_real_home() -> None:
+    """No test resolves the developer's own ``~/.claude-sql``.
+
+    The canary for ``conftest._isolate_claude_sql_home``. Without that fixture,
+    tests that build a ``Settings`` over a temp corpus create live
+    ``~/.claude-sql/corpora/<slug>/`` directories named for temp paths that no
+    longer exist — measured at 3 per full-suite run before the fixture landed.
+    Deliberately takes no ``monkeypatch``: it must observe the ambient state the
+    rest of the suite runs under.
+    """
+    resolved = claude_sql_home()
+    assert resolved != Path.home() / ".claude-sql"
+    assert not resolved.is_relative_to(Path.home() / ".claude-sql")
+
+
 def test_explicit_env_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``CLAUDE_SQL_HOME`` overrides every other resolution rule."""
     monkeypatch.setenv("CLAUDE_SQL_HOME", str(tmp_path))
