@@ -37,6 +37,7 @@ pattern: |
   def _purge_meta_glob_env() -> Iterator[None]:
       """Snapshot/restore CLAUDE_SQL_SUBAGENT_META_GLOB around every test."""
       import os
+
       prior = os.environ.get("CLAUDE_SQL_SUBAGENT_META_GLOB")
       yield
       if prior is None:

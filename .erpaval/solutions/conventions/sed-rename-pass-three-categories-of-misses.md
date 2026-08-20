@@ -14,7 +14,8 @@ When renaming `claude_sql.X` → `claude_sql.<cluster>.X` across hundreds of imp
 
 ```python
 def setup_lance(con):
-    from claude_sql import lance_store   # ← indented; line-anchor `^from` skips it
+    from claude_sql import lance_store  # ← indented; line-anchor `^from` skips it
+
     lance_store.attach(con)
 ```
 
@@ -36,11 +37,11 @@ rg -n " from claude_sql\.[a-z_]+ import" packages/ tests/
 
 ```python
 from claude_sql import (
-    binding as _binding,           # provenance
-    blind_handover as _blind_hand, # evals
-    checkpointer,                  # core
-    freeze as _freeze,             # evals
-    skills_catalog as _sk,         # analytics
+    binding as _binding,  # provenance
+    blind_handover as _blind_hand,  # evals
+    checkpointer,  # core
+    freeze as _freeze,  # evals
+    skills_catalog as _sk,  # analytics
 )
 ```
 

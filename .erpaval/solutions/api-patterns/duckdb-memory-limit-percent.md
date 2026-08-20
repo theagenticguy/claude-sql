@@ -34,6 +34,7 @@ string) but easy to forget when adopting DuckDB tuning PRAGMAs from
 ```python
 _PERCENT_LIMIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*$")
 
+
 def _resolve_memory_limit(limit: str) -> str:
     match = _PERCENT_LIMIT_RE.match(limit)
     if match is None:
@@ -48,6 +49,7 @@ def _resolve_memory_limit(limit: str) -> str:
         total_bytes = page_size * phys_pages
     target_mib = max(1, int((total_bytes * fraction) // (1024 * 1024)))
     return f"{target_mib}MiB"
+
 
 # Apply:
 con.execute(f"SET memory_limit = '{_resolve_memory_limit('70%')}'")

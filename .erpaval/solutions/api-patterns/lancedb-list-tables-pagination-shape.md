@@ -58,6 +58,7 @@ def _table_names(db) -> list[str]:
                 return [str(v) for v in value]
     return list(db.table_names())  # deprecated
 
+
 # Right (verified against installed lancedb/db.py:167-193):
 def _has_table(db: lancedb.DBConnection, name: str) -> bool:
     return name in db.list_tables().tables

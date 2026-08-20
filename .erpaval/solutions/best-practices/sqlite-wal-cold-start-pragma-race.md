@@ -30,6 +30,7 @@ pattern: |
   _SCHEMA_BOOTSTRAPPED: set[str] = set()
   _SCHEMA_BOOTSTRAP_LOCK = threading.Lock()
 
+
   def _connect(path: Path) -> sqlite3.Connection:
       con = sqlite3.connect(str(path), isolation_level=None, timeout=30.0)
       # Per-connection PRAGMAs — must run every open

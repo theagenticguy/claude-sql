@@ -312,12 +312,12 @@ Today embedding config is Cohere-only: `Settings.model_id = "global.cohere.embed
 The v2 goal is "importable library AND standalone binary." Today nothing is exported — `app/__init__.py` is empty and `cli.py` is a wall of decorated functions. The public API should be the **use-case layer**, e.g.:
 
 ```python
-from claude_sql import ClaudeSql              # facade over a resolved Settings + connection factory
+from claude_sql import ClaudeSql  # facade over a resolved Settings + connection factory
 from claude_sql.application import SearchTranscripts, RunAnalyzePipeline
 from claude_sql.providers import BedrockCohereEmbedder, OllamaEmbedder, OnnxBgeEmbedder
 
 engine = ClaudeSql(embedder=OllamaEmbedder(...))
-hits = engine.search("temporal workflows", k=10)     # returns typed rows, not stdout
+hits = engine.search("temporal workflows", k=10)  # returns typed rows, not stdout
 ```
 
 The cyclopts `main()` then becomes a thin adapter that constructs the same objects and routes results through `emit_dataframe`/`emit_json`. The import-linter contract (`pyproject.toml:264-273`) already enforces `app < {analytics|evals|provenance} < core`; v2 restructures that into `interfaces < application < domain < adapters` and drops the `evals` node.

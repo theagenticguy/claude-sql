@@ -16,11 +16,13 @@ and cancellations.
 import anyio
 import anyio.to_thread
 
+
 async def classify_one(client, text, limiter: anyio.CapacityLimiter):
     async with limiter:
         return await anyio.to_thread.run_sync(
             lambda: client.invoke_model(...),
         )
+
 
 # Caller
 limiter = anyio.CapacityLimiter(settings.llm_concurrency)

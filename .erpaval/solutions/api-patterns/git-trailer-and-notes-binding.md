@@ -55,9 +55,11 @@ trivially bypassed, and gets `$1` as the path to the message file.
 ```python
 # Trailer write — three keys, one subprocess each. Git's parser handles ordering.
 import subprocess
+
 TRAILER_DIGEST = "Claude-Transcript-Digest"
 TRAILER_URI = "Claude-Transcript-URI"
 TRAILER_RUNTIME = "Claude-Agent-Runtime"
+
 
 def write_trailer(commit_msg_path: Path, binding: TranscriptBinding) -> None:
     for key, value in (
@@ -66,21 +68,46 @@ def write_trailer(commit_msg_path: Path, binding: TranscriptBinding) -> None:
         (TRAILER_RUNTIME, binding.agent_runtime),
     ):
         subprocess.run(
-            ["git", "interpret-trailers", "--in-place", "--trailer", f"{key}: {value}", str(commit_msg_path)],
-            check=False, capture_output=True, text=True,
+            [
+                "git",
+                "interpret-trailers",
+                "--in-place",
+                "--trailer",
+                f"{key}: {value}",
+                str(commit_msg_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
         )
+
 
 # Note write — JSON under refs/notes/transcripts
 def write_note(repo: Path, commit_sha: str, binding: TranscriptBinding) -> None:
-    payload = json.dumps({
-        "uri": binding.uri,
-        "digest": binding.digest,
-        "agent_runtime": binding.agent_runtime,
-        "transcript_id": binding.transcript_id,
-        "captured_at": binding.captured_at,
-    })
+    payload = json.dumps(
+        {
+            "uri": binding.uri,
+            "digest": binding.digest,
+            "agent_runtime": binding.agent_runtime,
+            "transcript_id": binding.transcript_id,
+            "captured_at": binding.captured_at,
+        }
+    )
     subprocess.run(
-        ["git", "-C", str(repo), "notes", "--ref=transcripts", "add", "-f", "-m", payload, commit_sha],
-        check=False, capture_output=True, text=True,
+        [
+            "git",
+            "-C",
+            str(repo),
+            "notes",
+            "--ref=transcripts",
+            "add",
+            "-f",
+            "-m",
+            payload,
+            commit_sha,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
     )
 ```

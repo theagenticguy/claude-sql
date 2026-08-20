@@ -57,7 +57,11 @@ subagent doesn't burn a Bedrock pipeline rewrite for a third consumer.
 
 ```python
 # CORRECT — matches existing pipeline
-from claude_sql.llm_worker import _build_bedrock_client, _invoke_classifier_sync, BedrockRefusalError
+from claude_sql.llm_worker import (
+    _build_bedrock_client,
+    _invoke_classifier_sync,
+    BedrockRefusalError,
+)
 from claude_sql.schemas import PR_REVIEW_SHEET_SCHEMA
 
 client = _build_bedrock_client(settings)

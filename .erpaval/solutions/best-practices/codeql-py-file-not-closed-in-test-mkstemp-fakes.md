@@ -31,8 +31,10 @@ pattern: |
   def _patch_mkstemp_for_duckdb(monkeypatch, tmp_path):
       db_path = tmp_path / "shell_test.duckdb"
       fd_holder = os.open(os.devnull, os.O_RDONLY)  # ← CodeQL: file not closed
+
       def _fake_mkstemp(*_a, **_kw):
           return fd_holder, str(db_path)
+
       monkeypatch.setattr(cli.tempfile, "mkstemp", _fake_mkstemp)
       return db_path
   ```
@@ -63,12 +65,14 @@ pattern: |
   # CORRECT — fresh fd per call, consumer closes
   def _patch_mkstemp_for_duckdb(monkeypatch, tmp_path):
       db_path = tmp_path / "shell_test.duckdb"
+
       def _fake_mkstemp(*_a, **_kw):
           # The CLI's `os.close(fd)` (cli.py:674) owns the close.
           # Opening inside the closure keeps each invocation self-
           # contained so CodeQL's py/file-not-closed sees the producer
           # and consumer paired.
           return os.open(os.devnull, os.O_RDONLY), str(db_path)
+
       monkeypatch.setattr(cli.tempfile, "mkstemp", _fake_mkstemp)
       return db_path
   ```

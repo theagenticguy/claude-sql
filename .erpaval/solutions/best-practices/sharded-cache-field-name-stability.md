@@ -50,6 +50,7 @@ while delivering the same write-throughput win.
 def is_sharded_dir(path: Path) -> bool:
     return path.is_dir() or (not path.exists() and path.parent.exists())
 
+
 def write_part(target: Path, df: pl.DataFrame) -> Path:
     if is_sharded_dir(target):
         target.mkdir(parents=True, exist_ok=True)
@@ -61,6 +62,7 @@ def write_part(target: Path, df: pl.DataFrame) -> Path:
         df = pl.concat([pl.read_parquet(target), df], how="diagonal_relaxed")
     df.write_parquet(target)
     return target
+
 
 # embed_worker.py — call site stays simple:
 write_part(settings.embeddings_parquet_path, df)

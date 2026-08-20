@@ -173,9 +173,9 @@ It was a clean seam and lifted cleanly.
 @runtime_checkable
 class EmbeddingProvider(Protocol):
     @property
-    def model_id(self) -> str: ...        # identity string, stamped into the store
+    def model_id(self) -> str: ...  # identity string, stamped into the store
     @property
-    def dimension(self) -> int: ...       # fixed width: replaces free settings.output_dimension
+    def dimension(self) -> int: ...  # fixed width: replaces free settings.output_dimension
     async def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
     def embed_query(self, text: str) -> list[float]: ...
 ```

@@ -59,7 +59,7 @@ column as a **fixed-size** list — required for indexing:
 
 ```python
 # core/lance_store.py:77
-pa.field("embedding", pa.list_(pa.float32(), dim), nullable=False),
+(pa.field("embedding", pa.list_(pa.float32(), dim), nullable=False),)
 ```
 
 Index creation uses the unified LanceDB ≥0.30 API:
@@ -229,6 +229,7 @@ conflicts, friction). §4 splits them explicitly.
   ```python
   # community_worker.py:214
   import igraph as ig
+
   # community_worker.py:236 and :309
   import leidenalg as la
   ```
