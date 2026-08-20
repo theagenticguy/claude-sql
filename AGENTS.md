@@ -299,6 +299,15 @@ Re-cited to the current module paths — verify before editing.
   time (DuckDB rejects `%` as a unit). `temp_directory` is `~/.claude/duckdb_tmp`
   instead of `/tmp` — Amazon devboxes ship `/tmp` as a 4 GB tmpfs and a
   clustering spill there thrashes the host.
+- **A cache-hit path must return the same QUANTITY as the path it caches**
+  (`application/use_cases/cluster.py:_stats_from_parquet`). `run_clustering`'s stats
+  dict is the cautionary case: the compute path reports `clusters` as
+  `labels.max() + 1` (a cluster count), and re-deriving it from the parquet as
+  `(cluster_id >= 0).sum()` yields the count of non-noise *rows* — the same key
+  carrying a different quantity, observed live as `analyze/cluster: 139054 messages,
+  80057 clusters` against a parquet holding 1,080 real clusters. One helper now
+  derives all three numbers for every cache-hit branch, and the tests assert the
+  two paths AGREE rather than pinning literals.
 - **Source-mtime sidecars are the ONLY staleness gate** (`infrastructure/freshness.py`,
   consumed by `application/use_cases/{cluster,terms,community}.py`). Each of the three
   expensive derived stages stamps the newest `mtime_ns` of its single input and skips

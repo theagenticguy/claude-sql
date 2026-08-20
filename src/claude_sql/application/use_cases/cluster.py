@@ -66,6 +66,30 @@ def _load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
     return uuids, np.ascontiguousarray(emb, dtype=np.float32)
 
 
+def _stats_from_parquet(df: pl.DataFrame) -> dict[str, int]:
+    """Derive the ``run_clustering`` stats dict from an existing clusters parquet.
+
+    The ONE definition of those three numbers for every cache-hit path, because
+    they are not interchangeable quantities and the compute path establishes what
+    each one means:
+
+    * ``total``  — rows (one per embedded message).
+    * ``clusters`` — DISTINCT non-noise ``cluster_id`` values. The compute path
+      reports ``labels.max() + 1``, a cluster count; reading it back as
+      ``(cluster_id >= 0).sum()`` yields the count of non-noise *rows* instead,
+      which is the same key carrying a different quantity. Observed on the live
+      corpus as ``analyze/cluster: 139054 messages, 80057 clusters`` against a
+      parquet holding 1,080 real clusters.
+    * ``noise`` — rows labelled ``-1``. A row count on both paths, so it agrees.
+    """
+    real = df.filter(pl.col("cluster_id") >= 0)
+    return {
+        "total": len(df),
+        "clusters": int(real["cluster_id"].n_unique()),
+        "noise": int((df["cluster_id"] < 0).sum()),
+    }
+
+
 def run_clustering(
     settings: Settings, *, force: bool = False, store: VectorStorePort | None = None
 ) -> dict[str, int]:
@@ -113,12 +137,7 @@ def run_clustering(
     in_mtime_ns = newest_mtime_ns(in_path)
     if not force and is_output_fresh(out_path, sidecar=sidecar, input_mtime_ns=in_mtime_ns):
         logger.info("Embeddings unchanged since last cluster run; reusing {}.", out_path)
-        df = pl.read_parquet(out_path)
-        return {
-            "total": len(df),
-            "clusters": int((df["cluster_id"] >= 0).sum()),
-            "noise": int((df["cluster_id"] < 0).sum()),
-        }
+        return _stats_from_parquet(pl.read_parquet(out_path))
 
     # Legacy short-circuit: a clusters parquet exists but no sidecar (older
     # install before the mtime-skip landed). Trust the parquet and stamp
@@ -130,12 +149,7 @@ def run_clustering(
             out_path,
         )
         stamp_output(sidecar, in_mtime_ns)
-        df = pl.read_parquet(out_path)
-        return {
-            "total": len(df),
-            "clusters": int((df["cluster_id"] >= 0).sum()),
-            "noise": int((df["cluster_id"] < 0).sum()),
-        }
+        return _stats_from_parquet(pl.read_parquet(out_path))
 
     # Project the god-Settings down to the pure-math slice (T-2-4). The
     # UMAP/HDBSCAN fit reads only ``cfg`` — it never sees a Bedrock model ID or
@@ -192,4 +206,4 @@ def run_clustering(
     return {"total": len(uuids), "clusters": k, "noise": noise}
 
 
-__all__ = ["_load_embeddings", "run_clustering"]
+__all__ = ["_load_embeddings", "_stats_from_parquet", "run_clustering"]
